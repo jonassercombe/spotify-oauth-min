@@ -122,12 +122,18 @@ export default async function handler(req, res) {
     const meResp = await fetch("https://api.spotify.com/v1/me", {
       headers: { Authorization: `Bearer ${tokenRes.access_token}` },
     });
+    
+    // DEBUG: zeige genaue Fehlermeldung
     if (!meResp.ok) {
       const t = await meResp.text();
       console.error("Spotify /me failed:", meResp.status, t);
-      return res.status(400).send("Failed to get Spotify profile");
+      return res
+        .status(400)
+        .send(`Spotify /me failed: ${meResp.status}\n\n${t}`);
     }
+    
     const me = await meResp.json();
+
     const spotify_user_id = me.id;
     const display_name = me.display_name || label || "";
     const avatar_url = (me.images && me.images[0]?.url) || null;
