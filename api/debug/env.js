@@ -4,4 +4,4 @@ export default async function handler(req, res) {
     SUPABASE_SERVICE_ROLE_KEY: !!process.env.SUPABASE_SERVICE_ROLE_KEY
   });
 }
-export const config = { runtime: "nodejs18.x" };
+export const config = { runtime: "nodejs" };
