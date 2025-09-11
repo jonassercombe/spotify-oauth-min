@@ -198,6 +198,9 @@ export default async function handler(req, res) {
     return res.redirect(back);
   } catch (e) {
     console.error("callback error:", e);
-    return res.status(500).send("callback error");
+    const msg = (e && e.stack) ? e.stack : String(e);
+    return res
+      .status(500)
+      .send("callback error – " + msg);
   }
 }
