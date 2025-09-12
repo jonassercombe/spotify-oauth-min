@@ -30,7 +30,7 @@ async function getPlaylistIdsNeedingRefresh(connection_id, staleHours, limit) {
     `&connection_id=eq.${encodeURIComponent(connection_id)}` +
     `&is_owner=is.true&is_public=is.true` +
     `&or=(followers.is.null,followers_checked_at.lt.${encodeURIComponent(sinceIso)})` +
-    `&order=followers_checked_at.nullsfirst.asc` +
+    `&order=followers_checked_at.asc.nullsfirst` +
     `&limit=${limit}`;
   const r = await sb(path);
   if (!r.ok) throw new Error(`supabase select failed: ${r.status} ${await r.text()}`);
