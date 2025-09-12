@@ -20,7 +20,7 @@ async function sb(path, init={}) {
 }
 function decryptToken(b64){
   const hex = need("ENC_SECRET");
-  if(hex.length<64) throw new Error("ENC_SECRET must be 32-byte hex");
+  if(hex.length<64) throw new Error("ENC_SECRET must be 32-byte hex (64 chars)");
   const key = Buffer.from(hex,"hex");
   const raw = Buffer.from(String(b64),"base64");
   const iv = raw.subarray(0,12), tag = raw.subarray(12,28), ct = raw.subarray(28);
@@ -43,7 +43,7 @@ async function refreshAccessToken(refresh_token){
   return j.access_token;
 }
 
-/* ---------- fetch playlist meta + tracks ---------- */
+/* ---------- fetch playlist + tracks ---------- */
 async function getPlaylistRow(playlist_row_id){
   const r = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id&limit=1&id=eq.${encodeURIComponent(playlist_row_id)}`);
   if(!r.ok) throw new Error(`supabase select playlist failed: ${r.status} ${await r.text()}`);
@@ -61,28 +61,13 @@ async function fetchAllTracks(spotify_playlist_id, access_token){
     const r = await fetch(url, { headers:{ Authorization:`Bearer ${access_token}` }});
     const j = await r.json();
     if(!r.ok) throw new Error(`spotify playlist tracks failed: ${r.status} ${JSON.stringify(j)}`);
-    const items = j.items || [];
-    out.push(...items);
+    out.push(...(j.items || []));
     url = j.next;
   }
   return out;
 }
 
-/* ---------- db writes ---------- */
-async function deleteOldItems(playlist_row_id){
-  const r = await sb(`/rest/v1/playlist_items?playlist_id=eq.${encodeURIComponent(playlist_row_id)}`, { method:"DELETE" });
-  if(!r.ok) throw new Error(`delete old items failed: ${r.status} ${await r.text()}`);
-}
 function chunk(arr,n){ const out=[]; for(let i=0;i<arr.length;i+=n) out.push(arr.slice(i,i+n)); return out; }
-async function insertItems(rows){
-  if(rows.length===0) return;
-  const r = await sb(`/rest/v1/playlist_items`, {
-    method:"POST",
-    headers:{ Prefer:"return=minimal" },
-    body: JSON.stringify(rows)
-  });
-  if(!r.ok) throw new Error(`insert items failed: ${r.status} ${await r.text()}`);
-}
 
 /* ---------- handler ---------- */
 export default async function handler(req,res){
@@ -103,8 +88,17 @@ export default async function handler(req,res){
 
     // body
     const body = await readBody(req);
-    const playlist_row_id = body.playlist_row_id;
-    if(!playlist_row_id) return res.status(400).json({ error:"missing_playlist_row_id" });
+    let { playlist_row_id, spotify_playlist_id } = body;
+    if(!playlist_row_id && !spotify_playlist_id) return res.status(400).json({ error:"missing_playlist_identifier" });
+
+    // Falls nur Spotify-ID kam → Zeile nachschlagen
+    if (!playlist_row_id && spotify_playlist_id) {
+      const r = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id&limit=1&playlist_id=eq.${encodeURIComponent(spotify_playlist_id)}`);
+      if(!r.ok) return res.status(500).json({ error:"supabase_select_failed", body: await r.text() });
+      const arr = await r.json();
+      if(!arr[0]) return res.status(404).json({ error:"playlist_not_found_by_spotify_id" });
+      playlist_row_id = arr[0].id;
+    }
 
     // lookup playlist + connection
     const p = await getPlaylistRow(playlist_row_id);
@@ -120,7 +114,7 @@ export default async function handler(req,res){
     // fetch tracks
     const items = await fetchAllTracks(p.playlist_id, access_token);
 
-    // transform -> rows
+    // transform -> rows (eine Zeile je (playlist_id, position))
     const rows = [];
     for(let i=0;i<items.length;i++){
       const it = items[i] || {};
@@ -143,12 +137,34 @@ export default async function handler(req,res){
       });
     }
 
-    // write: delete then insert (batched)
-    await deleteOldItems(playlist_row_id);
+    // UPSERT in Batches: on_conflict=(playlist_id,position)
     const batches = chunk(rows, 500);
-    for(const b of batches){ await insertItems(b); }
+    let upserts = 0;
+    for (const b of batches) {
+      const up = await sb(`/rest/v1/playlist_items?on_conflict=playlist_id,position`, {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify(b),
+      });
+      if (!up.ok) {
+        const txt = await up.text();
+        return res.status(500).json({ error: "upsert_items_failed", body: txt });
+      }
+      upserts += b.length;
+    }
 
-    return res.status(200).json({ ok:true, total: items.length, inserted: rows.length });
+    // CLEANUP: entferne Zeilen mit Position >= neuer Länge (falls Playlist kürzer wurde)
+    // (PostgREST: position=gt.X)
+    const maxKeep = Math.max(0, rows.length - 1);
+    const delUrl = `/rest/v1/playlist_items?playlist_id=eq.${encodeURIComponent(playlist_row_id)}&position=gt.${maxKeep}`;
+    const del = await sb(delUrl, { method: "DELETE", headers: { Prefer: "return=minimal" } });
+    if (!del.ok) {
+      // Kein harter Abbruch, nur als Hinweis zurückgeben
+      const dtxt = await del.text();
+      return res.status(200).json({ ok: true, inserted_or_updated: upserts, total_spotify: items.length, cleanup_warning: dtxt });
+    }
+
+    return res.status(200).json({ ok:true, inserted_or_updated: upserts, total_spotify: items.length });
   }catch(e){
     return res.status(500).json({ error:"server_error", message:String(e) });
   }
