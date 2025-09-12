@@ -24,7 +24,7 @@ export default async function handler(req, res) {
     // Nur öffentliche Felder zurückgeben + Filter: eigene, public, owner
     const path =
       `/rest/v1/playlists` +
-      `?select=id,playlist_id,name,image,tracks_total,updated_at` +
+      `?select=id,playlist_id,name,image,tracks_total,followers,updated_at` +
       `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
       `&is_owner=is.true&is_public=is.true` +
       `&order=updated_at.desc`;
