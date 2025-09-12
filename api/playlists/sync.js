@@ -11,10 +11,6 @@ function need(name) {
   return v;
 }
 
-function b64url(s) {
-  return Buffer.from(s, "utf8").toString("base64url");
-}
-
 // AES-256-GCM decrypt (muss zu enc() aus callback.js passen)
 function decryptToken(b64) {
   const hex = need("ENC_SECRET");
@@ -43,9 +39,9 @@ async function sb(path, init = {}) {
 
 async function getConnectionById(id) {
   const r = await sb(
-    `/rest/v1/spotify_connections?select=id,bubble_user_id,spotify_user_id,refresh_token_enc&limit=1&id=eq.${encodeURIComponent(
-      id
-    )}`
+    `/rest/v1/spotify_connections` +
+      `?select=id,bubble_user_id,spotify_user_id,refresh_token_enc` +
+      `&limit=1&id=eq.${encodeURIComponent(id)}`
   );
   if (!r.ok) throw new Error(`supabase select connection failed: ${r.status} ${await r.text()}`);
   const arr = await r.json();
@@ -101,6 +97,12 @@ async function readBody(req) {
   });
 }
 
+function chunk(arr, n) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+}
+
 /* -------------------- handler -------------------- */
 
 export default async function handler(req, res) {
@@ -120,7 +122,7 @@ export default async function handler(req, res) {
     }
 
     // Params
-    const queryIncludePrivate = req.query.include_private === "1";
+    const includePrivate = req.query.include_private === "1";
     const body = await readBody(req);
     const connection_id = body.connection_id;
     if (!connection_id) return res.status(400).json({ error: "missing_connection_id" });
@@ -140,54 +142,57 @@ export default async function handler(req, res) {
 
     // 4) Filter: owned + public (oder private inkludieren, wenn ?include_private=1)
     const filtered = all.filter(
-      (p) =>
-        p?.owner?.id === conn.spotify_user_id &&
-        (queryIncludePrivate ? true : p?.public === true)
+      (p) => p?.owner?.id === conn.spotify_user_id && (includePrivate ? true : p?.public === true)
     );
 
-    // 5) Upsert in playlists (merge-duplicates on playlist_id)
+    // 5) Deduplizieren & Upsert in Batches (on_conflict=playlist_id)
     const nowIso = new Date().toISOString();
-    const rows = filtered.map((p) => ({
-      playlist_id: p.id,
-      connection_id: conn.id,
-      bubble_user_id: conn.bubble_user_id,
-      name: p.name || null,
-      description: p.description || null,
-      image: p.images?.[0]?.url || null,
-      followers: p.followers?.total ?? null,
-      is_owner: true,
-      is_public: !!p.public,
-      tracks_total: p.tracks?.total ?? 0,
-      snapshot_id: p.snapshot_id || null,
-      last_checked_at: nowIso,
-      updated_at: nowIso,
-    }));
+    const mapById = new Map();
+    for (const p of filtered) {
+      mapById.set(p.id, {
+        playlist_id: p.id,
+        connection_id: conn.id,
+        bubble_user_id: conn.bubble_user_id,
+        name: p.name || null,
+        description: p.description || null,
+        image: p.images?.[0]?.url || null,
+        followers: p.followers?.total ?? null,
+        is_owner: true,
+        is_public: !!p.public,
+        tracks_total: p.tracks?.total ?? 0,
+        snapshot_id: p.snapshot_id || null,
+        last_checked_at: nowIso,
+        updated_at: nowIso,
+      });
+    }
+    const rows = Array.from(mapById.values());
 
     if (rows.length === 0) {
-      return res.status(200).json({ ok: true, upserts: 0, reason: "no_owned_public_playlists" });
+      return res
+        .status(200)
+        .json({ ok: true, upserts: 0, reason: "no_owned_public_playlists" });
     }
 
-    const up = await sb(`/rest/v1/playlists?on_conflict=playlist_id`, {
-      method: "POST",
-      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
-      body: JSON.stringify(rows),
-    });
-    if (!up.ok) {
-      const txt = await up.text();
-      return res.status(500).json({ error: "supabase_upsert_failed", body: txt });
+    const batches = chunk(rows, 100);
+    let upserts = 0;
+    for (const batch of batches) {
+      const up = await sb(`/rest/v1/playlists?on_conflict=playlist_id`, {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify(batch),
+      });
+      if (!up.ok) {
+        const txt = await up.text();
+        return res.status(500).json({ error: "supabase_upsert_failed", body: txt });
+      }
+      upserts += batch.length;
     }
-    const saved = await up.json();
 
-    return res.status(200).json({
-      ok: true,
-      upserts: saved.length,
-      sample: saved.slice(0, 3),
-    });
+    return res.status(200).json({ ok: true, upserts, filtered: filtered.length });
   } catch (e) {
     return res.status(500).json({
       error: "server_error",
       message: String(e),
-      // Hinweis: in Produktion msg schlanker halten
     });
   }
 }
