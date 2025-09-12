@@ -17,8 +17,8 @@ export default async function handler(req,res){
     if(!playlist_row_id) return res.status(400).json({ error:"missing_playlist_row_id" });
 
     const path =
-      `/rest/v1/playlist_items` +
-      `?select=position,track_id,track_name,artist_names,album_name,duration_ms,popularity,preview_url,cover_url,added_at` +
+      `/rest/v1/playlist_items_with_age` +
+      `?select=position,track_id,track_name,artist_names,album_name,duration_ms,popularity,preview_url,cover_url,added_at,age_days,age_label` +
       `&playlist_id=eq.${encodeURIComponent(playlist_row_id)}` +
       `&order=position.asc`;
 
