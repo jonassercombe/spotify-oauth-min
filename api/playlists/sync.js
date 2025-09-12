@@ -11,7 +11,7 @@ function need(name) {
   return v;
 }
 
-// AES-256-GCM decrypt (muss zu enc() aus callback.js passen)
+// AES-256-GCM decrypt (kompatibel zur enc()-Logik aus callback.js)
 function decryptToken(b64) {
   const hex = need("ENC_SECRET");
   if (hex.length < 64) throw new Error("ENC_SECRET must be 32-byte hex (64 chars)");
@@ -73,11 +73,23 @@ async function fetchAllOwnPlaylists(access_token) {
   while (url) {
     const r = await fetch(url, { headers: { Authorization: `Bearer ${access_token}` } });
     const j = await r.json();
-    if (!r.ok) {
-      throw new Error(`spotify /me/playlists failed: ${r.status} ${JSON.stringify(j)}`);
-    }
+    if (!r.ok) throw new Error(`spotify /me/playlists failed: ${r.status} ${JSON.stringify(j)}`);
     out.push(...(j.items || []));
     url = j.next;
+  }
+  return out;
+}
+
+// Followers pro Playlist (Spotify liefert followers.total NICHT in /me/playlists)
+async function fetchFollowersForIds(ids, access_token) {
+  const out = new Map();
+  for (const id of ids) {
+    const r = await fetch(
+      `https://api.spotify.com/v1/playlists/${id}?fields=followers(total)`,
+      { headers: { Authorization: `Bearer ${access_token}` } }
+    );
+    const j = await r.json();
+    if (r.ok) out.set(id, j?.followers?.total ?? null);
   }
   return out;
 }
@@ -88,11 +100,7 @@ async function readBody(req) {
     let data = "";
     req.on("data", (c) => (data += c));
     req.on("end", () => {
-      try {
-        resolve(JSON.parse(data || "{}"));
-      } catch {
-        resolve({});
-      }
+      try { resolve(JSON.parse(data || "{}")); } catch { resolve({}); }
     });
   });
 }
@@ -114,15 +122,18 @@ export default async function handler(req, res) {
     if (req.method === "OPTIONS") return res.status(204).end();
     if (req.method !== "POST") return res.status(405).json({ error: "method_not_allowed" });
 
-    // optionaler Schutz-Header
+    // optionaler Secret-Header
     const expected = process.env.APP_WEBHOOK_SECRET;
     if (expected) {
       const got = req.headers["x-app-secret"];
       if (got !== expected) return res.status(401).json({ error: "unauthorized" });
     }
 
-    // Params
+    // Query-Flags
     const includePrivate = req.query.include_private === "1";
+    const withFollowers = req.query.with_followers === "1";
+
+    // Body
     const body = await readBody(req);
     const connection_id = body.connection_id;
     if (!connection_id) return res.status(400).json({ error: "missing_connection_id" });
@@ -140,10 +151,19 @@ export default async function handler(req, res) {
     // 3) Alle Playlists holen
     const all = await fetchAllOwnPlaylists(access_token);
 
-    // 4) Filter: owned + public (oder private inkludieren, wenn ?include_private=1)
+    // 4) Filter: owned + public (oder private inkludieren, wenn Flag)
     const filtered = all.filter(
       (p) => p?.owner?.id === conn.spotify_user_id && (includePrivate ? true : p?.public === true)
     );
+
+    // 4b) Optional Followers nachladen (max. 50 pro Run – schonend)
+    let followersMap = new Map();
+    let followersFetched = 0;
+    if (withFollowers) {
+      const ids = filtered.slice(0, 50).map((p) => p.id);
+      followersMap = await fetchFollowersForIds(ids, access_token);
+      followersFetched = followersMap.size;
+    }
 
     // 5) Deduplizieren & Upsert in Batches (on_conflict=playlist_id)
     const nowIso = new Date().toISOString();
@@ -156,7 +176,9 @@ export default async function handler(req, res) {
         name: p.name || null,
         description: p.description || null,
         image: p.images?.[0]?.url || null,
-        followers: p.followers?.total ?? null,
+        followers: followersMap.has(p.id)
+          ? followersMap.get(p.id)
+          : (p.followers?.total ?? null), // /me/playlists liefert das i. d. R. nicht
         is_owner: true,
         is_public: !!p.public,
         tracks_total: p.tracks?.total ?? 0,
@@ -168,9 +190,13 @@ export default async function handler(req, res) {
     const rows = Array.from(mapById.values());
 
     if (rows.length === 0) {
-      return res
-        .status(200)
-        .json({ ok: true, upserts: 0, reason: "no_owned_public_playlists" });
+      return res.status(200).json({
+        ok: true,
+        upserts: 0,
+        filtered: 0,
+        followers_fetched: followersFetched,
+        reason: "no_owned_public_playlists"
+      });
     }
 
     const batches = chunk(rows, 100);
@@ -188,7 +214,12 @@ export default async function handler(req, res) {
       upserts += batch.length;
     }
 
-    return res.status(200).json({ ok: true, upserts, filtered: filtered.length });
+    return res.status(200).json({
+      ok: true,
+      upserts,
+      filtered: filtered.length,
+      followers_fetched: followersFetched
+    });
   } catch (e) {
     return res.status(500).json({
       error: "server_error",
