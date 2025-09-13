@@ -333,10 +333,10 @@ const routes = {
     if (!playlist_row_id) return bad(res, 400, "missing_playlist_row_id");
 
     const path =
-     `/rest/v1/playlist_items_with_lock_fmt` +
+     `/rest/v1/playlist_items_ui` +
      `?select=playlist_id,position,track_id,track_name,artist_names,album_name,` +
-     `duration_ms,duration_formatted,added_at,track_uri,popularity,preview_url,cover_url,` +
-     `is_locked,locked_position,locked_at` +
+     `duration_ms,duration_formatted,added_at,age_days,age_label,track_uri,` +
+     `popularity,preview_url,cover_url,is_locked,locked_position,locked_at` +
      `&playlist_id=eq.${encodeURIComponent(playlist_row_id)}` +
      `&order=position.asc`;
 
