@@ -2,32 +2,41 @@
 import { createClient } from '@supabase/supabase-js';
 
 const url = process.env.SUPABASE_URL!;
-const anon = process.env.SUPABASE_ANON_KEY!;
 const service = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 
-export const supabaseAsAnon = () => createClient(url, anon, { auth: { persistSession: false }});
-export const supabaseAsService = () => createClient(url, service, { auth: { persistSession: false }});
+export const sbService = () => createClient(url, service, { auth: { persistSession: false } });
 
-// Für UI-Calls mit User-JWT (kommt von Bubble)
-export const supabaseWithBearer = (jwt: string) => {
-  const c = createClient(url, anon, { auth: { persistSession: false } });
-  // @ts-ignore
-  c.auth.setAuth(jwt);
-  return c;
-};
-
-// Hilfsfunktion: prüft, ob caller Zugriff auf playlist_id hat (RLS schützt zusätzlich)
-export async function assertUserAccessToPlaylist(sb: ReturnType<typeof supabaseWithBearer>, playlist_id: string) {
+export async function assertBubbleUserExists(sb: ReturnType<typeof sbService>, bubbleUserId: string) {
   const { data, error } = await sb
-    .from('playlists')
+    .from('app_users')                // <- Name eurer User-Tabelle (ggf. anpassen)
     .select('id')
-    .eq('id', playlist_id)
+    .eq('id', bubbleUserId)
     .limit(1)
     .maybeSingle();
   if (error) throw error;
   if (!data) {
-    const e: any = new Error('Playlist not found or not accessible');
-    e.status = 404;
+    const e: any = new Error('Unknown bubble_user_id');
+    e.status = 401;
+    throw e;
+  }
+}
+
+export async function assertPlaylistOwnership(
+  sb: ReturnType<typeof sbService>,
+  playlist_id: string,
+  bubbleUserId: string
+) {
+  const { data, error } = await sb
+    .from('playlists')
+    .select('id')
+    .eq('id', playlist_id)
+    .eq('bubble_user_id', bubbleUserId)  // <- Feldname ggf. anpassen
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) {
+    const e: any = new Error('Playlist not owned by user');
+    e.status = 403;
     throw e;
   }
 }
