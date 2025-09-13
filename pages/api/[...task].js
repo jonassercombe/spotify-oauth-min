@@ -333,10 +333,12 @@ const routes = {
     if (!playlist_row_id) return bad(res, 400, "missing_playlist_row_id");
 
     const path =
-       `/rest/v1/playlist_items_with_age_and_lock` +
-       `?select=position,track_id,track_name,artist_names,album_name,duration_ms,duration_formatted,popularity,preview_url,cover_url,added_at,age_days,age_label,is_locked,locked_position,locked_at` +
-       `&playlist_id=eq.${encodeURIComponent(playlist_row_id)}` +
-       `&order=position.asc`;
+     `/rest/v1/playlist_items_with_lock_fmt` +
+     `?select=playlist_id,position,track_id,track_name,artist_names,album_name,` +
+     `duration_ms,duration_formatted,added_at,track_uri,popularity,preview_url,cover_url,` +
+     `is_locked,locked_position,locked_at` +
+     `&playlist_id=eq.${encodeURIComponent(playlist_row_id)}` +
+     `&order=position.asc`;
 
     const r = await fetch(SUPABASE_URL + path, {
       headers: { apikey: SRK, Authorization: `Bearer ${SRK}` },
