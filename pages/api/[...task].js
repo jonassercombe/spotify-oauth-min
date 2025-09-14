@@ -1010,11 +1010,12 @@ const routes = {
       },
       body: JSON.stringify({
         url: targetUrl,
-        headers: JSON.stringify({ 
-          'Content-Type': 'application/json', 
-          'x-app-secret': APP_WEBHOOK_SECRET 
-        }),
-        body: syncBody
+        headers: {                      // <-- jsonb Objekt, nicht String
+          'Content-Type': 'application/json',
+          'x-app-secret': APP_WEBHOOK_SECRET
+        },
+        body: syncBody,                 // text ok
+        timeout_milliseconds: 15000     // optional: etwas großzügiger
       })
     });
 
