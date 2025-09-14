@@ -8,6 +8,12 @@ const json = (res, code, payload) => res.status(code).json(payload);
 const bad  = (res, code, msg) => json(res, code, { error: msg });
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+async function parseJsonSafe(resp) {
+  const txt = await resp.text();
+  try { return { json: JSON.parse(txt), text: txt }; }
+  catch { return { json: null, text: txt }; }
+}
+
 function withCORS(handler) {
   return async (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -96,9 +102,11 @@ async function refreshAccessToken(refresh_token) {
   const r = await fetch("https://accounts.spotify.com/api/token", {
     method:"POST", headers:{ "Content-Type":"application/x-www-form-urlencoded" }, body
   });
-  const j = await r.json();
-  if (!r.ok || !j.access_token) throw new Error(`spotify refresh failed: ${r.status} ${JSON.stringify(j)}`);
-  return j; // { access_token, expires_in, ... }
+  const { json, text } = await parseJsonSafe(r);
+  if (!r.ok || !json?.access_token) {
+    throw new Error(`spotify refresh failed: ${r.status} ${json ? JSON.stringify(json) : text}`);
+  }
+  return json; // { access_token, expires_in, ... }
 }
 
 async function getAccessTokenFromConnection(connection_id) {
@@ -508,10 +516,17 @@ const routes = {
     let url = `https://api.spotify.com/v1/playlists/${encodeURIComponent(p.playlist_id)}/tracks?limit=100&offset=0&fields=items(added_at,track(id,name,uri,popularity,duration_ms,preview_url,album(name,images),artists(name))),total,next,offset`;
     while (url) {
       const r = await fetch(url, { headers: { Authorization: `Bearer ${access_token}` } });
-      const j = await r.json();
-      if (!r.ok) return bad(res, r.status, `spotify playlist tracks failed: ${JSON.stringify(j)}`);
-      items.push(...(j.items || []));
-      url = j.next;
+      if (r.status === 429) {
+        const retry = Number(r.headers.get("retry-after") || "1");
+        await sleep((retry + 0.2) * 1000);
+        continue; // nochmal versuchen
+      }
+      const { json, text } = await parseJsonSafe(r);
+      if (!r.ok) {
+        return bad(res, r.status, `spotify playlist tracks failed: ${r.status} ${json ? JSON.stringify(json) : text}`);
+      }
+      items.push(...(json?.items || []));
+      url = json?.next || null;
     }
 
     const rows = [];
@@ -583,10 +598,17 @@ const routes = {
     const all = [];
     while (url) {
       const r = await fetch(url, { headers: { Authorization: `Bearer ${access_token}` } });
-      const j = await r.json();
-      if (!r.ok) return bad(res, r.status, `spotify /me/playlists failed: ${JSON.stringify(j)}`);
-      all.push(...(j.items || []));
-      url = j.next;
+      if (r.status === 429) {
+        const retry = Number(r.headers.get("retry-after") || "1");
+        await sleep((retry + 0.2) * 1000);
+        continue; // nochmal versuchen
+      }
+      const { json, text } = await parseJsonSafe(r);
+      if (!r.ok) {
+        return bad(res, r.status, `spotify /me/playlists failed: ${r.status} ${json ? JSON.stringify(json) : text}`);
+      }
+      all.push(...(json?.items || []));
+      url = json?.next || null;
     }
 
     const includePrivate = req.query.include_private === "1";
@@ -604,8 +626,13 @@ const routes = {
           `https://api.spotify.com/v1/playlists/${id}?fields=followers(total)`,
           { headers: { Authorization: `Bearer ${access_token}` } }
         );
-        const j = await r.json();
-        if (r.ok) followersMap.set(id, j?.followers?.total ?? null);
+        if (r.status === 429) {
+          const retry = Number(r.headers.get("retry-after") || "1");
+          await sleep((retry + 0.2) * 1000);
+          continue; // nochmal versuchen
+        }
+        const { json, text } = await parseJsonSafe(r);
+        if (r.ok) followersMap.set(id, json?.followers?.total ?? null);
       }
       followersFetched = followersMap.size;
     }
