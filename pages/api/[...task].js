@@ -18,7 +18,7 @@ function withCORS(handler) {
   return async (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,X-Bubble-User-Id,x-app-secret,x-service-key");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,X-Bubble-User-Id,x-app-secret,x-service-key,x-bubble-user-id");
     if (req.method === "OPTIONS") return res.status(204).end();
     return handler(req, res);
   };
