@@ -1003,19 +1003,18 @@ const routes = {
     // net.http_post einmalig starten – nicht darauf warten, dass der Sync fertig ist
     const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/net_http_post`, {
       method: 'POST',
-      headers: { 
-        apikey: SRK, 
-        Authorization: `Bearer ${SRK}`, 
-        'Content-Type': 'application/json' 
+      headers: {
+        apikey: SRK,
+        Authorization: `Bearer ${SRK}`,
+        'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        url: targetUrl,
-        headers: {                      // <-- jsonb Objekt, nicht String
+        body: syncBody,
+        headers: {
           'Content-Type': 'application/json',
           'x-app-secret': APP_WEBHOOK_SECRET
         },
-        body: syncBody,                 // text ok
-        timeout_milliseconds: 15000     // optional: etwas großzügiger
+        url: targetUrl
       })
     });
 
