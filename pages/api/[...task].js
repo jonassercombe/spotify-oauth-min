@@ -957,6 +957,73 @@ const routes = {
     return json(res, 200, { ok:true, enforced: true, playlist_id });
   },
 
+  /* ---------- playlists/mark-sync-needed (POST, secret) ---------- */
+  "playlists/mark-sync-needed": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    if (process.env.APP_WEBHOOK_SECRET) {
+      const got = req.headers["x-app-secret"];
+      if (got !== process.env.APP_WEBHOOK_SECRET) return bad(res, 401, "unauthorized");
+    }
+    const body = await readBody(req);
+    const { playlist_id } = body;
+    if (!playlist_id) return bad(res, 400, "missing_playlist_id");
+
+    const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK } = process.env;
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/playlists?id=eq.${encodeURIComponent(playlist_id)}`, {
+      method: 'PATCH',
+      headers: {
+        apikey: SRK, 
+        Authorization: `Bearer ${SRK}`,
+        'Content-Type': 'application/json', 
+        Prefer: 'return=minimal'
+      },
+      body: JSON.stringify({ needs_sync: true })
+    });
+    if (!r.ok) return bad(res, 500, `supabase_patch_failed: ${await r.text()}`);
+    return json(res, 200, { ok: true });
+  },
+
+  /* ---------- playlists/dispatch-sync (POST, secret) ---------- */
+  "playlists/dispatch-sync": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    if (process.env.APP_WEBHOOK_SECRET) {
+      const got = req.headers["x-app-secret"];
+      if (got !== process.env.APP_WEBHOOK_SECRET) return bad(res, 401, "unauthorized");
+    }
+    const body = await readBody(req);
+    const { playlist_id } = body;
+    if (!playlist_id) return bad(res, 400, "missing_playlist_id");
+
+    // pg_net-Aufruf an Supabase: ruft asynchron deinen /api/playlists/sync-items Endpoint auf
+    const base = process.env.PUBLIC_BASE_URL || `https://${process.env.VERCEL_URL}`;
+    const targetUrl = `${base}/api/playlists/sync-items`;
+    const syncBody = JSON.stringify({ playlist_row_id: playlist_id });
+
+    const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK, APP_WEBHOOK_SECRET } = process.env;
+    // net.http_post einmalig starten – nicht darauf warten, dass der Sync fertig ist
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/net_http_post`, {
+      method: 'POST',
+      headers: { 
+        apikey: SRK, 
+        Authorization: `Bearer ${SRK}`, 
+        'Content-Type': 'application/json' 
+      },
+      body: JSON.stringify({
+        url: targetUrl,
+        headers: JSON.stringify({ 
+          'Content-Type': 'application/json', 
+          'x-app-secret': APP_WEBHOOK_SECRET 
+        }),
+        body: syncBody
+      })
+    });
+
+    // Wir erwarten 200 von rpc-Aufruf; selbst wenn der spätere Sync 10–60s läuft, ist dieser Call sofort fertig
+    if (!r.ok) return bad(res, 500, `pg_net_http_post_failed: ${await r.text()}`);
+
+    return json(res, 202, { ok: true, dispatched: true });
+  },
+
   /* ---------- ping ---------- */
   "watch/ping": async (_req, res) => json(res, 200, { ok: true }),
 };
