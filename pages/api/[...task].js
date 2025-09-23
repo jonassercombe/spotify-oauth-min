@@ -1226,37 +1226,47 @@ const routes = {
 
   /* ---------- locks/set (POST, Bubble) ---------- */
   "locks/set": async (req, res) => {
-    if (req.method !== "POST") return bad(res, 405, "Method not allowed");
-    const bubbleUserId = req.headers["x-bubble-user-id"];
-    if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
+     if (req.method !== "POST") return bad(res, 405, "Method not allowed");
+     const bubbleUserId = req.headers["x-bubble-user-id"];
+     if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
+   
+     // user exists?
+     const usr = await sb(`/rest/v1/app_users?select=bubble_user_id&limit=1&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r=>r.json());
+     if (!usr?.[0]) return bad(res, 401, "Unknown bubble_user_id");
+   
+     const { playlist_id, track_id, locked_position, is_locked = true } = await readBody(req);
+   
+     // Wichtig: 0 ist ein gültiger Wert → nicht mit !locked_position prüfen
+     if (!playlist_id || !track_id || locked_position === undefined || locked_position === null) {
+       return bad(res, 400, "Missing playlist_id, track_id or locked_position");
+     }
+   
+     // ownership
+     const own = await sb(`/rest/v1/playlists?select=id&limit=1&id=eq.${encodeURIComponent(String(playlist_id))}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r=>r.json());
+     if (!own?.[0]) return bad(res, 403, "Playlist not owned by user");
+   
+     // UI liefert i.d.R. 1-basiert → auf 0-basiert normalisieren (nie negativ)
+     const rawPos = Number(locked_position);
+     if (!Number.isFinite(rawPos)) return bad(res, 400, "invalid locked_position");
+     const lockedPosZero = rawPos >= 1 ? rawPos - 1 : Math.max(0, rawPos);
+   
+     // upsert lock (jetzt 0-basiert speichern)
+     const up = await sb(`/rest/v1/playlist_item_locks?on_conflict=playlist_id,track_id`, {
+       method: "POST",
+       headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+       body: JSON.stringify([{
+         playlist_id,
+         track_id,
+         locked_position: lockedPosZero,
+         is_locked: !!is_locked,
+         locked_at: new Date().toISOString()
+       }]),
+     });
+     if (!up.ok) return bad(res, 500, `supabase_upsert_failed: ${await up.text()}`);
+     const data = await up.json();
+     return json(res, 200, { ok:true, lock: Array.isArray(data) ? data[0] : data });
+   },
 
-    // user exists?
-    const usr = await sb(`/rest/v1/app_users?select=bubble_user_id&limit=1&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r=>r.json());
-    if (!usr?.[0]) return bad(res, 401, "Unknown bubble_user_id");
-
-    const { playlist_id, track_id, locked_position, is_locked = true } = await readBody(req);
-    if (!playlist_id || !track_id || !locked_position) return bad(res, 400, "Missing playlist_id, track_id or locked_position");
-
-    // ownership
-    const own = await sb(`/rest/v1/playlists?select=id&limit=1&id=eq.${encodeURIComponent(String(playlist_id))}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r=>r.json());
-    if (!own?.[0]) return bad(res, 403, "Playlist not owned by user");
-
-    // upsert lock
-    const up = await sb(`/rest/v1/playlist_item_locks?on_conflict=playlist_id,track_id`, {
-      method: "POST",
-      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
-      body: JSON.stringify([{
-        playlist_id,
-        track_id,
-        locked_position: Number(locked_position),
-        is_locked: !!is_locked,
-        locked_at: new Date().toISOString()
-      }]),
-    });
-    if (!up.ok) return bad(res, 500, `supabase_upsert_failed: ${await up.text()}`);
-    const data = await up.json();
-    return json(res, 200, { ok:true, lock: Array.isArray(data) ? data[0] : data });
-  },
 
   /* ---------- locks/unset (POST, Bubble) ---------- */
   "locks/unset": async (req, res) => {
