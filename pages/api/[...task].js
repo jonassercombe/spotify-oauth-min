@@ -1224,6 +1224,75 @@ const routes = {
     return json(res, 200, { ok:true, check: out1, sync: out2 });
   },
 
+
+
+
+
+   /* ---------- playlist-items/move (POST) ---------- */
+   "playlist-items/move": async (req, res) => {
+     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+     const bubbleUserId = req.headers["x-bubble-user-id"];
+     if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
+   
+     const { playlist_id, track_id, dir, steps = 1 } = await readBody(req);
+     if (!playlist_id || !track_id || !dir) return bad(res, 400, "Missing playlist_id, track_id or dir");
+   
+     // Ownership
+     const own = await sb(`/rest/v1/playlists?select=id&limit=1&id=eq.${encodeURIComponent(String(playlist_id))}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r=>r.json());
+     if (!own?.[0]) return bad(res, 403, "Playlist not owned by user");
+   
+     // RPC call
+     const r = await sb(`/rest/v1/rpc/playlist_move_one`, {
+       method: "POST",
+       body: JSON.stringify({
+         p_playlist_id: playlist_id,
+         p_track_id: track_id,
+         p_dir: String(dir || "").toLowerCase(),
+         p_steps: Number(steps) || 1
+       })
+     });
+     const txt = await r.text();
+     let j = null; try { j = txt ? JSON.parse(txt) : null; } catch {}
+     if (!r.ok) return bad(res, r.status, `rpc_move_failed: ${txt}`);
+   
+     // optional: Spotify Enforce anstoßen (asynchron)
+     // await routes["playlists/dispatch-sync"]({ ...req, body: { playlist_id } }, { status: ()=>({ json: ()=>{} }) });
+   
+     return json(res, 200, { ok: true, result: j?.[0] || null });
+   },
+   
+   /* ---------- playlist-items/remove (POST) ---------- */
+   "playlist-items/remove": async (req, res) => {
+     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+     const bubbleUserId = req.headers["x-bubble-user-id"];
+     if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
+   
+     const { playlist_id, track_id } = await readBody(req);
+     if (!playlist_id || !track_id) return bad(res, 400, "Missing playlist_id or track_id");
+   
+     // Ownership
+     const own = await sb(`/rest/v1/playlists?select=id&limit=1&id=eq.${encodeURIComponent(String(playlist_id))}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r=>r.json());
+     if (!own?.[0]) return bad(res, 403, "Playlist not owned by user");
+   
+     // RPC call
+     const r = await sb(`/rest/v1/rpc/playlist_remove_one`, {
+       method: "POST",
+       body: JSON.stringify({
+         p_playlist_id: playlist_id,
+         p_track_id: track_id
+       })
+     });
+     const txt = await r.text();
+     if (!r.ok) return bad(res, r.status, `rpc_remove_failed: ${txt}`);
+   
+     // optional: Spotify Enforce anstoßen (asynchron)
+     // await routes["playlists/dispatch-sync"]({ ...req, body: { playlist_id } }, { status: ()=>({ json: ()=>{} }) });
+   
+     return json(res, 200, { ok: true });
+   },
+
+
+   
   /* ---------- locks/set (POST, Bubble) ---------- */
   "locks/set": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "Method not allowed");
