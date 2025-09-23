@@ -754,40 +754,59 @@ const routes = {
        console.log("sync-items:mapped_rows", { rows: rows.length });
    
        // UPSERT in Batches (Timeout pro Write)
-       const chunk = (arr, n) => {
-         const out = [];
-         for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
-         return out;
-       };
-       const batches = chunk(rows, 500);
-       let batchIdx = 0;
-       for (const b of batches) {
-         const tUp = Date.now();
-         const { r, text } = await fetchText(
-           `${process.env.SUPABASE_URL}/rest/v1/playlist_items?on_conflict=playlist_id,position`,
-           {
-             method: "POST",
-             headers: {
-               apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-               Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-               Prefer: "resolution=merge-duplicates,return=minimal",
-               "Content-Type": "application/json"
+         const chunk = (arr, n) => {
+           const out = [];
+           for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+           return out;
+         };
+         const batches = chunk(rows, 500);
+         let batchIdx = 0;
+         
+         for (const b of batches) {
+           const tUp = Date.now();
+           const { r, text } = await fetchText(
+             `${process.env.SUPABASE_URL}/rest/v1/playlist_items?on_conflict=playlist_id,position`,
+             {
+               method: "POST",
+               headers: {
+                 apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+                 Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+                 Prefer: "resolution=merge-duplicates,return=minimal",
+                 "Content-Type": "application/json"
+               },
+               body: JSON.stringify(b)
              },
-             body: JSON.stringify(b)
-           },
-           20000
-         );
-         if (!r.ok) {
-           console.error("sync-items:upsert_failed", { batch: batchIdx, size: b.length, text });
-           await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
-             method: "PATCH", headers: { Prefer: "return=minimal" },
-             body: JSON.stringify({ sync_started_at: null })
-           }).catch(() => {});
-           console.timeEnd(timeLabel);
-           return bad(res, 500, `upsert_items_failed: ${text}`);
+             20000
+           );
+         
+           if (!r.ok) {
+             console.error("sync-items:upsert_failed", { batch: batchIdx, size: b.length, text });
+         
+             // Guard freigeben und neu planen (statt hart 500 zu werfen)
+             await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
+               method: "PATCH",
+               headers: { Prefer: "return=minimal" },
+               body: JSON.stringify({
+                 sync_started_at: null,
+                 needs_sync: true,
+                 next_check_at: new Date(Date.now() + 60 * 1000).toISOString()
+               })
+             }).catch(() => {});
+         
+             console.timeEnd(timeLabel);
+             return json(res, 202, {
+               ok: false,
+               rescheduled: true,
+               reason: "upsert_failed",
+               status: r.status,
+               error: text
+             });
+           }
+         
+           console.log("sync-items:upsert_ok", { batch: batchIdx++, size: b.length, took_ms: Date.now() - tUp });
+           // Kleines Pacing hilft Supabase nicht zu überfahren
+           await sleep(40);
          }
-         console.log("sync-items:upsert_ok", { batch: batchIdx++, size: b.length, took_ms: Date.now() - tUp });
-       }
    
        // Tail-Cleanup (löscht alte Positionen > maxKeep)
        const maxKeep = Math.max(0, rows.length - 1);
