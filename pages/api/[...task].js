@@ -523,7 +523,8 @@ const routes = {
      const bodyRaw = await readBody(req);
      let { playlist_row_id, spotify_playlist_id } = bodyRaw;
    
-     console.time("sync-items");
+     const timeLabel = `sync-items:${playlist_row_id || spotify_playlist_id || 'unknown'}`;
+      console.time(timeLabel);
      console.log("sync-items:start", {
        by: playlist_row_id ? "row_id" : (spotify_playlist_id ? "spotify_id" : "missing"),
        playlist_row_id,
@@ -559,7 +560,34 @@ const routes = {
          connection_id: p.connection_id,
          bubble_user_id: p.bubble_user_id
        });
-   
+
+        // Reentrancy-Guard (Claim)
+         const claim = await fetch(
+           `${process.env.SUPABASE_URL}/rest/v1/playlists` +
+           `?id=eq.${encodeURIComponent(p.id)}&sync_started_at=is.null`,
+           {
+             method: "PATCH",
+             headers: {
+               apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+               Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+               "Content-Type": "application/json",
+               Prefer: "return=representation"
+             },
+             body: JSON.stringify({ sync_started_at: new Date().toISOString() })
+           }
+         );
+         if (!claim.ok) {
+           console.timeEnd(timeLabel);
+           return bad(res, 500, `supabase_claim_failed: ${await claim.text()}`);
+         }
+         const claimed = await claim.json(); // nur gesetzt, wenn vorher NULL
+         if (!Array.isArray(claimed) || claimed.length === 0) {
+           console.warn("sync-items:already_in_progress", { playlist_row_id: p.id });
+           console.timeEnd(timeLabel);
+           return json(res, 202, { ok:true, already_in_progress:true });
+         }
+
+        
        // Connection & Token
        const cr = await sb(`/rest/v1/spotify_connections?select=id,refresh_token_enc&limit=1&id=eq.${encodeURIComponent(p.connection_id)}`);
        if (!cr.ok) return bad(res, 500, `supabase select connection failed: ${await cr.text()}`);
@@ -607,7 +635,7 @@ const routes = {
              if (attempt++ >= MAX_429_RETRIES_PER_PAGE) {
                return bad(res, 429, `rate limited too long on tracks page (attempts=${attempt})`);
              }
-             await sleep((retry + Math.random() * 0.5) * 1000);
+             await sleep((retry + 0.5 + Math.random() * 0.8) * 1000);
              continue; // retry same page
            }
    
@@ -708,7 +736,7 @@ const routes = {
        );
        if (!delR.ok) {
          console.warn("sync-items:cleanup_warning", { text: dtxt, took_ms: Date.now() - tDel });
-         console.timeEnd("sync-items");
+         console.timeEnd(timeLabel);
          return json(res, 200, {
            ok: true,
            inserted_or_updated: rows.length,
@@ -718,12 +746,12 @@ const routes = {
        }
        console.log("sync-items:cleanup_ok", { took_ms: Date.now() - tDel });
    
-       console.timeEnd("sync-items");
+       console.timeEnd(timeLabel);
        return json(res, 200, { ok: true, inserted_or_updated: rows.length, total_spotify: items.length });
      } catch (e) {
        const msg = e && e.stack ? e.stack : String(e);
        console.error("sync-items:error", msg);
-       console.timeEnd("sync-items");
+       console.timeEnd(timeLabel);
        return bad(res, 500, "sync_items_exception: " + msg);
      }
    },
@@ -951,7 +979,7 @@ const routes = {
     if (!base) return bad(res, 500, "missing PUBLIC_BASE_URL/VERCEL_URL");
     const syncUrl = `${base}/api/playlists/sync-items`;
 
-    let i=0, running=0, conc=Number(qs.concurrency || "3"), synced=0, failed=0;
+    let i=0, running=0, conc=1, synced=0, failed=0; // conc=1, um Herdeneffekt zu vermeiden
     await new Promise((resolve) => {
       const kick = () => {
         while (running < conc && i < rows.length) {
