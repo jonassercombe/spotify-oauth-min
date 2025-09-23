@@ -666,29 +666,51 @@ const routes = {
            );
    
            if (r.status === 429) {
-             const retry = Math.min(5, Number(r.headers.get("retry-after") || "1"));
-             console.warn("sync-items:429", { page: pageCount, attempt, retry_after_s: retry });
-             if (attempt++ >= MAX_429_RETRIES_PER_PAGE) {
-               await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
-                 method: "PATCH", headers: { Prefer: "return=minimal" },
-                 body: JSON.stringify({ sync_started_at: null })
-               }).catch(() => {});
-               console.timeEnd(timeLabel);
-               return bad(res, 429, `rate limited too long on tracks page (attempts=${attempt})`);
-             }
-             await sleep((retry + 0.5 + Math.random() * 0.8) * 1000);
-             continue; // retry same page
+           // Exponentieller Backoff + Jitter
+           const ra = Number(r.headers.get("retry-after") || "1");
+           const base = Math.max(ra, 1);
+           const waitSec = Math.min(60, base * Math.pow(2, attempt)) + (Math.random() * 0.8);
+           console.warn("sync-items:429", { page: pageCount, attempt, retry_after_s: ra, wait_s: waitSec.toFixed(1) });
+         
+           if (attempt++ >= MAX_429_RETRIES_PER_PAGE) {
+             // Verbindung in Cooldown schicken und Sync später neu versuchen
+             const untilIso = new Date(Date.now() + (base + 5) * 1000).toISOString();
+             await sb(`/rest/v1/connection_rl_state`, {
+               method: "POST",
+               headers: { Prefer: "resolution=merge-duplicates" },
+               body: JSON.stringify({ connection_id: p.connection_id, cooldown_until: untilIso })
+             }).catch(()=>{});
+         
+             // Playlist auf "später neu versuchen"
+             await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
+               method: "PATCH",
+               headers: { Prefer: "return=minimal" },
+               body: JSON.stringify({
+                 sync_started_at: null,
+                 // optional: internes Scheduling-Feld, falls vorhanden
+                 next_check_at: new Date(Date.now() + (base + 5) * 1000).toISOString(),
+                 needs_sync: true
+               })
+             }).catch(()=>{});
+         
+             console.timeEnd(timeLabel);
+             // 202 = akzeptiert/neu geplant
+             return json(res, 202, { ok:false, rescheduled:true, reason:"rate_limited", retry_after_s: ra });
            }
+         
+           await sleep(waitSec * 1000);
+           continue;
+         }
    
            if (!r.ok) {
-             console.error("sync-items:spotify_tracks_failed", { status: r.status, body: json || text });
-             await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
-               method: "PATCH", headers: { Prefer: "return=minimal" },
-               body: JSON.stringify({ sync_started_at: null })
-             }).catch(() => {});
-             console.timeEnd(timeLabel);
-             return bad(res, r.status, `spotify playlist tracks failed: ${r.status} ${json ? JSON.stringify(json) : text}`);
-           }
+              console.error("sync-items:spotify_tracks_failed", { status: r.status, body: json || text });
+              await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
+                method: "PATCH", headers: { Prefer: "return=minimal" },
+                body: JSON.stringify({ sync_started_at: null, needs_sync: true, next_check_at: new Date(Date.now()+60*1000).toISOString() })
+              }).catch(() => {});
+              console.timeEnd(timeLabel);
+              return json(res, 202, { ok:false, rescheduled:true, status:r.status });
+            }
    
            const len = Array.isArray(json?.items) ? json.items.length : 0;
            items.push(...(json?.items || []));
@@ -954,12 +976,14 @@ const routes = {
 
     const order = encodeURIComponent("next_check_at.asc.nullsfirst");
     const sel = await sb(
-      `/rest/v1/playlists?select=id,playlist_id,snapshot_id,next_check_at,last_snapshot_checked_at,error_count` +
-      `&connection_id=eq.${encodeURIComponent(body.connection_id)}` +
-      `&is_owner=is.true&is_public=is.true` +
-      `&or=(next_check_at.is.null,next_check_at.lte.${encodeURIComponent(new Date().toISOString())})` +
-      `&order=${order}&limit=${encodeURIComponent(qs.limit || "200")}`
-    );
+        `/rest/v1/playlists?select=id,playlist_id,snapshot_id,next_check_at,last_snapshot_checked_at,error_count` +
+        `&connection_id=eq.${encodeURIComponent(body.connection_id)}` +
+        `&is_owner=is.true&is_public=is.true` +
+        `&sync_started_at=is.null` + // <— NEU: niemals poll’en, wenn gerade gesynct wird
+        `&or=(next_check_at.is.null,next_check_at.lte.${encodeURIComponent(new Date().toISOString())})` +
+        `&order=${order}&limit=${encodeURIComponent(qs.limit || "200")}`
+      );
+
     if (!sel.ok) return bad(res, 500, `supabase_select_failed: ${await sel.text()}`);
     const rows = await sel.json();
     if (rows.length === 0) return json(res, 200, { ok:true, checked:0, updated:0, marked:0 });
