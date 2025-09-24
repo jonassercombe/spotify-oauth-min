@@ -1841,35 +1841,129 @@ const routes = {
      return json(res, 200, { ok: true, result: j?.[0] || null });
    },
    
-   /* ---------- playlist-items/remove (POST) ---------- */
+   /* ---------- playlist-items/remove (POST, Bubble) ---------- */
    "playlist-items/remove": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+   
      const bubbleUserId = req.headers["x-bubble-user-id"];
      if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
    
-     const { playlist_id, track_id } = await readBody(req);
-     if (!playlist_id || !track_id) return bad(res, 400, "Missing playlist_id or track_id");
+     try {
+       const body = await readBody(req);
+       const playlist_id = body.playlist_id;
+       const track_id = body.track_id;
+       // Optional: 1-basige Position aus dem UI; wenn leer → wir entscheiden (erste Fundstelle) oder "alle"
+       const pos1 = body.position ?? body.position_1based ?? null;
+       const remove_all = !!body.remove_all; // wenn true → alle Vorkommen löschen
    
-     // Ownership
-     const own = await sb(`/rest/v1/playlists?select=id&limit=1&id=eq.${encodeURIComponent(String(playlist_id))}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r=>r.json());
-     if (!own?.[0]) return bad(res, 403, "Playlist not owned by user");
+       if (!playlist_id || !track_id) return bad(res, 400, "missing_playlist_id_or_track_id");
    
-     // RPC call
-     const r = await sb(`/rest/v1/rpc/playlist_remove_one`, {
-       method: "POST",
-       body: JSON.stringify({
-         p_playlist_id: playlist_id,
-         p_track_id: track_id
-       })
-     });
-     const txt = await r.text();
-     if (!r.ok) return bad(res, r.status, `rpc_remove_failed: ${txt}`);
+       // Playlist + Ownership prüfen
+       const pr = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id&limit=1&id=eq.${encodeURIComponent(playlist_id)}`);
+       if (!pr.ok) return bad(res, 500, `supabase_select_playlist_failed: ${await pr.text()}`);
+       const row = (await pr.json())?.[0];
+       if (!row) return bad(res, 404, "playlist_not_found");
+       if (row.bubble_user_id !== bubbleUserId) return bad(res, 403, "playlist_not_owned_by_user");
    
-     // optional: Spotify Enforce anstoßen (asynchron)
-     // await routes["playlists/dispatch-sync"]({ ...req, body: { playlist_id } }, { status: ()=>({ json: ()=>{} }) });
+       const access_token = await getAccessTokenFromConnection(row.connection_id);
    
-     return json(res, 200, { ok: true });
+       // Kandidaten aus DB ziehen, damit wir (a) die URI kennen und (b) bei Duplikaten gezielt eine Position erwischen
+       const q = `/rest/v1/playlist_items?select=position,track_uri&playlist_id=eq.${encodeURIComponent(playlist_id)}&track_id=eq.${encodeURIComponent(track_id)}&order=position.asc`;
+       const ir = await sb(q);
+       if (!ir.ok) return bad(res, 500, `supabase_select_items_failed: ${await ir.text()}`);
+       const items = await ir.json(); // kann 0,1,n Zeilen sein
+   
+       // Track-URI bestimmen (falls DB leer ist, basteln wir eine)
+       const fallbackUri = `spotify:track:${track_id}`;
+       const track_uri = items?.[0]?.track_uri || fallbackUri;
+   
+       // Position 0-basiert bestimmen, wenn der Nutzer eine 1-basige Position angegeben hat
+       let position0 = null;
+       if (pos1 !== null && pos1 !== undefined && String(pos1).trim() !== "") {
+         const p = Number(pos1);
+         if (Number.isFinite(p) && p > 0) position0 = Math.floor(p - 1);
+       }
+   
+       // Falls keine Position angegeben wurde und wir NICHT alle löschen wollen:
+       // - Wenn es DB-Treffer gibt → nimm die erste (kleinste) Position.
+       // - Wenn keine DB-Treffer → wir probieren „alle“ (ohne Positionsangabe), Spotify ignoriert dann, wenn nichts passt.
+       if (!remove_all && position0 === null) {
+         if (items.length > 0) {
+           position0 = items[0].position; // 0-basiert aus DB
+         } else {
+           // Kein DB-Hit → gezwungenermaßen „alle“ probieren
+         }
+       }
+   
+       const doRemove = async (payload) => {
+         const url = `https://api.spotify.com/v1/playlists/${encodeURIComponent(row.playlist_id)}/tracks`;
+         const r = await fetch(url, {
+           method: "DELETE",
+           headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" },
+           body: JSON.stringify(payload)
+         });
+         const { json, text } = await parseJsonSafe(r);
+         return { r, json, text };
+       };
+   
+       // Payload bauen:
+       // - Wenn remove_all === true → { tracks: [{ uri }] }
+       // - Wenn position0 bekannt → { tracks: [{ uri, positions: [position0] }] }
+       // - Sonst (kein pos, kein DB-Hit) → „alle“ versuchen
+       const payloadFirst = remove_all || (position0 === null && items.length === 0)
+         ? { tracks: [ { uri: track_uri } ] }
+         : { tracks: [ { uri: track_uri, positions: [ position0 ] } ] };
+   
+       let resp = await doRemove(payloadFirst);
+   
+       // 429 minimal behandeln → kurzer Backoff + einmal fallback auf „alle“
+       if (resp.r.status === 429) {
+         const ra = Number(resp.r.headers.get("retry-after") || "1");
+         await sleep((Math.max(1, ra) + 0.5) * 1000);
+         // Fallback: ohne Positionsangabe, um sicherzugehen
+         resp = await doRemove({ tracks: [ { uri: track_uri } ] });
+       }
+   
+       if (resp.r.status === 404) {
+         return bad(res, 404, "spotify_playlist_not_found");
+       }
+       if (!resp.r.ok) {
+         return bad(res, resp.r.status, `spotify_remove_failed: ${resp.text || JSON.stringify(resp.json)}`);
+       }
+   
+       // Wenn es für diesen Track Locks gibt und wir positionsgenau entfernt haben:
+       // Lock aufräumen (optional; ansonsten säubert eure RPC locks_cleanup_missing_tracks in cron)
+       await sb(`/rest/v1/playlist_item_locks?playlist_id=eq.${encodeURIComponent(playlist_id)}&track_id=eq.${encodeURIComponent(track_id)}`, {
+         method: "DELETE",
+         headers: { Prefer: "return=minimal" }
+       }).catch(()=>{});
+   
+       // Nach Erfolg: needs_sync setzen & async syncen
+       await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(row.id)}`, {
+         method: "PATCH",
+         headers: { Prefer: "return=minimal" },
+         body: JSON.stringify({ needs_sync: true })
+       }).catch(()=>{});
+   
+       const base = process.env.PUBLIC_BASE_URL || `https://${process.env.VERCEL_URL}`;
+       await fetch(`${base}/api/playlists/dispatch-sync`, {
+         method: "POST",
+         headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+         body: JSON.stringify({ playlist_id: row.id })
+       }).catch(()=>{});
+   
+       return json(res, 200, {
+         ok: true,
+         removed_uri: track_uri,
+         mode: remove_all ? "all" : (position0 !== null ? "single_by_position" : "all_fallback"),
+         position0,
+         snapshot_id: resp.json?.snapshot_id || null
+       });
+     } catch (e) {
+       return bad(res, 500, `remove_track_exception: ${e && e.stack ? e.stack : String(e)}`);
+     }
    },
+
 
 
    
