@@ -193,6 +193,33 @@ const routes = {
     return json(res, 200, txt ? JSON.parse(txt) : []);
   },
 
+  /* ---------- playlists/get (GET) ---------- */
+   
+   "playlists/get": async (req, res) => {
+  if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+  const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK } = process.env;
+  if (!SUPABASE_URL || !SRK) return bad(res, 500, "missing_env");
+
+  const playlist_id = req.query.playlist_id;
+  if (!playlist_id) return bad(res, 400, "missing_playlist_id");
+
+  const path =
+    `/rest/v1/playlists` +
+    `?select=id,playlist_id,name,image,tracks_total,followers,updated_at,` +
+    `auto_remove_enabled,auto_remove_weeks` +
+    `&id=eq.${encodeURIComponent(playlist_id)}` +
+    `&limit=1`;
+
+  const r = await fetch(SUPABASE_URL + path, {
+    headers: { apikey: SRK, Authorization: `Bearer ${SRK}` },
+    cache: "no-store",
+  });
+  const txt = await r.text();
+  if (!r.ok) return json(res, 500, { error:"supabase_error", status:r.status, body:txt, url: SUPABASE_URL+path });
+  const arr = txt ? JSON.parse(txt) : [];
+  return json(res, 200, arr[0] || null);
+},
+   
   /* ---------- debug/env (GET) ---------- */
   "debug/env": async (_req, res) => {
     return json(res, 200, {
@@ -475,7 +502,8 @@ const routes = {
 
     const path =
       `/rest/v1/playlists` +
-      `?select=id,playlist_id,name,image,tracks_total,followers,updated_at` +
+      `?select=id,playlist_id,name,image,tracks_total,followers,updated_at,` +
+      `auto_remove_enabled,auto_remove_weeks` +
       `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
       `&is_owner=is.true&is_public=is.true` +
       `&order=updated_at.desc`;
