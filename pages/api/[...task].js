@@ -1393,42 +1393,56 @@ const routes = {
      const valid = checkAppSecret(req) || checkCronAuth(req);
      if (!valid) return bad(res, 401, "unauthorized_cron");
    
-     // Original-Query parsen
      const inUrl = new URL(req.url, `http://${req.headers.host}`);
      const qp = inUrl.searchParams;
    
-     // Werte für CHECK
-     const limitCheck = qp.get("limit_check") ?? qp.get("limit") ?? "200";
-     const concCheck  = qp.get("conc_check")  ?? qp.get("concurrency") ?? "4";
+     // Shard/ Bucket bestimmen (0..59). Optional Override via ?bucket=NN
+     const bucketOverride = qp.get("bucket");
+     const nowUtcMin = new Date().getUTCMinutes();
+     const bucket = bucketOverride !== null ? Number(bucketOverride) : nowUtcMin;
    
-     // Werte für SYNC
-     const limitSync = qp.get("limit_sync") ?? qp.get("limit") ?? "50";
-     const concSync  = qp.get("conc_sync")  ?? qp.get("concurrency") ?? "3";
+     // Per-Subroute Budgets aus Query (global fallback)
+     const limitCheck = qp.get("limit_check") ?? qp.get("limit") ?? "5";
+     const concCheck  = qp.get("conc_check")  ?? qp.get("concurrency") ?? "2";
+     const limitSync  = qp.get("limit_sync")  ?? qp.get("limit") ?? "2";
+     const concSync   = qp.get("conc_sync")   ?? qp.get("concurrency") ?? "1";
    
-     // Zwei interne Requests konstruieren, jeweils mit ?limit=&concurrency=
-     const mkReq = (origReq, newSearch) => ({
-       ...origReq,
-       url: `${inUrl.pathname}?${newSearch}`, // wichtig: neue Query an Unterroute
-       query: Object.fromEntries(new URLSearchParams(newSearch).entries())
-     });
+     // Nur Connections in diesem Bucket laden
+     const conns = await sb(`/rest/v1/spotify_connections?select=id&cron_bucket=eq.${encodeURIComponent(bucket)}`)
+                         .then(r => r.json());
    
-     const checkSearch = new URLSearchParams({ limit: String(limitCheck), concurrency: String(concCheck) }).toString();
-     const syncSearch  = new URLSearchParams({ limit: String(limitSync),  concurrency: String(concSync)  }).toString();
+     let ok=0, fail=0;
+     for (const c of conns) {
+       // CHECK-Updates für diese Connection
+       const reqCheck = {
+         ...req,
+         method: "POST",
+         headers: { ...req.headers, "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+         url: `/api/watch/check-updates?limit=${encodeURIComponent(limitCheck)}&concurrency=${encodeURIComponent(concCheck)}`,
+         query: { limit: String(limitCheck), concurrency: String(concCheck) },
+         body: { connection_id: c.id }
+       };
+       const r1 = await routes["watch/check-updates"](reqCheck, { status:()=>({ json:()=>{} }) }).catch(()=>({ ok:false }));
+       r1?.ok ? ok++ : fail++;
    
-     // Subrouten nacheinander ausführen (wie bisher)
-     const out1 = await routes["watch/cron-check-all"](
-       mkReq(req, checkSearch),
-       { status: ()=>({ json: ()=>{} }) }
-     ).catch(e => ({ error: String(e) }));
+       // SYNC-needed für diese Connection
+       const reqSync = {
+         ...req,
+         method: "POST",
+         headers: { ...req.headers, "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+         url: `/api/watch/sync-needed?limit=${encodeURIComponent(limitSync)}&concurrency=${encodeURIComponent(concSync)}`,
+         query: { limit: String(limitSync), concurrency: String(concSync) },
+         body: { connection_id: c.id }
+       };
+       const r2 = await routes["watch/sync-needed"](reqSync, { status:()=>({ json:()=>{} }) }).catch(()=>({ ok:false }));
+       r2?.ok ? ok++ : fail++;
    
-     const out2 = await routes["watch/cron-sync-all"](
-       mkReq(req, syncSearch),
-       { status: ()=>({ json: ()=>{} }) }
-     ).catch(e => ({ error: String(e) }));
+       await sleep(60); // mini-jitter zwischen Connections
+     }
    
-     if (out1?.error || out2?.error) return bad(res, 500, "cron_error");
-     return json(res, 200, { ok:true, check: out1, sync: out2 });
+     return json(res, 200, { ok:true, bucket, connections: conns.length, dispatched_ok: ok, dispatched_fail: fail });
    },
+
 
 
    /* ---------- watch/cron-maintenance-all (GET/POST) ---------- */
