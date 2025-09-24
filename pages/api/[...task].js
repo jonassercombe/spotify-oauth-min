@@ -81,6 +81,52 @@ function decryptToken(b64) {
   return Buffer.concat([d.update(ct), d.final()]).toString("utf8");
 }
 
+
+function parseSpotifyTrack(input) {
+  const v = String(input || "").trim();
+  if (!v) return null;
+
+  const BASE62_22 = /^[A-Za-z0-9]{22}$/;
+
+  // spotify:track:<id>
+  if (v.startsWith("spotify:")) {
+    const parts = v.split(":");
+    if (parts[1] === "track" && BASE62_22.test(parts[2])) {
+      return { id: parts[2], uri: `spotify:track:${parts[2]}` };
+    }
+    return null;
+  }
+
+  // reine ID erlauben
+  if (BASE62_22.test(v)) {
+    return { id: v, uri: `spotify:track:${v}` };
+  }
+
+  // URL-Formate (inkl. /intl-xx/, /embed/, Query-Params)
+  let u;
+  try { u = new URL(v); }
+  catch {
+    try { u = new URL("https://" + v); }
+    catch { return null; }
+  }
+
+  const hostOk = /(^|\.)spotify\.com$/i.test(u.hostname);
+  if (!hostOk) return null;
+
+  const parts = u.pathname.split("/").filter(Boolean);
+  // Locale-Prefixe wie intl-de, intl-en, intl-de-de entfernen
+  if (parts[0] && /^intl-/i.test(parts[0])) parts.shift();
+  // /embed/track/<id> unterstützen
+  if (parts[0] === "embed") parts.shift();
+
+  if (parts[0] !== "track") return null;
+  const id = parts[1];
+  if (!BASE62_22.test(id)) return null;
+
+  return { id, uri: `spotify:track:${id}` };
+}
+
+
 function parseTrackId(input) {
   const s = String(input || "").trim();
   if (!s) return null;
@@ -348,121 +394,111 @@ const routes = {
    },
 
 
-  /* ---------- add-track (POST) ---------- */
-
-   /* ---------- playlist-items/add (POST, Bubble) ---------- */
+  /* ---------- playlist-items/add (POST, Bubble) ---------- */
    "playlist-items/add": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
    
-     // Auth wie bei locks/*
      const bubbleUserId = req.headers["x-bubble-user-id"];
      if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
    
-     const body = await readBody(req);
-     const { playlist_id, link_or_uri, position } = body || {};
-     if (!playlist_id || !link_or_uri) return bad(res, 400, "missing_playlist_id_or_link");
-   
-     // Ownership prüfen
-     const own = await sb(`/rest/v1/playlists?select=id,connection_id,playlist_id&limit=1&id=eq.${encodeURIComponent(playlist_id)}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r=>r.json());
-     const row = own?.[0];
-     if (!row) return bad(res, 403, "playlist_not_owned_by_user");
-   
-     // Link/URI -> spotify:track:ID
-     const toTrackUri = (s) => {
-       if (!s || typeof s !== "string") return null;
-       const trimmed = s.trim();
-   
-       // spotify:track:ID
-       const m1 = trimmed.match(/^spotify:track:([A-Za-z0-9]{22})$/);
-       if (m1) return `spotify:track:${m1[1]}`;
-   
-       // https://open.spotify.com/track/ID?...
-       const m2 = trimmed.match(/open\.spotify\.com\/track\/([A-Za-z0-9]{22})/);
-       if (m2) return `spotify:track:${m2[1]}`;
-   
-       // Short-URL wie https://spotify.link/… -> bitte im UI vorher auflösen, hier nicht unterstützt
-       return null;
-     };
-   
-     const trackUri = toTrackUri(link_or_uri);
-     if (!trackUri) return bad(res, 400, "invalid_spotify_track_link_or_uri");
-   
-     // Token
-     const cr = await sb(`/rest/v1/spotify_connections?select=id,refresh_token_enc&limit=1&id=eq.${encodeURIComponent(row.connection_id)}`);
-     if (!cr.ok) return bad(res, 500, `supabase select connection failed: ${await cr.text()}`);
-     const conn = (await cr.json())?.[0];
-     if (!conn) return bad(res, 404, "connection_not_found");
-     const refresh_token = decryptToken(conn.refresh_token_enc);
-     const tokenRef = await refreshAccessToken(refresh_token);
-     const access_token = tokenRef.access_token;
-   
-     // Position behandeln: UI liefert 1-basiert. Leere/ungültige → append.
-     let pos = null;
-     if (position !== undefined && position !== null && String(position).trim() !== "") {
-       const n = Number(position);
-       if (Number.isFinite(n) && n >= 1) {
-         pos = Math.max(0, Math.floor(n) - 1); // -> 0-basiert
+     try {
+       const { playlist_id, link_or_uri, position } = await readBody(req);
+       if (!playlist_id || !link_or_uri) {
+         return bad(res, 400, "missing_playlist_id_or_link");
        }
-     }
    
-     // Hilfsfunktion Add mit optionaler Position
-     const addOnce = async (usePos) => {
-       const url = `https://api.spotify.com/v1/playlists/${encodeURIComponent(row.playlist_id)}/tracks` +
-                   (usePos === null ? "" : `?position=${encodeURIComponent(usePos)}`);
-       const r = await fetch(url, {
-         method: "POST",
-         headers: {
-           Authorization: `Bearer ${access_token}`,
-           "Content-Type": "application/json"
-         },
-         body: JSON.stringify({ uris: [trackUri] })
-       });
-       const { json, text } = await parseJsonSafe(r);
-       return { ok: r.ok, status: r.status, json, text, retryAfter: Number(r.headers.get("retry-after") || "0") };
-     };
+       // Playlist holen + Ownership prüfen
+       const pr = await sb(
+         `/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id&limit=1&id=eq.${encodeURIComponent(playlist_id)}`
+       );
+       if (!pr.ok) return bad(res, 500, `supabase_select_playlist_failed: ${await pr.text()}`);
+       const row = (await pr.json())?.[0];
+       if (!row) return bad(res, 404, "playlist_not_found");
+       if (row.bubble_user_id !== bubbleUserId) return bad(res, 403, "playlist_not_owned_by_user");
    
-     // 1) Versuch mit Position (falls gesetzt), sonst direkt append
-     let resp = await addOnce(pos);
+       // Link/URI/ID -> Track-URI parsen (unterstützt /intl-xx/, /embed/, Query, reine ID, spotify:track:…)
+       const parsed = parseSpotifyTrack(link_or_uri);
+       if (!parsed) return bad(res, 400, "invalid_spotify_track_link_or_uri");
+       const trackUri = parsed.uri;
    
-     // Fallbacks:
-     // - 400 "Index out of bounds" → nochmal ohne position (append)
-     // - 429 → kurzen Backoff & ein Mal ohne Position probieren (append)
-     if (!resp.ok) {
-       const msg = resp.json?.error?.message || "";
-       if (resp.status === 400 && /index out of bounds/i.test(msg)) {
-         resp = await addOnce(null);
-       } else if (resp.status === 429) {
-         const ra = Math.max(1, resp.retryAfter || 1);
-         const waitMs = Math.min(5000, (ra + Math.random() * 0.5) * 1000);
-         await sleep(waitMs);
-         resp = await addOnce(null);
+       // Access Token für die Connection ziehen
+       const access_token = await getAccessTokenFromConnection(row.connection_id);
+   
+       // Position aus UI ist 1-basiert – Spotify erwartet 0-basiert.
+       // Wenn leer/0/ungültig -> append.
+       let wantPosition = null;
+       if (position !== undefined && position !== null && String(position).trim() !== "") {
+         const p = Number(position);
+         if (Number.isFinite(p) && p > 0) wantPosition = Math.floor(p - 1);
        }
-     }
    
-     if (!resp.ok) {
-       // Weitergeben, damit du siehst, was Spotify genau zurückgibt
-       return bad(res, resp.status || 500, `spotify_add_failed: ${resp.text || JSON.stringify(resp.json)}`);
-     }
+       const doAdd = async (posOrNull) => {
+         const payload = posOrNull !== null && posOrNull !== undefined
+           ? { uris: [trackUri], position: posOrNull }
+           : { uris: [trackUri] };
    
-     // Nach Erfolg: lokale DB aktualisieren lassen
-     await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(playlist_id)}`, {
-       method: "PATCH",
-       headers: { Prefer: "return=minimal" },
-       body: JSON.stringify({ needs_sync: true })
-     }).catch(()=>{});
+         const r = await fetch(
+           `https://api.spotify.com/v1/playlists/${encodeURIComponent(row.playlist_id)}/tracks`,
+           {
+             method: "POST",
+             headers: {
+               Authorization: `Bearer ${access_token}`,
+               "Content-Type": "application/json"
+             },
+             body: JSON.stringify(payload)
+           }
+         );
+         const { json, text } = await parseJsonSafe(r);
+         return { r, json, text };
+       };
    
-     // Optional direkt dispatchen (asynchron)
-     const base = process.env.PUBLIC_BASE_URL || `https://${process.env.VERCEL_URL}`;
-     if (base) {
-       fetch(`${base}/api/playlists/dispatch-sync`, {
+       // 1. Versuch: mit gewünschter Position (falls angegeben)
+       let addRes = await doAdd(wantPosition);
+   
+       // Falls 400 "Index out of bounds" -> erneut ohne position (append)
+       if (addRes.r.status === 400 && String(addRes.text || "").toLowerCase().includes("index out of bounds")) {
+         addRes = await doAdd(null);
+       }
+   
+       // Minimales 429-Handling: einmal kurz warten und nochmal ohne Position probieren
+       if (addRes.r.status === 429) {
+         const ra = Number(addRes.r.headers.get("retry-after") || "1");
+         await sleep((Math.max(1, ra) + 0.5) * 1000);
+         addRes = await doAdd(null);
+       }
+   
+       if (addRes.r.status === 404) {
+         return bad(res, 404, "spotify_playlist_not_found");
+       }
+       if (!addRes.r.ok) {
+         return bad(res, addRes.r.status, `spotify_add_failed: ${addRes.text || JSON.stringify(addRes.json)}`);
+       }
+   
+       // Nach Erfolg: DB-Sync markieren und asynchronen Sync anstoßen
+       await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(row.id)}`, {
+         method: "PATCH",
+         headers: { Prefer: "return=minimal" },
+         body: JSON.stringify({ needs_sync: true })
+       }).catch(() => {});
+   
+       const base = process.env.PUBLIC_BASE_URL || `https://${process.env.VERCEL_URL}`;
+       await fetch(`${base}/api/playlists/dispatch-sync`, {
          method: "POST",
          headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
-         body: JSON.stringify({ playlist_id })
-       }).catch(()=>{});
-     }
+         body: JSON.stringify({ playlist_id: row.id })
+       }).catch(() => {});
    
-     return json(res, 200, { ok: true, added: trackUri, position_used: (pos == null ? "append" : pos) });
+       return json(res, 200, {
+         ok: true,
+         added: trackUri,
+         position_used: (wantPosition !== null && wantPosition !== undefined) ? wantPosition : "append",
+         snapshot_id: addRes.json?.snapshot_id || null
+       });
+     } catch (e) {
+       return bad(res, 500, `add_track_exception: ${e && e.stack ? e.stack : String(e)}`);
+     }
    },
+
 
    
   /* ---------- playlists/get (GET) ---------- */
