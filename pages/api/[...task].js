@@ -498,30 +498,40 @@ const routes = {
   },
 
   /* ---------- playlists/list (GET) ---------- */
-  "playlists/list": async (req, res) => {
-    if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
-    const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK } = process.env;
-    if (!SUPABASE_URL || !SRK) return bad(res, 500, "missing_env");
+   "playlists/list": async (req, res) => {
+     if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+     const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK } = process.env;
+     if (!SUPABASE_URL || !SRK) return bad(res, 500, "missing_env");
+   
+     const bubble_user_id = req.query.bubble_user_id;
+     const connection_id  = req.query.connection_id || ""; // optional
+     const include_private = req.query.include_private === "1"; // optional
+   
+     if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
+   
+     const joinConn = req.query.include_conn === "1"; // optional: Verbindungstitel mitliefern
+     const selectFields = joinConn
+       ? "id,playlist_id,connection_id,name,image,tracks_total,followers,updated_at,spotify_connections(display_name,spotify_user_id)"
+       : "id,playlist_id,connection_id,name,image,tracks_total,followers,updated_at";
+   
+     let path =
+       `/rest/v1/playlists` +
+       `?select=${encodeURIComponent(selectFields)}` +
+       `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+       `&is_owner=is.true` +                                   // nur eigene
+       (include_private ? "" : `&is_public=is.true`) +         // default: nur öffentliche
+       (connection_id ? `&connection_id=eq.${encodeURIComponent(connection_id)}` : "") +
+       `&order=updated_at.desc`;
+   
+     const r = await fetch(SUPABASE_URL + path, {
+       headers: { apikey: SRK, Authorization: `Bearer ${SRK}` },
+       cache: "no-store",
+     });
+     const txt = await r.text();
+     if (!r.ok) return json(res, 500, { error: "supabase_error", status: r.status, body: txt, url: SUPABASE_URL+path });
+     return json(res, 200, txt ? JSON.parse(txt) : []);
+   },
 
-    const bubble_user_id = req.query.bubble_user_id;
-    if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
-
-    const path =
-      `/rest/v1/playlists` +
-      `?select=id,playlist_id,name,image,tracks_total,followers,updated_at,` +
-      `auto_remove_enabled,auto_remove_weeks` +
-      `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
-      `&is_owner=is.true&is_public=is.true` +
-      `&order=updated_at.desc`;
-
-    const r = await fetch(SUPABASE_URL + path, {
-      headers: { apikey: SRK, Authorization: `Bearer ${SRK}` },
-      cache: "no-store",
-    });
-    const txt = await r.text();
-    if (!r.ok) return json(res, 500, { error: "supabase_error", status: r.status, body: txt, url: SUPABASE_URL+path });
-    return json(res, 200, txt ? JSON.parse(txt) : []);
-  },
 
   /* ---------- playlists/refresh-followers (POST, secret) ---------- */
   "playlists/refresh-followers": async (req, res) => {
