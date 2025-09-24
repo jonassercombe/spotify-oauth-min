@@ -372,6 +372,71 @@ const routes = {
     }
   },
 
+   /* ---------- playlists/settings/save (POST, Bubble) ---------- */
+   "playlists/settings/save": async (req, res) => {
+     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+     const bubbleUserId = req.headers["x-bubble-user-id"];
+     if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
+   
+     const { playlist_id, auto_remove_enabled, auto_remove_weeks } = await readBody(req);
+     if (!playlist_id) return bad(res, 400, "missing_playlist_id");
+   
+     // Ownership prüfen
+     const own = await sb(`/rest/v1/playlists?select=id&limit=1&id=eq.${encodeURIComponent(String(playlist_id))}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r=>r.json());
+     if (!own?.[0]) return bad(res, 403, "Playlist not owned by user");
+   
+     // Werte validieren
+     const enabled = !!auto_remove_enabled;
+     const weeks = (auto_remove_weeks == null || auto_remove_weeks === "") ? null : Number(auto_remove_weeks);
+     if (enabled && (!Number.isInteger(weeks) || weeks < 1 || weeks > 104)) {
+       return bad(res, 400, "invalid_weeks_range_1_104");
+     }
+   
+     const patch = {
+       auto_remove_enabled: enabled,
+       auto_remove_weeks: weeks
+     };
+   
+     const r = await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(playlist_id)}`, {
+       method: "PATCH",
+       headers: { Prefer: "return=representation" },
+       body: JSON.stringify(patch),
+     });
+     if (!r.ok) return bad(res, 500, `supabase_patch_failed: ${await r.text()}`);
+     const data = await r.json();
+     return json(res, 200, { ok:true, playlist: Array.isArray(data) ? data[0] : data });
+   },
+   
+
+   /* ---------- playlists/maintenance (POST, Bubble ODER Cron) ---------- */
+   "playlists/maintenance": async (req, res) => {
+     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+   
+     const body = await readBody(req);
+     const { playlist_id } = body;
+     if (!playlist_id) return bad(res, 400, "missing_playlist_id");
+   
+     // Entweder Bubble-User prüft Ownership ODER interner Secret-Call:
+     const bubbleUserId = req.headers["x-bubble-user-id"];
+     const isInternal = checkAppSecret(req) || checkCronAuth(req);
+   
+     if (!isInternal) {
+       if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
+       const own = await sb(`/rest/v1/playlists?select=id&limit=1&id=eq.${encodeURIComponent(String(playlist_id))}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r=>r.json());
+       if (!own?.[0]) return bad(res, 403, "Playlist not owned by user");
+     }
+   
+     const r = await sb(`/rest/v1/rpc/playlist_maintenance`, {
+       method: "POST",
+       body: JSON.stringify({ p_playlist_id: playlist_id })
+     });
+     const t = await r.text();
+     if (!r.ok) return bad(res, 500, `rpc_playlist_maintenance_failed: ${t}`);
+   
+     const out = t ? JSON.parse(t) : [{ removed:0, total_after:0 }];
+     return json(res, 200, { ok:true, result: out[0] || out });
+   },
+
   /* ---------- playlist-items/list (GET) ---------- */
   "playlist-items/list": async (req, res) => {
     if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
@@ -1224,6 +1289,41 @@ const routes = {
     return json(res, 200, { ok:true, check: out1, sync: out2 });
   },
 
+   /* ---------- watch/cron-maintenance-all (GET/POST) ---------- */
+   "watch/cron-maintenance-all": async (req, res) => {
+     if (!checkCronAuth(req) && !checkAppSecret(req)) return bad(res, 401, "unauthorized_cron");
+     const qs = Object.fromEntries(new URL(req.url, `http://${req.headers.host}`).searchParams.entries());
+   
+     // Zielmenge: alle, die Auto-Remove aktiv haben (und Wochen gesetzt)
+     const sel = await sb(`/rest/v1/playlists?select=id&auto_remove_enabled=is.true&auto_remove_weeks=not.is.null`);
+     if (!sel.ok) return bad(res, 500, `supabase_select_failed: ${await sel.text()}`);
+     const rows = await sel.json();
+     if (!rows.length) return json(res, 200, { ok:true, processed:0 });
+   
+     let i=0, running=0, conc = Number(qs.concurrency || "3");
+     let ok=0, fail=0;
+     await new Promise(resolve => {
+       const kick = () => {
+         while (running < conc && i < rows.length) {
+           const id = rows[i++].id; running++;
+           (async () => {
+             try {
+               const r = await sb(`/rest/v1/rpc/playlist_maintenance`, {
+                 method: "POST",
+                 body: JSON.stringify({ p_playlist_id: id })
+               });
+               r.ok ? ok++ : fail++;
+             } catch { fail++; }
+             finally { running--; kick(); }
+           })();
+         }
+         if (running === 0 && i >= rows.length) resolve();
+       };
+       kick();
+     });
+   
+     return json(res, 200, { ok:true, processed: rows.length, ok_count: ok, failed: fail });
+   },
 
 
 
