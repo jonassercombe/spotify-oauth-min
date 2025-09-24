@@ -1389,15 +1389,47 @@ const routes = {
   },
 
   /* ---------- watch/cron-all (GET/POST) ---------- */
-  "watch/cron-all": async (req, res) => {
-    const valid = checkAppSecret(req) || checkCronAuth(req);
-    if (!valid) return bad(res, 401, "unauthorized_cron");
+   "watch/cron-all": async (req, res) => {
+     const valid = checkAppSecret(req) || checkCronAuth(req);
+     if (!valid) return bad(res, 401, "unauthorized_cron");
+   
+     // Original-Query parsen
+     const inUrl = new URL(req.url, `http://${req.headers.host}`);
+     const qp = inUrl.searchParams;
+   
+     // Werte für CHECK
+     const limitCheck = qp.get("limit_check") ?? qp.get("limit") ?? "200";
+     const concCheck  = qp.get("conc_check")  ?? qp.get("concurrency") ?? "4";
+   
+     // Werte für SYNC
+     const limitSync = qp.get("limit_sync") ?? qp.get("limit") ?? "50";
+     const concSync  = qp.get("conc_sync")  ?? qp.get("concurrency") ?? "3";
+   
+     // Zwei interne Requests konstruieren, jeweils mit ?limit=&concurrency=
+     const mkReq = (origReq, newSearch) => ({
+       ...origReq,
+       url: `${inUrl.pathname}?${newSearch}`, // wichtig: neue Query an Unterroute
+       query: Object.fromEntries(new URLSearchParams(newSearch).entries())
+     });
+   
+     const checkSearch = new URLSearchParams({ limit: String(limitCheck), concurrency: String(concCheck) }).toString();
+     const syncSearch  = new URLSearchParams({ limit: String(limitSync),  concurrency: String(concSync)  }).toString();
+   
+     // Subrouten nacheinander ausführen (wie bisher)
+     const out1 = await routes["watch/cron-check-all"](
+       mkReq(req, checkSearch),
+       { status: ()=>({ json: ()=>{} }) }
+     ).catch(e => ({ error: String(e) }));
+   
+     const out2 = await routes["watch/cron-sync-all"](
+       mkReq(req, syncSearch),
+       { status: ()=>({ json: ()=>{} }) }
+     ).catch(e => ({ error: String(e) }));
+   
+     if (out1?.error || out2?.error) return bad(res, 500, "cron_error");
+     return json(res, 200, { ok:true, check: out1, sync: out2 });
+   },
 
-    const out1 = await routes["watch/cron-check-all"](req, { status: ()=>({ json: ()=>{} }) }).catch(e=>({ error:String(e) }));
-    const out2 = await routes["watch/cron-sync-all"](req, { status: ()=>({ json: ()=>{} }) }).catch(e=>({ error:String(e) }));
-    if (out1?.error || out2?.error) return bad(res, 500, "cron_error");
-    return json(res, 200, { ok:true, check: out1, sync: out2 });
-  },
 
    /* ---------- watch/cron-maintenance-all (GET/POST) ---------- */
    "watch/cron-maintenance-all": async (req, res) => {
