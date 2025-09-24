@@ -81,6 +81,17 @@ function decryptToken(b64) {
   return Buffer.concat([d.update(ct), d.final()]).toString("utf8");
 }
 
+function parseTrackId(input) {
+  const s = String(input || "").trim();
+  if (!s) return null;
+  let m;
+  if ((m = s.match(/spotify:track:([A-Za-z0-9]{22})/))) return m[1];
+  if ((m = s.match(/open\.spotify\.com\/(?:intl-[a-z]+\/)?track\/([A-Za-z0-9]{22})/))) return m[1];
+  if (/^[A-Za-z0-9]{22}$/.test(s)) return s;
+  return null;
+}
+const trackUri = (id) => `spotify:track:${id}`;
+
 function encToken(plain) {
   const hex = need("ENC_SECRET");
   if (hex.length < 64) throw new Error("ENC_SECRET must be 32-byte hex (64 chars)");
@@ -193,6 +204,247 @@ const routes = {
     return json(res, 200, txt ? JSON.parse(txt) : []);
   },
 
+
+
+
+
+  /* ---------- search (GET) ---------- */
+
+   "tracks/search": async (req, res) => {
+     if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+     const q = req.query.q || "";
+     const connection_id = req.query.connection_id || "";
+     const limit = Math.min(25, Number(req.query.limit || "10"));
+   
+     if (!q || !connection_id) return bad(res, 400, "missing_q_or_connection_id");
+   
+     try {
+       const token = await getAccessTokenFromConnection(connection_id);
+       const url = `https://api.spotify.com/v1/search?type=track&market=from_token&limit=${encodeURIComponent(
+         String(limit)
+       )}&q=${encodeURIComponent(q)}`;
+   
+       const { r, json, text } = await fetchJSON(url, {
+         headers: { Authorization: `Bearer ${token}` },
+       }, 20000);
+   
+       if (!r.ok) {
+         return bad(res, r.status, `spotify_search_failed: ${json ? JSON.stringify(json) : text}`);
+       }
+   
+       const items = (json?.tracks?.items || []).map((t) => ({
+         id: t.id,
+         uri: t.uri,
+         name: t.name,
+         artists: (t.artists || []).map((a) => a.name).join(", "),
+         album: t.album?.name || null,
+         duration_ms: t.duration_ms ?? null,
+         preview_url: t.preview_url || null,
+         cover_url: t.album?.images?.[0]?.url || null,
+       }));
+   
+       return json(res, 200, { items });
+     } catch (e) {
+       return bad(res, 500, `tracks_search_exception: ${String(e?.message || e)}`);
+     }
+   },
+
+  /* ---------- resolve (GET) ---------- */
+   
+   "tracks/resolve": async (req, res) => {
+     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+     const body = await readBody(req);
+     const input = body.input || "";
+     const connection_id = body.connection_id || "";
+     const wantCandidates = Math.max(0, Math.min(25, Number(body.candidates ?? req.query.candidates ?? 8)));
+   
+     let id = parseTrackId(input);
+   
+     try {
+       // Wenn id erkennbar: hol Meta (wenn connection da) + parallele Kandidaten-Suche optional
+       if (id) {
+         let meta = null, candidates = [];
+         if (connection_id) {
+           const token = await getAccessTokenFromConnection(connection_id);
+   
+           // Track-Meta
+           const metaReq = fetchJSON(
+             `https://api.spotify.com/v1/tracks/${encodeURIComponent(id)}`,
+             { headers: { Authorization: `Bearer ${token}` } },
+             20000
+           );
+   
+           // Kandidaten (freie Suche nach demselben Input) – optional
+           let candReq = null;
+           if (wantCandidates > 0) {
+             candReq = fetchJSON(
+               `https://api.spotify.com/v1/search?type=track&market=from_token&limit=${encodeURIComponent(String(wantCandidates))}&q=${encodeURIComponent(input)}`,
+               { headers: { Authorization: `Bearer ${token}` } },
+               20000
+             );
+           }
+   
+           const metaRes = await metaReq;
+           if (metaRes.r.ok) meta = metaRes.json;
+   
+           if (candReq) {
+             const candRes = await candReq;
+             if (candRes.r.ok) {
+               candidates = (candRes.json?.tracks?.items || []).map((t) => ({
+                 id: t.id, uri: t.uri, name: t.name,
+                 artists: (t.artists||[]).map(a=>a.name).join(", "),
+                 album: t.album?.name || null,
+                 cover_url: t.album?.images?.[0]?.url || null,
+                 duration_ms: t.duration_ms ?? null
+               }));
+             }
+           }
+         }
+   
+         return json(res, 200, {
+           track_id: id,
+           track_uri: trackUri(id),
+           ...(meta ? {
+             name: meta.name,
+             artists: (meta.artists||[]).map(a=>a.name).join(", "),
+             album: meta.album?.name || null,
+             cover_url: meta.album?.images?.[0]?.url || null,
+             duration_ms: meta.duration_ms ?? null
+           } : {}),
+           candidates
+         });
+       }
+   
+       // Keine ID => Fallback Suche (liefert best + candidates)
+       if (!connection_id) return bad(res, 400, "unrecognized_input_and_no_connection");
+   
+       const token = await getAccessTokenFromConnection(connection_id);
+       const url = `https://api.spotify.com/v1/search?type=track&market=from_token&limit=${encodeURIComponent(String(Math.max(1, wantCandidates)))}&q=${encodeURIComponent(input)}`;
+       const { r, json, text } = await fetchJSON(url, { headers: { Authorization: `Bearer ${token}` } }, 20000);
+       if (!r.ok) return bad(res, r.status, `search_failed: ${json ? JSON.stringify(json) : text}`);
+   
+       const all = (json?.tracks?.items || []).map((t) => ({
+         id: t.id, uri: t.uri, name: t.name,
+         artists: (t.artists||[]).map(a=>a.name).join(", "),
+         album: t.album?.name || null,
+         cover_url: t.album?.images?.[0]?.url || null,
+         duration_ms: t.duration_ms ?? null
+       }));
+       if (all.length === 0) return bad(res, 404, "no_match");
+   
+       return json(res, 200, {
+         track_id: all[0].id,
+         track_uri: trackUri(all[0].id),
+         name: all[0].name,
+         artists: all[0].artists,
+         album: all[0].album,
+         cover_url: all[0].cover_url,
+         duration_ms: all[0].duration_ms ?? null,
+         candidates: all
+       });
+     } catch (e) {
+       return bad(res, 500, `tracks_resolve_exception: ${String(e?.message || e)}`);
+     }
+   },
+
+
+  /* ---------- add-track (POST) ---------- */
+
+   "playlists/add-track": async (req, res) => {
+     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+   
+     const bubbleUserId = req.headers["x-bubble-user-id"];
+     if (!bubbleUserId) return bad(res, 401, "missing_x_bubble_user_id");
+   
+     const body = await readBody(req);
+     const playlist_id = body.playlist_id;              // <- our DB playlists.id (UUID)
+     const track_id    = body.track_id || parseTrackId(body.track_input || "");
+     const position_ui = body.position != null ? Number(body.position) : null; // 1-based, optional
+     const lock_on_add = !!body.lock;                   // optional
+   
+     if (!playlist_id) return bad(res, 400, "missing_playlist_id");
+     if (!track_id)    return bad(res, 400, "missing_or_invalid_track_id");
+   
+     // Verify ownership
+     const own = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,tracks_total&limit=1&id=eq.${encodeURIComponent(playlist_id)}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`);
+     if (!own.ok) return bad(res, 500, `supabase_select_failed: ${await own.text()}`);
+     const p = (await own.json())?.[0];
+     if (!p) return bad(res, 403, "playlist_not_owned_by_user");
+   
+     try {
+       const token = await getAccessTokenFromConnection(p.connection_id);
+       const uri = trackUri(track_id);
+   
+       // Compute 0-based index for Spotify (or append if null/NaN)
+       let pos0 = null;
+       if (position_ui != null && Number.isFinite(position_ui)) {
+         const posUiClamped = Math.max(1, Math.floor(position_ui));
+         pos0 = posUiClamped - 1;
+       }
+   
+       // Add to Spotify (429-safe)
+       let attempt = 0;
+       while (true) {
+         const payload = pos0 == null ? { uris: [uri] } : { uris: [uri], position: pos0 };
+         const { r, json, text } = await fetchJSON(
+           `https://api.spotify.com/v1/playlists/${encodeURIComponent(p.playlist_id)}/tracks`,
+           {
+             method: "POST",
+             headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+             body: JSON.stringify(payload),
+           },
+           20000
+         );
+   
+         if (r.status === 429 && attempt < 6) {
+           const ra = Number(r.headers.get("retry-after") || "1");
+           const wait = Math.min(60, ra * Math.pow(2, attempt)) + Math.random() * 0.8;
+           console.warn("add-track:429", { attempt, retry_after_s: ra, wait_s: wait.toFixed(1) });
+           await sleep(wait * 1000);
+           attempt++;
+           continue;
+         }
+         if (!r.ok) return bad(res, r.status, `spotify_add_failed: ${json ? JSON.stringify(json) : text}`);
+         break;
+       }
+   
+       // Optional: immediately lock at requested position (only if a position was provided)
+       if (lock_on_add && pos0 != null) {
+         await sb(`/rest/v1/playlist_item_locks?on_conflict=playlist_id,track_id`, {
+           method: "POST",
+           headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+           body: JSON.stringify([{
+             playlist_id,
+             track_id,
+             locked_position: pos0 + 1, // locks are 1-based
+             is_locked: true,
+             locked_at: new Date().toISOString(),
+           }]),
+         }).catch(() => {});
+       }
+   
+       // Kick a fresh sync so UI updates fast
+       const base = process.env.PUBLIC_BASE_URL || `https://${process.env.VERCEL_URL}`;
+       fetch(`${base}/api/playlists/dispatch-sync`, {
+         method: "POST",
+         headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+         body: JSON.stringify({ playlist_id }),
+       }).catch(() => {});
+   
+       return json(res, 200, {
+         ok: true,
+         added: true,
+         playlist_id,
+         track_id,
+         position: pos0 == null ? "append" : pos0 + 1,
+         locked: !!(lock_on_add && pos0 != null),
+       });
+     } catch (e) {
+       return bad(res, 500, `add_track_exception: ${String(e?.message || e)}`);
+     }
+   },
+
+   
   /* ---------- playlists/get (GET) ---------- */
    
    "playlists/get": async (req, res) => {
