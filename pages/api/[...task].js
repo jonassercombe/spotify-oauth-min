@@ -350,98 +350,118 @@ const routes = {
 
   /* ---------- add-track (POST) ---------- */
 
-   "playlists/add-track": async (req, res) => {
+   /* ---------- playlist-items/add (POST, Bubble) ---------- */
+   "playlist-items/add": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
    
+     // Auth wie bei locks/*
      const bubbleUserId = req.headers["x-bubble-user-id"];
-     if (!bubbleUserId) return bad(res, 401, "missing_x_bubble_user_id");
+     if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
    
      const body = await readBody(req);
-     const playlist_id = body.playlist_id;              // <- our DB playlists.id (UUID)
-     const track_id    = body.track_id || parseTrackId(body.track_input || "");
-     const position_ui = body.position != null ? Number(body.position) : null; // 1-based, optional
-     const lock_on_add = !!body.lock;                   // optional
+     const { playlist_id, link_or_uri, position } = body || {};
+     if (!playlist_id || !link_or_uri) return bad(res, 400, "missing_playlist_id_or_link");
    
-     if (!playlist_id) return bad(res, 400, "missing_playlist_id");
-     if (!track_id)    return bad(res, 400, "missing_or_invalid_track_id");
+     // Ownership prüfen
+     const own = await sb(`/rest/v1/playlists?select=id,connection_id,playlist_id&limit=1&id=eq.${encodeURIComponent(playlist_id)}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r=>r.json());
+     const row = own?.[0];
+     if (!row) return bad(res, 403, "playlist_not_owned_by_user");
    
-     // Verify ownership
-     const own = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,tracks_total&limit=1&id=eq.${encodeURIComponent(playlist_id)}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`);
-     if (!own.ok) return bad(res, 500, `supabase_select_failed: ${await own.text()}`);
-     const p = (await own.json())?.[0];
-     if (!p) return bad(res, 403, "playlist_not_owned_by_user");
+     // Link/URI -> spotify:track:ID
+     const toTrackUri = (s) => {
+       if (!s || typeof s !== "string") return null;
+       const trimmed = s.trim();
    
-     try {
-       const token = await getAccessTokenFromConnection(p.connection_id);
-       const uri = trackUri(track_id);
+       // spotify:track:ID
+       const m1 = trimmed.match(/^spotify:track:([A-Za-z0-9]{22})$/);
+       if (m1) return `spotify:track:${m1[1]}`;
    
-       // Compute 0-based index for Spotify (or append if null/NaN)
-       let pos0 = null;
-       if (position_ui != null && Number.isFinite(position_ui)) {
-         const posUiClamped = Math.max(1, Math.floor(position_ui));
-         pos0 = posUiClamped - 1;
+       // https://open.spotify.com/track/ID?...
+       const m2 = trimmed.match(/open\.spotify\.com\/track\/([A-Za-z0-9]{22})/);
+       if (m2) return `spotify:track:${m2[1]}`;
+   
+       // Short-URL wie https://spotify.link/… -> bitte im UI vorher auflösen, hier nicht unterstützt
+       return null;
+     };
+   
+     const trackUri = toTrackUri(link_or_uri);
+     if (!trackUri) return bad(res, 400, "invalid_spotify_track_link_or_uri");
+   
+     // Token
+     const cr = await sb(`/rest/v1/spotify_connections?select=id,refresh_token_enc&limit=1&id=eq.${encodeURIComponent(row.connection_id)}`);
+     if (!cr.ok) return bad(res, 500, `supabase select connection failed: ${await cr.text()}`);
+     const conn = (await cr.json())?.[0];
+     if (!conn) return bad(res, 404, "connection_not_found");
+     const refresh_token = decryptToken(conn.refresh_token_enc);
+     const tokenRef = await refreshAccessToken(refresh_token);
+     const access_token = tokenRef.access_token;
+   
+     // Position behandeln: UI liefert 1-basiert. Leere/ungültige → append.
+     let pos = null;
+     if (position !== undefined && position !== null && String(position).trim() !== "") {
+       const n = Number(position);
+       if (Number.isFinite(n) && n >= 1) {
+         pos = Math.max(0, Math.floor(n) - 1); // -> 0-basiert
        }
+     }
    
-       // Add to Spotify (429-safe)
-       let attempt = 0;
-       while (true) {
-         const payload = pos0 == null ? { uris: [uri] } : { uris: [uri], position: pos0 };
-         const { r, json, text } = await fetchJSON(
-           `https://api.spotify.com/v1/playlists/${encodeURIComponent(p.playlist_id)}/tracks`,
-           {
-             method: "POST",
-             headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-             body: JSON.stringify(payload),
-           },
-           20000
-         );
+     // Hilfsfunktion Add mit optionaler Position
+     const addOnce = async (usePos) => {
+       const url = `https://api.spotify.com/v1/playlists/${encodeURIComponent(row.playlist_id)}/tracks` +
+                   (usePos === null ? "" : `?position=${encodeURIComponent(usePos)}`);
+       const r = await fetch(url, {
+         method: "POST",
+         headers: {
+           Authorization: `Bearer ${access_token}`,
+           "Content-Type": "application/json"
+         },
+         body: JSON.stringify({ uris: [trackUri] })
+       });
+       const { json, text } = await parseJsonSafe(r);
+       return { ok: r.ok, status: r.status, json, text, retryAfter: Number(r.headers.get("retry-after") || "0") };
+     };
    
-         if (r.status === 429 && attempt < 6) {
-           const ra = Number(r.headers.get("retry-after") || "1");
-           const wait = Math.min(60, ra * Math.pow(2, attempt)) + Math.random() * 0.8;
-           console.warn("add-track:429", { attempt, retry_after_s: ra, wait_s: wait.toFixed(1) });
-           await sleep(wait * 1000);
-           attempt++;
-           continue;
-         }
-         if (!r.ok) return bad(res, r.status, `spotify_add_failed: ${json ? JSON.stringify(json) : text}`);
-         break;
+     // 1) Versuch mit Position (falls gesetzt), sonst direkt append
+     let resp = await addOnce(pos);
+   
+     // Fallbacks:
+     // - 400 "Index out of bounds" → nochmal ohne position (append)
+     // - 429 → kurzen Backoff & ein Mal ohne Position probieren (append)
+     if (!resp.ok) {
+       const msg = resp.json?.error?.message || "";
+       if (resp.status === 400 && /index out of bounds/i.test(msg)) {
+         resp = await addOnce(null);
+       } else if (resp.status === 429) {
+         const ra = Math.max(1, resp.retryAfter || 1);
+         const waitMs = Math.min(5000, (ra + Math.random() * 0.5) * 1000);
+         await sleep(waitMs);
+         resp = await addOnce(null);
        }
+     }
    
-       // Optional: immediately lock at requested position (only if a position was provided)
-       if (lock_on_add && pos0 != null) {
-         await sb(`/rest/v1/playlist_item_locks?on_conflict=playlist_id,track_id`, {
-           method: "POST",
-           headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-           body: JSON.stringify([{
-             playlist_id,
-             track_id,
-             locked_position: pos0 + 1, // locks are 1-based
-             is_locked: true,
-             locked_at: new Date().toISOString(),
-           }]),
-         }).catch(() => {});
-       }
+     if (!resp.ok) {
+       // Weitergeben, damit du siehst, was Spotify genau zurückgibt
+       return bad(res, resp.status || 500, `spotify_add_failed: ${resp.text || JSON.stringify(resp.json)}`);
+     }
    
-       // Kick a fresh sync so UI updates fast
-       const base = process.env.PUBLIC_BASE_URL || `https://${process.env.VERCEL_URL}`;
+     // Nach Erfolg: lokale DB aktualisieren lassen
+     await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(playlist_id)}`, {
+       method: "PATCH",
+       headers: { Prefer: "return=minimal" },
+       body: JSON.stringify({ needs_sync: true })
+     }).catch(()=>{});
+   
+     // Optional direkt dispatchen (asynchron)
+     const base = process.env.PUBLIC_BASE_URL || `https://${process.env.VERCEL_URL}`;
+     if (base) {
        fetch(`${base}/api/playlists/dispatch-sync`, {
          method: "POST",
          headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
-         body: JSON.stringify({ playlist_id }),
-       }).catch(() => {});
-   
-       return json(res, 200, {
-         ok: true,
-         added: true,
-         playlist_id,
-         track_id,
-         position: pos0 == null ? "append" : pos0 + 1,
-         locked: !!(lock_on_add && pos0 != null),
-       });
-     } catch (e) {
-       return bad(res, 500, `add_track_exception: ${String(e?.message || e)}`);
+         body: JSON.stringify({ playlist_id })
+       }).catch(()=>{});
      }
+   
+     return json(res, 200, { ok: true, added: trackUri, position_used: (pos == null ? "append" : pos) });
    },
 
    
