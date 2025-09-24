@@ -330,7 +330,17 @@ const routes = {
       // existing connection?
       const existing = await fetch(
         `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?` +
-        `select=id,refresh_token_enc&` +
+        `select=id,refresh_token_enc,cron_bucket&` +   // <-- NEU
+        `bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&` +
+        `spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}&limit=1`,
+        {
+          headers: {
+            apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+          }
+        }
+      ).then(r => r.json()).then(a => (Array.isArray(a) && a[0]) ? a[0] : null);
+
         `bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&` +
         `spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}&limit=1`,
         {
@@ -349,6 +359,10 @@ const routes = {
       const access_token_enc = encToken(tokenRes.access_token);
       const access_expires_at = new Date(Date.now() + (tokenRes.expires_in || 3600) * 1000).toISOString();
 
+      // stabilen Bucket bestimmen: vorhandenen behalten, sonst neu würfeln (0..59)
+      const cron_bucket =
+        Number.isInteger(existing?.cron_bucket) ? existing.cron_bucket : Math.floor(Math.random() * 60);
+      
       const payload = {
         bubble_user_id,
         spotify_user_id,
@@ -357,8 +371,10 @@ const routes = {
         scope: "playlist-read-private playlist-modify-private playlist-modify-public",
         refresh_token_enc,
         access_token_enc,
-        access_expires_at
+        access_expires_at,
+        cron_bucket, // <-- NEU
       };
+
 
       if (existing) {
         await fetch(
