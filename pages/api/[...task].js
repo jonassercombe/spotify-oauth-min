@@ -624,7 +624,7 @@ const routes = {
      const bodyRaw = await readBody(req);
      let { playlist_row_id, spotify_playlist_id } = bodyRaw;
    
-     const timeLabel = `sync-items:${playlist_row_id || spotify_playlist_id || "unknown"}`;
+     const timeLabel = `sync-items:${playlist_row_id || spotify_playlist_id || 'unknown'}`;
      console.time(timeLabel);
      console.log("sync-items:start", {
        by: playlist_row_id ? "row_id" : (spotify_playlist_id ? "spotify_id" : "missing"),
@@ -633,6 +633,8 @@ const routes = {
        ts: new Date().toISOString(),
        vercel_url: process.env.VERCEL_URL || null
      });
+   
+     const chunk = (arr, n) => { const out=[]; for (let i=0;i<arr.length;i+=n) out.push(arr.slice(i, i+n)); return out; };
    
      try {
        if (!playlist_row_id && !spotify_playlist_id) {
@@ -643,42 +645,32 @@ const routes = {
        // Falls nur Spotify-ID kam → Row-ID auflösen
        if (!playlist_row_id && spotify_playlist_id) {
          console.log("sync-items:resolve_row_id_from_spotify_id", { spotify_playlist_id });
-         const r = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id&limit=1&playlist_id=eq.${encodeURIComponent(spotify_playlist_id)}`);
-         if (!r.ok) {
-           console.timeEnd(timeLabel);
-           return bad(res, 500, `supabase_select_failed: ${await r.text()}`);
-         }
+         const r = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id,auto_remove_enabled,auto_remove_weeks&limit=1&playlist_id=eq.${encodeURIComponent(spotify_playlist_id)}`);
+         if (!r.ok) { console.timeEnd(timeLabel); return bad(res, 500, `supabase_select_failed: ${await r.text()}`); }
          const arr = await r.json();
-         if (!arr[0]) {
-           console.timeEnd(timeLabel);
-           return bad(res, 404, "playlist_not_found_by_spotify_id");
-         }
+         if (!arr[0]) { console.timeEnd(timeLabel); return bad(res, 404, "playlist_not_found_by_spotify_id"); }
          playlist_row_id = arr[0].id;
          console.log("sync-items:resolved_row_id", { playlist_row_id });
        }
    
-       // Playlist-Metadaten
-       const pr = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id&limit=1&id=eq.${encodeURIComponent(playlist_row_id)}`);
-       if (!pr.ok) {
-         console.timeEnd(timeLabel);
-         return bad(res, 500, `supabase select playlist failed: ${await pr.text()}`);
-       }
+       // Playlist-Metadaten (+Settings)
+       const pr = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id,auto_remove_enabled,auto_remove_weeks&limit=1&id=eq.${encodeURIComponent(playlist_row_id)}`);
+       if (!pr.ok) { console.timeEnd(timeLabel); return bad(res, 500, `supabase select playlist failed: ${await pr.text()}`); }
        const p = (await pr.json())[0];
-       if (!p) {
-         console.timeEnd(timeLabel);
-         return bad(res, 404, "playlist_not_found");
-       }
+       if (!p) { console.timeEnd(timeLabel); return bad(res, 404, "playlist_not_found"); }
        console.log("sync-items:playlist_meta", {
          playlist_row_id: p.id,
          spotify_playlist_id: p.playlist_id,
          connection_id: p.connection_id,
-         bubble_user_id: p.bubble_user_id
+         bubble_user_id: p.bubble_user_id,
+         auto_remove_enabled: !!p.auto_remove_enabled,
+         auto_remove_weeks: p.auto_remove_weeks
        });
    
        // Reentrancy-Guard (Claim)
        const claim = await fetch(
          `${process.env.SUPABASE_URL}/rest/v1/playlists` +
-           `?id=eq.${encodeURIComponent(p.id)}&sync_started_at=is.null`,
+         `?id=eq.${encodeURIComponent(p.id)}&sync_started_at=is.null`,
          {
            method: "PATCH",
            headers: {
@@ -694,52 +686,18 @@ const routes = {
          console.timeEnd(timeLabel);
          return bad(res, 500, `supabase_claim_failed: ${await claim.text()}`);
        }
-       const claimed = await claim.json(); // nur gesetzt, wenn vorher NULL
+       const claimed = await claim.json();
        if (!Array.isArray(claimed) || claimed.length === 0) {
          console.warn("sync-items:already_in_progress", { playlist_row_id: p.id });
          console.timeEnd(timeLabel);
-         return json(res, 202, { ok: true, already_in_progress: true });
+         return json(res, 202, { ok:true, already_in_progress:true });
        }
-
-
-         // --- Connection-Cooldown-Check (früher Exit) ---
-         try {
-           const cdR = await sb(`/rest/v1/connection_rl_state?select=cooldown_until&connection_id=eq.${encodeURIComponent(p.connection_id)}&limit=1`);
-           const cdA = await cdR.json();
-           const cdUntil = cdA?.[0]?.cooldown_until ? new Date(cdA[0].cooldown_until) : null;
-           if (cdUntil && cdUntil > new Date()) {
-             console.warn("sync-items:connection_on_cooldown", { connection_id: p.connection_id, until: cdUntil.toISOString() });
-             // Guard wieder frei + Playlist später neu versuchen
-             await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
-               method: "PATCH", headers: { Prefer: "return=minimal" },
-               body: JSON.stringify({ sync_started_at: null, needs_sync: true, next_check_at: cdUntil.toISOString() })
-             }).catch(()=>{});
-             console.timeEnd(timeLabel);
-             return json(res, 202, { ok:false, on_cooldown:true, until: cdUntil.toISOString() });
-           }
-         } catch {}
-         // --- /Cooldown-Check ---
-
-        
+   
        // Connection & Token
        const cr = await sb(`/rest/v1/spotify_connections?select=id,refresh_token_enc&limit=1&id=eq.${encodeURIComponent(p.connection_id)}`);
-       if (!cr.ok) {
-         await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
-           method: "PATCH", headers: { Prefer: "return=minimal" },
-           body: JSON.stringify({ sync_started_at: null })
-         }).catch(() => {});
-         console.timeEnd(timeLabel);
-         return bad(res, 500, `supabase select connection failed: ${await cr.text()}`);
-       }
+       if (!cr.ok) { console.timeEnd(timeLabel); return bad(res, 500, `supabase select connection failed: ${await cr.text()}`); }
        const conn = (await cr.json())[0];
-       if (!conn) {
-         await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
-           method: "PATCH", headers: { Prefer: "return=minimal" },
-           body: JSON.stringify({ sync_started_at: null })
-         }).catch(() => {});
-         console.timeEnd(timeLabel);
-         return bad(res, 404, "connection_not_found");
-       }
+       if (!conn) { console.timeEnd(timeLabel); return bad(res, 404, "connection_not_found"); }
    
        const refresh_token = decryptToken(conn.refresh_token_enc);
        const t0 = Date.now();
@@ -747,34 +705,51 @@ const routes = {
        const access_token = tokenRef.access_token;
        console.log("sync-items:token_refreshed", { took_ms: Date.now() - t0, expires_in: tokenRef.expires_in });
    
-       // Spotify Tracks robust holen (Timeouts, Retry-Caps, Safeguards)
+       // Snapshot-ID (für positionsgenaue Delete/Reorder)
+       let snapshot_id = null;
+       {
+         const meta = await fetchJSON(
+           `https://api.spotify.com/v1/playlists/${encodeURIComponent(p.playlist_id)}?fields=snapshot_id`,
+           { headers: { Authorization: `Bearer ${access_token}` } },
+           20000
+         );
+         if (meta.r.ok) snapshot_id = meta.json?.snapshot_id || null;
+       }
+   
+       // Locks laden
+       const locksR = await sb(`/rest/v1/playlist_item_locks?select=track_id,is_locked,locked_position&playlist_id=eq.${encodeURIComponent(p.id)}`);
+       const locksArr = locksR.ok ? await locksR.json() : [];
+       const lockedSet = new Set(locksArr.filter(x => x.is_locked).map(x => x.track_id));
+   
+       // Spotify Tracks robust holen
        const items = [];
        let url = `https://api.spotify.com/v1/playlists/${encodeURIComponent(p.playlist_id)}/tracks?limit=100&offset=0&fields=items(added_at,track(id,name,uri,popularity,duration_ms,preview_url,album(name,images),artists(name))),total,next,offset`;
    
        const startedAt = Date.now();
-       const MAX_WALL_MS = 240000; // 240s Budget innerhalb 300s Vercel
+       const MAX_WALL_MS = 240000;
        const MAX_PAGES = 100;
-       const MAX_429_RETRIES_PER_PAGE = 12; // hochgesetzt
+       const MAX_429_RETRIES_PER_PAGE = 12;
    
        let pageCount = 0;
        while (url) {
          if (Date.now() - startedAt > MAX_WALL_MS) {
            console.warn("sync-items:wall_timeout", { elapsed_ms: Date.now() - startedAt });
+           // Guard abbauen + reschedule
            await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
              method: "PATCH", headers: { Prefer: "return=minimal" },
-             body: JSON.stringify({ sync_started_at: null })
-           }).catch(() => {});
+             body: JSON.stringify({ sync_started_at: null, next_check_at: new Date(Date.now()+300000).toISOString(), needs_sync: true })
+           }).catch(()=>{});
            console.timeEnd(timeLabel);
-           return bad(res, 504, `spotify tracks timed out after ${Math.round((Date.now() - startedAt) / 1000)}s`);
+           return json(res, 202, { ok:false, rescheduled:true, reason:"wall_timeout" });
          }
          if (++pageCount > MAX_PAGES) {
            console.warn("sync-items:pagination_safety_tripped", { pageCount });
            await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
              method: "PATCH", headers: { Prefer: "return=minimal" },
-             body: JSON.stringify({ sync_started_at: null })
-           }).catch(() => {});
+             body: JSON.stringify({ sync_started_at: null, next_check_at: new Date(Date.now()+300000).toISOString(), needs_sync: true })
+           }).catch(()=>{});
            console.timeEnd(timeLabel);
-           return bad(res, 502, `pagination safety tripped (>${MAX_PAGES} pages)`);
+           return json(res, 202, { ok:false, rescheduled:true, reason:"too_many_pages" });
          }
    
          let attempt = 0;
@@ -783,62 +758,50 @@ const routes = {
            const { r, json, text } = await fetchJSON(
              url,
              { headers: { Authorization: `Bearer ${access_token}` } },
-             20000 // 20s per request
+             20000
            );
    
            if (r.status === 429) {
-              const retry = Number(r.headers.get("retry-after") || "60"); // Spotify meldet teils ~9000s
-              const globalUntil = await setConnectionCooldown(p.connection_id, retry);
-            
-              // Für next_check_at begrenzen wir das Scheduling auf max. 30min,
-              // damit Vercel-Lambdas nicht so lange "umsonst" schlafen.
-              const localWait = Math.min(retry, 1800);
-            
-              console.warn("sync-items:429", {
-                page: pageCount,
-                attempt,
-                retry_after_s: retry,
-                wait_s: String(localWait),
-                cooldown_until: globalUntil
-              });
-            
-              // Wenn Spotify ein großes Retry-After gibt (>=120s) ODER wir schon oft versucht haben:
-              // -> Guard freigeben, Playlist neu terminieren und die Lambda *sofort* beenden (202).
-              if (retry >= 120 || attempt++ >= MAX_429_RETRIES_PER_PAGE) {
-                await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
-                  method: "PATCH",
-                  headers: { Prefer: "return=minimal" },
-                  body: JSON.stringify({
-                    sync_started_at: null,
-                    needs_sync: true,
-                    next_check_at: new Date(Date.now() + localWait * 1000).toISOString()
-                  })
-                }).catch(()=>{});
-            
-                console.timeEnd(timeLabel);
-                return json(res, 202, {
-                  ok: false,
-                  reason: "rate_limited",
-                  retry_after_s: retry,
-                  rescheduled_in_s: localWait,
-                  connection_cooldown_until: globalUntil
-                });
-              }
-            
-              // Bei kleinen Retry-After-Werten (<120s) machen wir ein kurzes Sleep + Retry.
-              await sleep((Math.min(retry, 60) + 0.5 + Math.random() * 0.8) * 1000);
-              continue; // gleiche Seite erneut versuchen
-            }
+             // Exponentieller Backoff + Jitter + Cooldown (falls zu oft)
+             const ra = Number(r.headers.get("retry-after") || "1");
+             const base = Math.max(ra, 1);
+             const waitSec = Math.min(60, base * Math.pow(2, attempt)) + (Math.random() * 0.8);
+             console.warn("sync-items:429", { page: pageCount, attempt, retry_after_s: ra, wait_s: waitSec.toFixed(1) });
+   
+             if (attempt++ >= MAX_429_RETRIES_PER_PAGE) {
+               // Verbindung in Cooldown + später neu versuchen
+               const untilIso = new Date(Date.now() + (base + 5) * 1000).toISOString();
+               await sb(`/rest/v1/connection_rl_state`, {
+                 method: "POST",
+                 headers: { Prefer: "resolution=merge-duplicates" },
+                 body: JSON.stringify({ connection_id: p.connection_id, cooldown_until: untilIso })
+               }).catch(()=>{});
+               await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
+                 method: "PATCH",
+                 headers: { Prefer: "return=minimal" },
+                 body: JSON.stringify({
+                   sync_started_at: null,
+                   next_check_at: untilIso,
+                   needs_sync: true
+                 })
+               }).catch(()=>{});
+               console.timeEnd(timeLabel);
+               return json(res, 202, { ok:false, rescheduled:true, reason:"rate_limited" });
+             }
+   
+             await sleep(waitSec * 1000);
+             continue;
+           }
    
            if (!r.ok) {
-              console.error("sync-items:spotify_tracks_failed", { status: r.status, body: json || text });
-              await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
-                method: "PATCH", headers: { Prefer: "return=minimal" },
-                body: JSON.stringify({ sync_started_at: null, needs_sync: true, next_check_at: new Date(Date.now()+60*1000).toISOString() })
-              }).catch(() => {});
-              console.timeEnd(timeLabel);
-              return json(res, 202, { ok:false, rescheduled:true, status:r.status });
-            }
+             console.error("sync-items:spotify_tracks_failed", { status: r.status, body: json || text });
+             // Guard abbauen, aber Fehler zurückgeben (hier sinnvoll)
+             await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
+               method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ sync_started_at: null })
+             }).catch(()=>{});
+             console.timeEnd(timeLabel);
+             return bad(res, r.status, `spotify playlist tracks failed: ${r.status} ${json ? JSON.stringify(json) : text}`);
+           }
    
            const len = Array.isArray(json?.items) ? json.items.length : 0;
            items.push(...(json?.items || []));
@@ -857,7 +820,171 @@ const routes = {
    
        console.log("sync-items:spotify_fetched", { total_items: items.length });
    
-       // Map zu DB-rows
+       /* === (A) Expiry: alte, UNGElOCKTE Items löschen (positionsgenau) === */
+       let removedPositionsSet = new Set();
+       if (p.auto_remove_enabled && Number(p.auto_remove_weeks) > 0) {
+         const cutoffMs = Date.now() - Number(p.auto_remove_weeks) * 7 * 24 * 3600 * 1000;
+         const toRemoveMap = new Map(); // uri -> positions[]
+   
+         for (let i = 0; i < items.length; i++) {
+           const it = items[i] || {};
+           const t = it.track || {};
+           if (!t?.id || !t?.uri) continue;
+           if (lockedSet.has(t.id)) continue; // gelockte nie löschen
+           const addedAt = it.added_at ? Date.parse(it.added_at) : NaN;
+           if (!Number.isFinite(addedAt)) continue;
+           if (addedAt <= cutoffMs) {
+             if (!toRemoveMap.has(t.uri)) toRemoveMap.set(t.uri, []);
+             toRemoveMap.get(t.uri).push(i);
+             removedPositionsSet.add(i);
+           }
+         }
+   
+         const toRemovePayload = Array.from(toRemoveMap.entries()).map(([uri, positions]) => ({ uri, positions }));
+         if (toRemovePayload.length > 0 && snapshot_id) {
+           for (const batch of chunk(toRemovePayload, 100)) {
+             let attempt = 0;
+             while (true) {
+               const del = await fetchJSON(
+                 `https://api.spotify.com/v1/playlists/${encodeURIComponent(p.playlist_id)}/tracks`,
+                 {
+                   method: "DELETE",
+                   headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" },
+                   body: JSON.stringify({ tracks: batch, snapshot_id })
+                 },
+                 20000
+               );
+               if (del.r.status === 429) {
+                 const ra = Number(del.r.headers.get("retry-after") || "1");
+                 const waitSec = Math.min(60, Math.max(1, ra) * Math.pow(2, attempt)) + (Math.random() * 0.8);
+                 if (attempt++ >= 6) {
+                   // Guard abbauen + später neu versuchen
+                   await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
+                     method: "PATCH", headers: { Prefer: "return=minimal" },
+                     body: JSON.stringify({ sync_started_at: null, needs_sync: true, next_check_at: new Date(Date.now()+ (Math.max(1,ra)+5)*1000).toISOString() })
+                   }).catch(()=>{});
+                   console.timeEnd(timeLabel);
+                   return json(res, 202, { ok:false, rescheduled:true, reason:"rate_limited_delete" });
+                 }
+                 await sleep(waitSec * 1000);
+                 continue;
+               }
+               if (!del.r.ok) {
+                 // harte Fehler → Guard abbauen & Fehler
+                 await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
+                   method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ sync_started_at: null })
+                 }).catch(()=>{});
+                 console.timeEnd(timeLabel);
+                 return bad(res, del.r.status, `spotify delete failed: ${del.r.status} ${del.text || ""}`);
+               }
+               // neue snapshot_id übernehmen
+               snapshot_id = del.json?.snapshot_id || snapshot_id;
+               break;
+             }
+             await sleep(80);
+           }
+   
+           // Lokalen Items-Array kompaktieren (gelöschte Positionen entfernen)
+           const keep = [];
+           for (let i = 0; i < items.length; i++) {
+             if (!removedPositionsSet.has(i)) keep.push(items[i]);
+           }
+           items.length = 0;
+           items.push(...keep);
+         }
+       }
+   
+       /* === (B) Locks enforce (Reorder) – auf Basis des (ggf. bereinigten) items-Arrays === */
+       if (locksArr.some(x => x.is_locked) && snapshot_id) {
+         // Arbeitsliste: nur tracks mit id/uri
+         const order = items
+           .map((it) => it?.track ? { id: it.track.id, uri: it.track.uri } : null)
+           .filter(Boolean);
+   
+         // Hilfsfunktion: local reorder anwenden
+         const localMove = (arr, from, to) => {
+           if (from === to) return;
+           const el = arr.splice(from, 1)[0];
+           arr.splice(to, 0, el);
+         };
+   
+         // IndexMap
+         const indexOf = (id) => order.findIndex(x => x.id === id);
+   
+         // sortiere Locks nach Zielposition ASC
+         const desiredLocks = locksArr
+           .filter(l => l.is_locked && Number.isFinite(l.locked_position))
+           .sort((a,b) => a.locked_position - b.locked_position);
+   
+         for (const l of desiredLocks) {
+           const desired = Math.max(0, Math.min(order.length - 1, Number(l.locked_position)));
+           const cur = indexOf(l.track_id);
+           if (cur < 0) continue;      // Track aktuell nicht in Playlist
+           if (cur === desired) continue;
+   
+           // Spotify-Reorder: insert_before ist "Zielindex" nach Entfernung des Elements.
+           const insert_before = desired > cur ? desired + 1 : desired;
+   
+           let attempt = 0;
+           while (true) {
+             const re = await fetchJSON(
+               `https://api.spotify.com/v1/playlists/${encodeURIComponent(p.playlist_id)}/tracks`,
+               {
+                 method: "PUT",
+                 headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" },
+                 body: JSON.stringify({
+                   range_start: cur,
+                   insert_before,
+                   range_length: 1,
+                   snapshot_id
+                 })
+               },
+               20000
+             );
+             if (re.r.status === 429) {
+               const ra = Number(re.r.headers.get("retry-after") || "1");
+               const waitSec = Math.min(60, Math.max(1, ra) * Math.pow(2, attempt)) + (Math.random() * 0.8);
+               if (attempt++ >= 6) {
+                 await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
+                   method: "PATCH", headers: { Prefer: "return=minimal" },
+                   body: JSON.stringify({ sync_started_at: null, needs_sync: true, next_check_at: new Date(Date.now() + (Math.max(1,ra)+5)*1000).toISOString() })
+                 }).catch(()=>{});
+                 console.timeEnd(timeLabel);
+                 return json(res, 202, { ok:false, rescheduled:true, reason:"rate_limited_reorder" });
+               }
+               await sleep(waitSec * 1000);
+               continue;
+             }
+             if (!re.r.ok) {
+               await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
+                 method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ sync_started_at: null })
+               }).catch(()=>{});
+               console.timeEnd(timeLabel);
+               return bad(res, re.r.status, `spotify reorder failed: ${re.r.status} ${re.text || ""}`);
+             }
+             // lokale Liste & snapshot aktualisieren
+             localMove(order, cur, desired);
+             snapshot_id = re.json?.snapshot_id || snapshot_id;
+             break;
+           }
+   
+           // kleine Pause
+           await sleep(60);
+         }
+   
+         // items an neue Reihenfolge anpassen (damit Upsert-Positionen stimmen)
+         // Wir mappen schnell id -> erstes Item
+         const byId = new Map();
+         for (const it of items) {
+           const t = it?.track;
+           if (t?.id && !byId.has(t.id)) byId.set(t.id, it);
+         }
+         const remapped = order.map(o => byId.get(o.id)).filter(Boolean);
+         items.length = 0;
+         items.push(...remapped);
+       }
+   
+       /* === (C) Map → DB Rows === */
        const rows = [];
        for (let i = 0; i < items.length; i++) {
          const it = items[i] || {};
@@ -865,8 +992,8 @@ const routes = {
          const album = t.album || {};
          const artists = Array.isArray(t.artists) ? t.artists : [];
          rows.push({
-           playlist_id: playlist_row_id, // FK -> playlists.id (uuid)
-           position: i,                  // 0-based
+           playlist_id: p.id,          // FK -> playlists.id (uuid)
+           position: i,                // 0-based
            track_id: t.id || null,
            track_name: t.name || null,
            track_uri: t.uri || null,
@@ -881,65 +1008,38 @@ const routes = {
        }
        console.log("sync-items:mapped_rows", { rows: rows.length });
    
-       // UPSERT in Batches (Timeout pro Write)
-         const chunk = (arr, n) => {
-           const out = [];
-           for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
-           return out;
-         };
-         const batches = chunk(rows, 500);
-         let batchIdx = 0;
-         
-         for (const b of batches) {
-           const tUp = Date.now();
-           const { r, text } = await fetchText(
-             `${process.env.SUPABASE_URL}/rest/v1/playlist_items?on_conflict=playlist_id,position`,
-             {
-               method: "POST",
-               headers: {
-                 apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-                 Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-                 Prefer: "resolution=merge-duplicates,return=minimal",
-                 "Content-Type": "application/json"
-               },
-               body: JSON.stringify(b)
+       /* === (D) UPSERT in Batches (robust, kein harter return bei Teilausfällen) === */
+       const batches = chunk(rows, 500);
+       let batchIdx = 0, upsertErrors = 0;
+       for (const b of batches) {
+         const tUp = Date.now();
+         const { r, text } = await fetchText(
+           `${process.env.SUPABASE_URL}/rest/v1/playlist_items?on_conflict=playlist_id,position`,
+           {
+             method: "POST",
+             headers: {
+               apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+               Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+               Prefer: "resolution=merge-duplicates,return=minimal",
+               "Content-Type": "application/json"
              },
-             20000
-           );
-         
-           if (!r.ok) {
-             console.error("sync-items:upsert_failed", { batch: batchIdx, size: b.length, text });
-         
-             // Guard freigeben & kurz reschedulen
-             await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
-               method: "PATCH",
-               headers: { Prefer: "return=minimal" },
-               body: JSON.stringify({
-                 sync_started_at: null,
-                 needs_sync: true,
-                 next_check_at: new Date(Date.now() + 60 * 1000).toISOString()
-               })
-             }).catch(()=>{});
-         
-             console.timeEnd(timeLabel);
-             return json(res, 202, {
-               ok:false,
-               rescheduled:true,
-               reason:"upsert_failed",
-               status: r.status,
-               error: text
-             });
-           }
-         
-           console.log("sync-items:upsert_ok", { batch: batchIdx++, size: b.length, took_ms: Date.now() - tUp });
-           await sleep(40);
+             body: JSON.stringify(b)
+           },
+           20000
+         );
+         if (!r.ok) {
+           upsertErrors++;
+           console.error("sync-items:upsert_failed", { batch: batchIdx, size: b.length, text });
+         } else {
+           console.log("sync-items:upsert_ok", { batch: batchIdx, size: b.length, took_ms: Date.now() - tUp });
          }
-
+         batchIdx++;
+       }
    
        // Tail-Cleanup (löscht alte Positionen > maxKeep)
        const maxKeep = Math.max(0, rows.length - 1);
        const delUrl = `${process.env.SUPABASE_URL}/rest/v1/playlist_items?playlist_id=eq.${encodeURIComponent(
-         playlist_row_id
+         p.id
        )}&position=gt.${maxKeep}`;
        const tDel = Date.now();
        const { r: delR, text: dtxt } = await fetchText(
@@ -954,24 +1054,10 @@ const routes = {
          },
          20000
        );
-       if (!delR.ok) {
-         console.warn("sync-items:cleanup_warning", { text: dtxt, took_ms: Date.now() - tDel });
-         await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
-           method: "PATCH",
-           headers: { Prefer: "return=minimal" },
-           body: JSON.stringify({ sync_started_at: null, last_synced_at: new Date().toISOString() })
-         }).catch(() => {});
-         console.timeEnd(timeLabel);
-         return json(res, 200, {
-           ok: true,
-           inserted_or_updated: rows.length,
-           total_spotify: items.length,
-           cleanup_warning: dtxt
-         });
-       }
-       console.log("sync-items:cleanup_ok", { took_ms: Date.now() - tDel });
+       if (!delR.ok) console.warn("sync-items:cleanup_warning", { text: dtxt, took_ms: Date.now() - tDel });
+       else console.log("sync-items:cleanup_ok", { took_ms: Date.now() - tDel });
    
-       // Erfolg: needs_sync zurücksetzen + Guard freigeben
+       // Erfolgs-Finale: Flags setzen & Guard abbauen
        await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
          method: "PATCH",
          headers: { Prefer: "return=minimal" },
@@ -980,36 +1066,32 @@ const routes = {
            sync_started_at: null,
            last_synced_at: new Date().toISOString()
          })
-       }).catch(() => {});
+       }).catch(()=>{});
    
-      // success: Guard lösen & Flags setzen
-      await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
-        method: "PATCH",
-        headers: { Prefer: "return=minimal" },
-        body: JSON.stringify({
-          needs_sync: false,
-          sync_started_at: null,
-          last_synced_at: new Date().toISOString(),
-          next_check_at: null
-        })
-      }).catch(()=>{});
-      
-      console.timeEnd(timeLabel);
-      return json(res, 200, { ok: true, inserted_or_updated: rows.length, total_spotify: items.length });
-
+       console.timeEnd(timeLabel);
+       return json(res, 200, {
+         ok: upsertErrors === 0,
+         inserted_or_updated: rows.length,
+         total_spotify: items.length,
+         upsert_errors: upsertErrors
+       });
      } catch (e) {
-        const msg = e && e.stack ? e.stack : String(e);
-        console.error("sync-items:error", msg);
-        console.timeEnd(timeLabel);
-        // Fehler, aber nicht hängen bleiben:
-        await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p?.id || playlist_row_id)}`, {
-          method: "PATCH", headers: { Prefer: "return=minimal" },
-          body: JSON.stringify({ sync_started_at: null, needs_sync: true, next_check_at: new Date(Date.now()+5*60*1000).toISOString() })
-        }).catch(()=>{});
-        return json(res, 202, { ok:false, reason:"exception", error: String(msg) });
-      }
-
+       const msg = e && e.stack ? e.stack : String(e);
+       console.error("sync-items:error", msg);
+       console.timeEnd(timeLabel);
+       return bad(res, 500, "sync_items_exception: " + msg);
+     } finally {
+       // Guard sicher abbauen, falls noch gesetzt
+       try {
+         if (playlist_row_id) {
+           await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(playlist_row_id)}`, {
+             method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ sync_started_at: null })
+           });
+         }
+       } catch {}
+     }
    },
+
 
   /* ---------- playlists/sync (POST, secret) ---------- */
   "playlists/sync": async (req, res) => {
