@@ -341,16 +341,6 @@ const routes = {
         }
       ).then(r => r.json()).then(a => (Array.isArray(a) && a[0]) ? a[0] : null);
 
-        `bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&` +
-        `spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}&limit=1`,
-        {
-          headers: {
-            apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-            Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-          }
-        }
-      ).then(r => r.json()).then(a => (Array.isArray(a) && a[0]) ? a[0] : null);
-
       let refresh_token_enc = null;
       if (tokenRes.refresh_token) refresh_token_enc = encToken(tokenRes.refresh_token);
       else if (existing?.refresh_token_enc) refresh_token_enc = existing.refresh_token_enc;
