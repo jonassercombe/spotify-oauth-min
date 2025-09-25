@@ -1842,231 +1842,10 @@ const routes = {
    },
    
   /* ---------- playlist-items/remove (POST, Bubble) ---------- */
-"playlist-items/remove": async (req, res) => {
-  if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
-
-  // Bubble Auth
-  const bubbleUserId = req.headers["x-bubble-user-id"];
-  if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
-  const usr = await sb(`/rest/v1/app_users?select=bubble_user_id&limit=1&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r=>r.json());
-  if (!usr?.[0]) return bad(res, 401, "Unknown bubble_user_id");
-
-  // Body
-  const body = await readBody(req);
-  const playlist_id = body.playlist_id; // UUID (playlists.id)
-  const remove_all  = !!body.remove_all;
-
-  let track_id  = body.track_id || null;   // "06AKEB..."
-  let track_uri = body.track_uri || null;  // "spotify:track:06AKEB..."
-
-  // Position: bevorzugt 0-basiert (position0). Falls nur 1-basiert (position) kommt: -1.
-  let position0 = (body.position0 !== undefined && body.position0 !== null)
-    ? Number(body.position0)
-    : (body.position !== undefined && body.position !== null)
-      ? Number(body.position) - 1
-      : null;
-
-  if (!playlist_id) return bad(res, 400, "missing_playlist_id");
-  if (!track_uri && !track_id) return bad(res, 400, "missing_track_id_or_uri");
-
-  // URI normalisieren
-  if (!track_uri && track_id) track_uri = `spotify:track:${String(track_id).trim()}`;
-  if (!/^spotify:track:[a-zA-Z0-9]+$/.test(String(track_uri))) return bad(res, 400, "invalid_spotify_track_uri");
-  track_id = track_uri.split(":").pop();
-
-  // Playlist + Ownership + Meta
-  const pr = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id&limit=1&id=eq.${encodeURIComponent(playlist_id)}`);
-  if (!pr.ok) return bad(res, 500, `supabase_select_playlist_failed: ${await pr.text()}`);
-  const row = (await pr.json())?.[0];
-  if (!row) return bad(res, 404, "playlist_not_found");
-  if (row.bubble_user_id !== bubbleUserId) return bad(res, 403, "playlist_not_owned_by_user");
-
-  const access_token = await getAccessTokenFromConnection(row.connection_id);
-
-  // Helper: Live-Snapshot holen
-  const getSnapshot = async () => {
-    const r = await fetch(`https://api.spotify.com/v1/playlists/${encodeURIComponent(row.playlist_id)}?fields=snapshot_id`, {
-      headers: { Authorization: `Bearer ${access_token}` }
-    });
-    const { json, text } = await parseJsonSafe(r);
-    if (!r.ok) throw new Error(`snapshot_fetch_failed: ${r.status} ${text || JSON.stringify(json)}`);
-    return json?.snapshot_id || null;
-  };
-
-  // Helper: Track-URI an Offset prüfen
-  const getUriAtOffset = async (offset) => {
-    const url = `https://api.spotify.com/v1/playlists/${encodeURIComponent(row.playlist_id)}/tracks?limit=1&offset=${encodeURIComponent(offset)}&fields=items(track(uri))`;
-    const r = await fetch(url, { headers: { Authorization: `Bearer ${access_token}` } });
-    const { json, text } = await parseJsonSafe(r);
-    if (!r.ok) throw new Error(`offset_fetch_failed: ${r.status} ${text || JSON.stringify(json)}`);
-    const uri = json?.items?.[0]?.track?.uri || null;
-    return uri;
-  };
-
-  // Helper: in 100er-Seite um den Offset suchen
-  const findInPage = async (offset) => {
-    const pageStart = Math.max(0, Math.floor(Number(offset || 0) / 100) * 100);
-    const url = `https://api.spotify.com/v1/playlists/${encodeURIComponent(row.playlist_id)}/tracks?limit=100&offset=${encodeURIComponent(pageStart)}&fields=items(track(uri))`;
-    const r = await fetch(url, { headers: { Authorization: `Bearer ${access_token}` } });
-    const { json, text } = await parseJsonSafe(r);
-    if (!r.ok) throw new Error(`page_fetch_failed: ${r.status} ${text || JSON.stringify(json)}`);
-    const items = Array.isArray(json?.items) ? json.items : [];
-    for (let i = 0; i < items.length; i++) {
-      if (items[i]?.track?.uri === track_uri) return pageStart + i;
-    }
-    return null;
-  };
-
-  // Helper: Spotify-DELETE ausführen (single by position oder all)
-  const doDelete = async (pos0, snapshot_id, usePositions) => {
-    const payload = (usePositions && pos0 !== null && Number.isFinite(pos0) && pos0 >= 0 && !remove_all)
-      ? { tracks: [{ uri: track_uri, positions: [pos0] }], snapshot_id }
-      : { tracks: [{ uri: track_uri }] };
-
-    const r = await fetch(
-      `https://api.spotify.com/v1/playlists/${encodeURIComponent(row.playlist_id)}/tracks`,
-      {
-        method: "DELETE",
-        headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      }
-    );
-    const { json, text } = await parseJsonSafe(r);
-    return { r, json, text, usedPositions: !!(payload.tracks[0].positions) };
-  };
-
-  // 429 Cooldown helper
-  const handle429 = async (resp) => {
-    const ra = Math.max(1, Number(resp.r.headers.get("retry-after") || "5"));
-    const untilIso = new Date(Date.now() + (ra + 2) * 1000).toISOString();
-    await sb(`/rest/v1/connection_rl_state`, {
-      method: "POST",
-      headers: { Prefer: "resolution=merge-duplicates" },
-      body: JSON.stringify({ connection_id: row.connection_id, cooldown_until: untilIso })
-    }).catch(()=>{});
-    return json(res, 202, { ok:false, rescheduled:true, reason:"rate_limited", retry_after_s: ra });
-  };
-
-  // Erfolg: Flags + optional Lock bereinigen + Resync
-  const onSuccess = async (mode, pos, snapshot) => {
-    // Lock nur löschen, wenn er exakt diese Position fixierte
-    if (pos !== null && Number.isFinite(pos) && pos >= 0) {
-      const lr = await sb(`/rest/v1/playlist_item_locks?select=locked_position&playlist_id=eq.${encodeURIComponent(row.id)}&track_id=eq.${encodeURIComponent(track_id)}&limit=1`).then(r=>r.json()).catch(()=>null);
-      const lockedPos = lr?.[0]?.locked_position;
-      if (lockedPos === (pos + 1)) { // locked_position ist 1-basiert
-        await sb(`/rest/v1/playlist_item_locks?playlist_id=eq.${encodeURIComponent(row.id)}&track_id=eq.${encodeURIComponent(track_id)}`, {
-          method: "DELETE", headers: { Prefer: "return=minimal" }
-        }).catch(()=>{});
-      }
-    } else if (remove_all) {
-      // wenn wirklich alle Vorkommen gelöscht wurden → Lock auf jeden Fall weg
-      await sb(`/rest/v1/playlist_item_locks?playlist_id=eq.${encodeURIComponent(row.id)}&track_id=eq.${encodeURIComponent(track_id)}`, {
-        method: "DELETE", headers: { Prefer: "return=minimal" }
-      }).catch(()=>{});
-    }
-
-    await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(row.id)}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({ needs_sync: true })
-    }).catch(()=>{});
-
-    const base = process.env.PUBLIC_BASE_URL || `https://${process.env.VERCEL_URL}`;
-    fetch(`${base}/api/playlists/dispatch-sync`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
-      body: JSON.stringify({ playlist_id: row.id })
-    }).catch(()=>{});
-
-    return json(res, 200, { ok:true, removed_uri: track_uri, mode, position0: pos, snapshot_id: snapshot || null });
-  };
-
-  try {
-    // remove_all explizit → ohne Positions, aber mit Retry auf 5xx
-    if (remove_all) {
-      let attempt5xx = 0;
-      while (true) {
-        const resp = await doDelete(null, null, false);
-        if (resp.r.status === 429) return handle429(resp);
-        if (resp.r.ok) return onSuccess("all_explicit", null, resp.json?.snapshot_id || null);
-        if (resp.r.status >= 500 && resp.r.status < 600 && attempt5xx < 5) {
-          const waitSec = Math.min(20, 2 ** attempt5xx * 2) + Math.random();
-          await sleep(waitSec * 1000); attempt5xx++; continue;
-        }
-        return bad(res, resp.r.status, `spotify_remove_failed: ${resp.text || JSON.stringify(resp.json)}`);
-      }
-    }
-
-    // Single-instance remove:
-    if (position0 === null || !Number.isFinite(position0) || position0 < 0) {
-      return bad(res, 400, "missing_or_invalid_position0");
-    }
-
-    // 1) Live snapshot holen
-    let snapshot = await getSnapshot();
-
-    // 2) Prüfen, ob am gewünschten Offset wirklich unser Track liegt
-    let uriAtOffset = null;
-    try { uriAtOffset = await getUriAtOffset(position0); } catch(e) {
-      // Bei 400 out-of-bounds o.ä. versuchen wir, ihn auf der 100er-Seite zu finden
-      uriAtOffset = null;
-    }
-    if (uriAtOffset !== track_uri) {
-      // 3) In der Seite um den Offset suchen (max. 100 Items)
-      const found = await findInPage(position0);
-      if (found === null) {
-        // Kein „All“-Fallback mehr! Sauber melden:
-        return bad(res, 409, "track_not_at_expected_position");
-      }
-      position0 = found;
-    }
-
-    // 4) Löschen mit Position + Snapshot (und robusten 409/5xx Handlings)
-    let attempt5xx = 0, triedSnapshotRefresh = 0;
-    while (true) {
-      const resp = await doDelete(position0, snapshot, true);
-      if (resp.r.status === 429) return handle429(resp);
-
-      if (resp.r.ok) {
-        return onSuccess("single_by_position", position0, resp.json?.snapshot_id || null);
-      }
-
-      // 409 = Snapshot mismatch → Snapshot neu holen & 1x retry
-      if (resp.r.status === 409 && triedSnapshotRefresh < 2) {
-        snapshot = await getSnapshot();
-        triedSnapshotRefresh++;
-        continue;
-      }
-
-      // 400 "Index out of bounds" → Position neu ermitteln und nochmal versuchen
-      if (resp.r.status === 400 && /index out of bounds/i.test(resp.text || JSON.stringify(resp.json || {}))) {
-        const found = await findInPage(position0);
-        if (found !== null) {
-          position0 = found;
-          snapshot = await getSnapshot();
-          continue;
-        }
-        return bad(res, 409, "track_not_at_expected_position");
-      }
-
-      // 5xx → Retry mit Backoff
-      if (resp.r.status >= 500 && resp.r.status < 600 && attempt5xx < 5) {
-        const waitSec = Math.min(20, 2 ** attempt5xx * 2) + Math.random();
-        await sleep(waitSec * 1000); attempt5xx++; continue;
-      }
-
-      // alles andere → sauberer Fehler
-      return bad(res, resp.r.status, `spotify_remove_failed: ${resp.text || JSON.stringify(resp.json)}`);
-    }
-  } catch (e) {
-    return bad(res, 500, `remove_exception: ${e?.message || String(e)}`);
-  }
-},
-/* ---------- playlist-items/remove (POST, Bubble) ---------- */
    "playlist-items/remove": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
    
-     // Bubble Auth
+     // Bubble-Auth
      const bubbleUserId = req.headers["x-bubble-user-id"];
      if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
      const usr = await sb(`/rest/v1/app_users?select=bubble_user_id&limit=1&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r=>r.json());
@@ -2074,37 +1853,23 @@ const routes = {
    
      // Body
      const body = await readBody(req);
-     const playlist_id = body.playlist_id; // UUID (playlists.id)
-     const remove_all  = !!body.remove_all;
-   
-     let track_id  = body.track_id || null;   // "06AKEB..."
-     let track_uri = body.track_uri || null;  // "spotify:track:06AKEB..."
-   
-     // Position: bevorzugt 0-basiert (position0). Falls nur 1-basiert (position) kommt: -1.
-     let position0 = (body.position0 !== undefined && body.position0 !== null)
-       ? Number(body.position0)
-       : (body.position !== undefined && body.position !== null)
-         ? Number(body.position) - 1
-         : null;
+     const playlist_id = body.playlist_id;       // UUID (playlists.id)
+     let position0 = Number(body.position0);     // 0-basiert
    
      if (!playlist_id) return bad(res, 400, "missing_playlist_id");
-     if (!track_uri && !track_id) return bad(res, 400, "missing_track_id_or_uri");
+     if (!Number.isFinite(position0) || position0 < 0) return bad(res, 400, "missing_or_invalid_position0");
    
-     // URI normalisieren
-     if (!track_uri && track_id) track_uri = `spotify:track:${String(track_id).trim()}`;
-     if (!/^spotify:track:[a-zA-Z0-9]+$/.test(String(track_uri))) return bad(res, 400, "invalid_spotify_track_uri");
-     track_id = track_uri.split(":").pop();
-   
-     // Playlist + Ownership + Meta
+     // Playlist row & Ownership
      const pr = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id&limit=1&id=eq.${encodeURIComponent(playlist_id)}`);
      if (!pr.ok) return bad(res, 500, `supabase_select_playlist_failed: ${await pr.text()}`);
      const row = (await pr.json())?.[0];
      if (!row) return bad(res, 404, "playlist_not_found");
      if (row.bubble_user_id !== bubbleUserId) return bad(res, 403, "playlist_not_owned_by_user");
    
+     // Token
      const access_token = await getAccessTokenFromConnection(row.connection_id);
    
-     // Helper: Live-Snapshot holen
+     // Helpers
      const getSnapshot = async () => {
        const r = await fetch(`https://api.spotify.com/v1/playlists/${encodeURIComponent(row.playlist_id)}?fields=snapshot_id`, {
          headers: { Authorization: `Bearer ${access_token}` }
@@ -2114,36 +1879,20 @@ const routes = {
        return json?.snapshot_id || null;
      };
    
-     // Helper: Track-URI an Offset prüfen
      const getUriAtOffset = async (offset) => {
-       const url = `https://api.spotify.com/v1/playlists/${encodeURIComponent(row.playlist_id)}/tracks?limit=1&offset=${encodeURIComponent(offset)}&fields=items(track(uri))`;
+       const url = `https://api.spotify.com/v1/playlists/${encodeURIComponent(row.playlist_id)}/tracks?limit=1&offset=${encodeURIComponent(offset)}&fields=items(track(id,uri))`;
        const r = await fetch(url, { headers: { Authorization: `Bearer ${access_token}` } });
        const { json, text } = await parseJsonSafe(r);
        if (!r.ok) throw new Error(`offset_fetch_failed: ${r.status} ${text || JSON.stringify(json)}`);
-       const uri = json?.items?.[0]?.track?.uri || null;
-       return uri;
+       const it = json?.items?.[0]?.track || null;
+       return it ? { uri: it.uri || null, id: it.id || null } : { uri: null, id: null };
      };
    
-     // Helper: in 100er-Seite um den Offset suchen
-     const findInPage = async (offset) => {
-       const pageStart = Math.max(0, Math.floor(Number(offset || 0) / 100) * 100);
-       const url = `https://api.spotify.com/v1/playlists/${encodeURIComponent(row.playlist_id)}/tracks?limit=100&offset=${encodeURIComponent(pageStart)}&fields=items(track(uri))`;
-       const r = await fetch(url, { headers: { Authorization: `Bearer ${access_token}` } });
-       const { json, text } = await parseJsonSafe(r);
-       if (!r.ok) throw new Error(`page_fetch_failed: ${r.status} ${text || JSON.stringify(json)}`);
-       const items = Array.isArray(json?.items) ? json.items : [];
-       for (let i = 0; i < items.length; i++) {
-         if (items[i]?.track?.uri === track_uri) return pageStart + i;
-       }
-       return null;
-     };
-   
-     // Helper: Spotify-DELETE ausführen (single by position oder all)
-     const doDelete = async (pos0, snapshot_id, usePositions) => {
-       const payload = (usePositions && pos0 !== null && Number.isFinite(pos0) && pos0 >= 0 && !remove_all)
-         ? { tracks: [{ uri: track_uri, positions: [pos0] }], snapshot_id }
-         : { tracks: [{ uri: track_uri }] };
-   
+     const deleteAt = async (uri, offset, snapshot) => {
+       const payload = {
+         tracks: [{ uri, positions: [offset] }],
+         snapshot_id: snapshot
+       };
        const r = await fetch(
          `https://api.spotify.com/v1/playlists/${encodeURIComponent(row.playlist_id)}/tracks`,
          {
@@ -2153,10 +1902,9 @@ const routes = {
          }
        );
        const { json, text } = await parseJsonSafe(r);
-       return { r, json, text, usedPositions: !!(payload.tracks[0].positions) };
+       return { r, json, text };
      };
    
-     // 429 Cooldown helper
      const handle429 = async (resp) => {
        const ra = Math.max(1, Number(resp.r.headers.get("retry-after") || "5"));
        const untilIso = new Date(Date.now() + (ra + 2) * 1000).toISOString();
@@ -2168,115 +1916,67 @@ const routes = {
        return json(res, 202, { ok:false, rescheduled:true, reason:"rate_limited", retry_after_s: ra });
      };
    
-     // Erfolg: Flags + optional Lock bereinigen + Resync
-     const onSuccess = async (mode, pos, snapshot) => {
-       // Lock nur löschen, wenn er exakt diese Position fixierte
-       if (pos !== null && Number.isFinite(pos) && pos >= 0) {
-         const lr = await sb(`/rest/v1/playlist_item_locks?select=locked_position&playlist_id=eq.${encodeURIComponent(row.id)}&track_id=eq.${encodeURIComponent(track_id)}&limit=1`).then(r=>r.json()).catch(()=>null);
-         const lockedPos = lr?.[0]?.locked_position;
-         if (lockedPos === (pos + 1)) { // locked_position ist 1-basiert
-           await sb(`/rest/v1/playlist_item_locks?playlist_id=eq.${encodeURIComponent(row.id)}&track_id=eq.${encodeURIComponent(track_id)}`, {
-             method: "DELETE", headers: { Prefer: "return=minimal" }
-           }).catch(()=>{});
-         }
-       } else if (remove_all) {
-         // wenn wirklich alle Vorkommen gelöscht wurden → Lock auf jeden Fall weg
-         await sb(`/rest/v1/playlist_item_locks?playlist_id=eq.${encodeURIComponent(row.id)}&track_id=eq.${encodeURIComponent(track_id)}`, {
-           method: "DELETE", headers: { Prefer: "return=minimal" }
-         }).catch(()=>{});
-       }
-   
-       await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(row.id)}`, {
-         method: "PATCH",
-         headers: { Prefer: "return=minimal" },
-         body: JSON.stringify({ needs_sync: true })
-       }).catch(()=>{});
-   
-       const base = process.env.PUBLIC_BASE_URL || `https://${process.env.VERCEL_URL}`;
-       fetch(`${base}/api/playlists/dispatch-sync`, {
-         method: "POST",
-         headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
-         body: JSON.stringify({ playlist_id: row.id })
-       }).catch(()=>{});
-   
-       return json(res, 200, { ok:true, removed_uri: track_uri, mode, position0: pos, snapshot_id: snapshot || null });
-     };
-   
      try {
-       // remove_all explizit → ohne Positions, aber mit Retry auf 5xx
-       if (remove_all) {
-         let attempt5xx = 0;
-         while (true) {
-           const resp = await doDelete(null, null, false);
-           if (resp.r.status === 429) return handle429(resp);
-           if (resp.r.ok) return onSuccess("all_explicit", null, resp.json?.snapshot_id || null);
-           if (resp.r.status >= 500 && resp.r.status < 600 && attempt5xx < 5) {
-             const waitSec = Math.min(20, 2 ** attempt5xx * 2) + Math.random();
-             await sleep(waitSec * 1000); attempt5xx++; continue;
-           }
-           return bad(res, resp.r.status, `spotify_remove_failed: ${resp.text || JSON.stringify(resp.json)}`);
-         }
-       }
-   
-       // Single-instance remove:
-       if (position0 === null || !Number.isFinite(position0) || position0 < 0) {
-         return bad(res, 400, "missing_or_invalid_position0");
-       }
-   
-       // 1) Live snapshot holen
+       // 1) Snapshot + URI an der gewünschten Position holen
        let snapshot = await getSnapshot();
+       let at = await getUriAtOffset(position0);
+       if (!at.uri) return bad(res, 400, "position_out_of_bounds");
    
-       // 2) Prüfen, ob am gewünschten Offset wirklich unser Track liegt
-       let uriAtOffset = null;
-       try { uriAtOffset = await getUriAtOffset(position0); } catch(e) {
-         // Bei 400 out-of-bounds o.ä. versuchen wir, ihn auf der 100er-Seite zu finden
-         uriAtOffset = null;
-       }
-       if (uriAtOffset !== track_uri) {
-         // 3) In der Seite um den Offset suchen (max. 100 Items)
-         const found = await findInPage(position0);
-         if (found === null) {
-           // Kein „All“-Fallback mehr! Sauber melden:
-           return bad(res, 409, "track_not_at_expected_position");
-         }
-         position0 = found;
-       }
-   
-       // 4) Löschen mit Position + Snapshot (und robusten 409/5xx Handlings)
-       let attempt5xx = 0, triedSnapshotRefresh = 0;
+       // 2) Löschen mit Positions-Garantie
+       let attempt409 = 0, attempt5xx = 0;
        while (true) {
-         const resp = await doDelete(position0, snapshot, true);
+         const resp = await deleteAt(at.uri, position0, snapshot);
+   
          if (resp.r.status === 429) return handle429(resp);
    
          if (resp.r.ok) {
-           return onSuccess("single_by_position", position0, resp.json?.snapshot_id || null);
+           // Lock aufräumen, falls genau diese Position gelockt war
+           if (at.id) {
+             const lr = await sb(`/rest/v1/playlist_item_locks?select=locked_position&playlist_id=eq.${encodeURIComponent(row.id)}&track_id=eq.${encodeURIComponent(at.id)}&limit=1`).then(r=>r.json()).catch(()=>null);
+             const lockedPos = lr?.[0]?.locked_position;
+             if (lockedPos === (position0 + 1)) {
+               await sb(`/rest/v1/playlist_item_locks?playlist_id=eq.${encodeURIComponent(row.id)}&track_id=eq.${encodeURIComponent(at.id)}`, {
+                 method: "DELETE", headers: { Prefer: "return=minimal" }
+               }).catch(()=>{});
+             }
+           }
+   
+           // Resync anstoßen
+           await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(row.id)}`, {
+             method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ needs_sync: true })
+           }).catch(()=>{});
+           const base = process.env.PUBLIC_BASE_URL || `https://${process.env.VERCEL_URL}`;
+           fetch(`${base}/api/playlists/dispatch-sync`, {
+             method: "POST",
+             headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+             body: JSON.stringify({ playlist_id: row.id })
+           }).catch(()=>{});
+   
+           return json(res, 200, { ok:true, removed_uri: at.uri, position0 });
          }
    
-         // 409 = Snapshot mismatch → Snapshot neu holen & 1x retry
-         if (resp.r.status === 409 && triedSnapshotRefresh < 2) {
+         // 409 Snapshot mismatch → Snapshot einmal neu holen und erneut versuchen
+         if (resp.r.status === 409 && attempt409 < 1) {
            snapshot = await getSnapshot();
-           triedSnapshotRefresh++;
+           attempt409++;
            continue;
          }
    
-         // 400 "Index out of bounds" → Position neu ermitteln und nochmal versuchen
-         if (resp.r.status === 400 && /index out of bounds/i.test(resp.text || JSON.stringify(resp.json || {}))) {
-           const found = await findInPage(position0);
-           if (found !== null) {
-             position0 = found;
-             snapshot = await getSnapshot();
-             continue;
-           }
-           return bad(res, 409, "track_not_at_expected_position");
+         // 400 „Index out of bounds“ o.ä. → Position hat sich geändert: noch einmal URI an Offset prüfen
+         if (resp.r.status === 400) {
+           const check = await getUriAtOffset(position0);
+           if (!check.uri) return bad(res, 409, "position_changed_or_out_of_bounds");
+           if (check.uri !== at.uri) return bad(res, 409, "position_changed");
+           // sonst war’s ein anderer 400 – abbrechen
          }
    
-         // 5xx → Retry mit Backoff
-         if (resp.r.status >= 500 && resp.r.status < 600 && attempt5xx < 5) {
-           const waitSec = Math.min(20, 2 ** attempt5xx * 2) + Math.random();
-           await sleep(waitSec * 1000); attempt5xx++; continue;
+         // 5xx → kurzer Backoff, bis zu 3x
+         if (resp.r.status >= 500 && resp.r.status < 600 && attempt5xx < 3) {
+           await sleep((2 ** attempt5xx * 2 + Math.random()) * 1000);
+           attempt5xx++;
+           continue;
          }
    
-         // alles andere → sauberer Fehler
          return bad(res, resp.r.status, `spotify_remove_failed: ${resp.text || JSON.stringify(resp.json)}`);
        }
      } catch (e) {
