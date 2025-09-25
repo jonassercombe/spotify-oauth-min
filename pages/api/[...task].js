@@ -251,6 +251,195 @@ const routes = {
   },
 
 
+   /* ---------- dashboard/series (GET) ---------- */
+   // Query:
+   //   bubble_user_id=...          (required)
+   //   days=30                     (optional)
+   //   granularity=daily|weekly|monthly  (optional; default daily)
+   //   scope=total|by_playlist     (optional; default total)
+   "dashboard/series": async (req, res) => {
+     if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+     const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK } = process.env;
+     if (!SUPABASE_URL || !SRK) return bad(res, 500, "missing_env");
+   
+     const bubble_user_id = req.query.bubble_user_id;
+     if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
+   
+     const days = Math.max(1, Math.min(365, Number(req.query.days || "30")));
+     const gran = (req.query.granularity || "daily").toLowerCase(); // daily|weekly|monthly
+     const scope = (req.query.scope || "total").toLowerCase();       // total|by_playlist
+   
+     const fromDay = new Date(Date.now() - days*24*3600*1000);
+     const fromStr = fromDay.toISOString().slice(0,10);
+   
+     const snapPath =
+       `/rest/v1/playlist_followers_daily` +
+       `?select=playlist_id,day,followers` +
+       `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+       `&day=gte.${encodeURIComponent(fromStr)}` +
+       `&order=day.asc`;
+     const sResp = await fetch(SUPABASE_URL + snapPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
+     if (!sResp.ok) return bad(res, 500, `supabase_error: ${await sResp.text()}`);
+     const rows = JSON.parse(await sResp.text() || "[]");
+   
+     // Helper: bucket nach granularity
+     const bucketKey = (isoDay) => {
+       // isoDay = "YYYY-MM-DD"
+       if (gran === "weekly") {
+         // ISO week Montag: wir normalisieren auf die Montag-Datum
+         const d = new Date(isoDay + "T00:00:00Z");
+         const day = d.getUTCDay(); // So=0..Sa=6
+         const diffToMon = (day === 0 ? -6 : 1 - day);
+         const monday = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + diffToMon));
+         return monday.toISOString().slice(0,10);
+       }
+       if (gran === "monthly") {
+         return isoDay.slice(0,7) + "-01"; // erster des Monats
+       }
+       return isoDay;
+     };
+   
+     // Aggregiere Followers TOTAL pro Bucket (Summe über Playlists),
+     // danach in Growth (Delta zum vorherigen Bucket) umrechnen
+     const agg = new Map(); // key -> { followersTotalByPlaylist?:Map, followersTotal }
+     for (const r of rows) {
+       const k = bucketKey(r.day);
+       let o = agg.get(k);
+       if (!o) { o = { followersTotal: 0, byPl: new Map() }; agg.set(k, o); }
+       // wir nehmen den letzten Wert pro playlist_id im Bucket als "Stand"
+       o.byPl.set(r.playlist_id, r.followers);
+     }
+     // jetzt pro Bucket Summen bilden
+     for (const [, o] of agg) {
+       let sum = 0;
+       for (const v of o.byPl.values()) sum += v || 0;
+       o.followersTotal = sum;
+     }
+   
+     // sortierte Buckets
+     const labels = Array.from(agg.keys()).sort();
+     // Growth total:
+     const growth = [];
+     for (let i = 0; i < labels.length; i++) {
+       const curr = agg.get(labels[i]).followersTotal;
+       const prev = i ? agg.get(labels[i-1]).followersTotal : curr;
+       growth.push(curr - prev);
+     }
+   
+     if (scope === "total") {
+       return json(res, 200, {
+         ok: true,
+         granularity: gran,
+         labels,               // z.B. Tage/Wochen/Monate
+         growth,               // Delta followers pro Bucket (gesamt)
+       });
+     }
+   
+     // by_playlist: Growth je Playlist (für z.B. gestapelte Graphen)
+     // Wir berechnen je Playlist die Buckets (letzter Followers-Wert je Bucket), dann Delta
+     const byPlMap = new Map(); // playlist_id -> array followersByBucket
+     const plIds = new Set(rows.map(r => r.playlist_id));
+     for (const pid of plIds) {
+       const series = [];
+       for (const k of labels) {
+         const o = agg.get(k);
+         const v = o.byPl.get(pid);
+         // falls im Bucket kein Wert, nimm letzten bekannten (carry-forward)
+         const last = series.length ? series[series.length-1] : (v ?? 0);
+         series.push(v ?? last ?? 0);
+       }
+       byPlMap.set(pid, series);
+     }
+     const by_playlist = [];
+     for (const [pid, series] of byPlMap) {
+       const deltas = series.map((v, i) => i ? (v - series[i-1]) : 0);
+       by_playlist.push({ playlist_id: pid, growth: deltas });
+     }
+   
+     return json(res, 200, { ok: true, granularity: gran, labels, by_playlist });
+   },
+   
+      
+/* ---------- dashboard/summary (GET) ---------- */
+// Query:
+//   bubble_user_id=...            (required)
+//   days=7                        (optional; für Growth-Spanne)
+//   removals_limit=50             (optional)
+"dashboard/summary": async (req, res) => {
+  if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+  const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK } = process.env;
+  if (!SUPABASE_URL || !SRK) return bad(res, 500, "missing_env");
+
+  const bubble_user_id = req.query.bubble_user_id;
+  if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
+
+  const days = Math.max(1, Math.min(365, Number(req.query.days || "7")));
+  const removals_limit = Math.max(1, Math.min(500, Number(req.query.removals_limit || "50")));
+
+  // 1) aktuelle Playlists ziehen (für total followers + Namen)
+  const plistPath =
+    `/rest/v1/playlists?select=id,name,followers,image,tracks_total,connection_id` +
+    `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+    `&is_owner=is.true&is_public=is.true`;
+  const pResp = await fetch(SUPABASE_URL + plistPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
+  const playlists = pResp.ok ? JSON.parse(await pResp.text() || "[]") : [];
+  const total_followers = playlists.reduce((a, p) => a + (p.followers || 0), 0);
+
+  // 2) Growth über N Tage: minimaler/ maximaler Snapshot pro Playlist vergleichen
+  const fromDay = new Date(Date.now() - days*24*3600*1000);
+  const fromStr = fromDay.toISOString().slice(0,10); // YYYY-MM-DD
+
+  const snapPath =
+    `/rest/v1/playlist_followers_daily` +
+    `?select=playlist_id,day,followers` +
+    `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+    `&day=gte.${encodeURIComponent(fromStr)}` +
+    `&order=day.asc`;
+  const sResp = await fetch(SUPABASE_URL + snapPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
+  const snaps = sResp.ok ? JSON.parse(await sResp.text() || "[]") : [];
+
+  // map: playlist_id -> {firstFollowers, lastFollowers}
+  const snapMap = new Map();
+  for (const r of snaps) {
+    let o = snapMap.get(r.playlist_id);
+    if (!o) { o = { first: r.followers, last: r.followers }; snapMap.set(r.playlist_id, o); }
+    o.last = r.followers; // wegen day.asc ist die letzte Zeile am Ende
+  }
+
+  let top_growing = null;
+  let net_growth = 0;
+  for (const p of playlists) {
+    const s = snapMap.get(p.id);
+    const delta = s ? (s.last - s.first) : 0;
+    net_growth += delta;
+    if (!top_growing || delta > top_growing.delta) {
+      top_growing = { playlist_id: p.id, name: p.name, image: p.image, delta, followers_now: p.followers || 0 };
+    }
+  }
+
+  // 3) Morgen entfernte Tracks (UTC)
+  const tomorrow = new Date(Date.now() + 24*3600*1000);
+  const tomStr = tomorrow.toISOString().slice(0,10);
+  const upcPath =
+    `/rest/v1/upcoming_removals_ui` +
+    `?select=playlist_id,playlist_name,position,track_id,track_name,artist_names,added_at,auto_remove_weeks,removes_on` +
+    `&removes_on=eq.${encodeURIComponent(tomStr)}` +
+    `&playlist_id=in.(${playlists.map(p => `"${p.id}"`).join(",")})` +
+    `&limit=${removals_limit}`;
+  const uResp = await fetch(SUPABASE_URL + upcPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
+  const next_day_removals = uResp.ok ? JSON.parse(await uResp.text() || "[]") : [];
+
+  return json(res, 200, {
+    ok: true,
+    totals: {
+      playlists_count: playlists.length,
+      total_followers,
+      net_growth_last_days: net_growth
+    },
+    top_growing: top_growing || null,
+    next_day_removals: next_day_removals
+  });
+},
 
 
 
