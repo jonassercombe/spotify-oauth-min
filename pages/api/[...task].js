@@ -812,33 +812,46 @@ const routes = {
      if (!SUPABASE_URL || !SRK) return bad(res, 500, "missing_env");
    
      const bubble_user_id = req.query.bubble_user_id;
-     const connection_id  = req.query.connection_id || ""; // optional
-     const include_private = req.query.include_private === "1"; // optional
-   
      if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
    
-     const joinConn = req.query.include_conn === "1"; // optional: Verbindungstitel mitliefern
-     const selectFields = joinConn
-       ? "id,playlist_id,connection_id,name,image,tracks_total,followers,updated_at,spotify_connections(display_name,spotify_user_id)"
-       : "id,playlist_id,connection_id,name,image,tracks_total,followers,updated_at";
+     // optionales Filter fürs Dropdown (nur Playlists einer Connection anzeigen)
+     const connection_id = req.query.connection_id; // optional
    
+     // Felder erweitert: connection_id, auto_remove_enabled, auto_remove_weeks
      let path =
        `/rest/v1/playlists` +
-       `?select=${encodeURIComponent(selectFields)}` +
+       `?select=` +
+         [
+           "id",
+           "playlist_id",
+           "connection_id",
+           "name",
+           "image",
+           "tracks_total",
+           "followers",
+           "updated_at",
+           "auto_remove_enabled",
+           "auto_remove_weeks"
+         ].join(",") +
        `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
-       `&is_owner=is.true` +                                   // nur eigene
-       (include_private ? "" : `&is_public=is.true`) +         // default: nur öffentliche
-       (connection_id ? `&connection_id=eq.${encodeURIComponent(connection_id)}` : "") +
+       `&is_owner=is.true&is_public=is.true` +
        `&order=updated_at.desc`;
+   
+     if (connection_id) {
+       path += `&connection_id=eq.${encodeURIComponent(connection_id)}`;
+     }
    
      const r = await fetch(SUPABASE_URL + path, {
        headers: { apikey: SRK, Authorization: `Bearer ${SRK}` },
        cache: "no-store",
      });
      const txt = await r.text();
-     if (!r.ok) return json(res, 500, { error: "supabase_error", status: r.status, body: txt, url: SUPABASE_URL+path });
+     if (!r.ok) {
+       return json(res, 500, { error: "supabase_error", status: r.status, body: txt, url: SUPABASE_URL + path });
+     }
      return json(res, 200, txt ? JSON.parse(txt) : []);
    },
+
 
 
   /* ---------- playlists/refresh-followers (POST, secret) ---------- */
