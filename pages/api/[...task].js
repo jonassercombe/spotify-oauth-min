@@ -251,6 +251,93 @@ const routes = {
   },
 
 
+   /* ---------- dashboard/cards (GET) ----------
+   Query:
+     bubble_user_id (required)
+     range: 'd'|'w'|'m'|'y'  -> 1/7/30/365 Tage
+   */
+   "dashboard/cards": async (req, res) => {
+     if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+     const bubble_user_id = req.query.bubble_user_id;
+     const range = String(req.query.range || "d").toLowerCase();
+   
+     if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
+   
+     const days = range === "y" ? 365 : range === "m" ? 30 : range === "w" ? 7 : 1;
+     const threshold = new Date(Date.now() - days * 86400 * 1000).toISOString().slice(0,10); // 'YYYY-MM-DD'
+   
+     // 1) aktuelle Playlists des Users (Owner + public)
+     const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK } = process.env;
+     const pathNow =
+       `/rest/v1/playlists` +
+       `?select=id,name,followers` +
+       `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+       `&is_owner=is.true&is_public=is.true` +
+       `&order=updated_at.desc`;
+     const nowR = await fetch(SUPABASE_URL + pathNow, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` } });
+     const nowArr = await nowR.json().catch(()=>[]);
+     if (!nowR.ok) return bad(res, 500, `supabase_now_failed: ${JSON.stringify(nowArr)}`);
+   
+     const ids = nowArr.map(x => x.id).filter(Boolean);
+     let baselineById = new Map();
+     if (ids.length > 0) {
+       // 2) Baseline pro Playlist = letzter History-Wert <= threshold
+       const inList = `(${ids.join(",")})`; // UUIDs können unquoted in PostgREST IN()
+       const pathHist =
+         `/rest/v1/playlist_followers_history` +
+         `?select=playlist_id,day,followers` +
+         `&playlist_id=in.${encodeURIComponent(inList)}` +
+         `&day=lte.${encodeURIComponent(threshold)}` +
+         `&order=playlist_id.asc,day.desc`;
+       const histR = await fetch(SUPABASE_URL + pathHist, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` } });
+       const histArr = await histR.json().catch(()=>[]);
+       if (!histR.ok) return bad(res, 500, `supabase_hist_failed: ${JSON.stringify(histArr)}`);
+   
+       // durch sortierung: erstes Auftreten je playlist_id ist die "jüngste <= threshold"
+       for (const row of histArr) {
+         if (!baselineById.has(row.playlist_id)) baselineById.set(row.playlist_id, row.followers ?? 0);
+       }
+     }
+   
+     // 3) KPIs berechnen
+     let totalCurrent = 0, totalBaseline = 0, playlistsCount = nowArr.length;
+     let topFollower = null; // {id,name,current,delta}
+     let topNew = null;      // {id,name,current,delta}
+   
+     for (const p of nowArr) {
+       const current = Number(p.followers || 0);
+       const baseline = Number(baselineById.get(p.id) ?? current); // fallback: wenn keine History → delta 0
+       const delta = current - baseline;
+   
+       totalCurrent += current;
+       totalBaseline += baseline;
+   
+       if (!topFollower || current > topFollower.current) {
+         topFollower = { id: p.id, name: p.name, current, delta };
+       }
+       if (!topNew || delta > topNew.delta) {
+         topNew = { id: p.id, name: p.name, current, delta };
+       }
+     }
+   
+     const pctChange = totalBaseline > 0 ? ((totalCurrent - totalBaseline) * 100.0) / totalBaseline : null;
+   
+     return json(res, 200, {
+       ok: true,
+       range: { key: range, days },
+       totals: {
+         total_followers: totalCurrent,
+         pct_change: pctChange,                // z.B. 3.5 (%)
+         total_new_followers: totalCurrent - totalBaseline,
+         playlists_count: playlistsCount
+       },
+       top_playlist_follower: topFollower,     // {id,name,current,delta}
+       top_playlist_new_followers: topNew      // {id,name,current,delta}
+     });
+   },
+   
+   
+      
    /* ---------- dashboard/series (GET) ---------- */
    // Query:
    //   bubble_user_id=...          (required)
