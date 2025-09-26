@@ -251,6 +251,50 @@ const routes = {
   },
 
 
+   /* ---------- dashboard/expiring-next (GET) ---------- */
+   "dashboard/expiring-next": async (req, res) => {
+     if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+     const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK } = process.env;
+     if (!SUPABASE_URL || !SRK) return bad(res, 500, "missing_env");
+   
+     const bubble_user_id = req.query.bubble_user_id;
+     if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
+   
+     const limit = Math.max(1, Math.min(100, Number(req.query.limit || "10")));
+     const connection_id = req.query.connection_id || null; // optional: Filter auf einen Account
+   
+     // RPC aufrufen
+     const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/dashboard_expiring_next`, {
+       method: "POST",
+       headers: {
+         apikey: SRK,
+         Authorization: `Bearer ${SRK}`,
+         "Content-Type": "application/json",
+         Prefer: "return=representation"
+       },
+       body: JSON.stringify({
+         p_bubble_user_id: String(bubble_user_id),
+         p_limit: limit,
+         p_connection_id: connection_id
+       })
+     });
+   
+     const txt = await r.text();
+     if (!r.ok) return json(res, 500, { error: "rpc_failed", status: r.status, body: txt });
+     const rows = txt ? JSON.parse(txt) : [];
+   
+     // kleine Sicherung: niemals negative Tage anzeigen
+     for (const row of rows) {
+       if (typeof row.days_until_remove === "number" && row.days_until_remove < 0) {
+         row.days_until_remove = 0;
+       }
+     }
+   
+     return json(res, 200, rows);
+   },
+   
+   
+      
    /* ---------- dashboard/cards (GET) ----------
    Query:
      bubble_user_id (required)
