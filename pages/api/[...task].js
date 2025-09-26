@@ -294,7 +294,108 @@ const routes = {
    },
    
    
-      
+      /* ---------- dashboard/growth (GET) ----------
+   Query:
+     bubble_user_id (required)
+     playlist_id   (required, UUID der playlists.id)
+     days          (optional, int; default 30)
+   Returns rows: [{day, followers, delta, note}]
+   */
+   "dashboard/growth": async (req, res) => {
+     if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+     const bubble_user_id = String(req.query.bubble_user_id || "");
+     const playlist_id    = String(req.query.playlist_id || "");
+     const days           = Math.max(1, parseInt(req.query.days || "30", 10) || 30);
+   
+     if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
+     if (!playlist_id)    return bad(res, 400, "missing_playlist_id");
+   
+     try {
+       const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK } = process.env;
+   
+       // 1) Eigentum prüfen & Playlist-Infos ziehen
+       const pR = await fetch(
+         `${SUPABASE_URL}/rest/v1/playlists?select=id,name,followers,bubble_user_id&limit=1&id=eq.${encodeURIComponent(playlist_id)}&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}`,
+         { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` } }
+       );
+       const pArr = await pR.json().catch(()=>[]);
+       if (!pR.ok) return bad(res, 500, `supabase_playlist_failed: ${JSON.stringify(pArr)}`);
+       const playlist = pArr[0];
+       if (!playlist) return bad(res, 403, "playlist_not_owned_or_not_found");
+   
+       // 2) Zeitraum berechnen (UTC)
+       const cutoff = new Date(Date.now() - days * 86400 * 1000).toISOString().slice(0,10); // YYYY-MM-DD
+       const today  = new Date().toISOString().slice(0,10);
+   
+       // 3) Daily-Folgs holen (ASC für Delta-Berechnung)
+       const dR = await fetch(
+         `${SUPABASE_URL}/rest/v1/playlist_followers_daily` +
+         `?select=day,followers` +
+         `&playlist_id=eq.${encodeURIComponent(playlist_id)}` +
+         `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+         `&day=gte.${encodeURIComponent(cutoff)}` +
+         `&order=day.asc`,
+         { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` } }
+       );
+       const dArr = await dR.json().catch(()=>[]);
+       if (!dR.ok) return bad(res, 500, `supabase_daily_failed: ${JSON.stringify(dArr)}`);
+   
+       // 4) Notizen für diesen Zeitraum ziehen
+       const nR = await fetch(
+         `${SUPABASE_URL}/rest/v1/playlist_growth_notes` +
+         `?select=day,note` +
+         `&playlist_id=eq.${encodeURIComponent(playlist_id)}` +
+         `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+         `&day=gte.${encodeURIComponent(cutoff)}`,
+         { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` } }
+       );
+       const nArr = await nR.json().catch(()=>[]);
+       if (!nR.ok) return bad(res, 500, `supabase_notes_failed: ${JSON.stringify(nArr)}`);
+       const noteByDay = new Map(nArr.map(r => [String(r.day), r.note || ""]));
+   
+       // 5) Delta vs. Vortag berechnen
+       const rowsAsc = [];
+       for (let i=0; i<dArr.length; i++) {
+         const cur = dArr[i];
+         const prev = dArr[i-1];
+         const delta = prev ? Number(cur.followers || 0) - Number(prev.followers || 0) : null;
+         rowsAsc.push({
+           day: String(cur.day),
+           followers: Number(cur.followers || 0),
+           delta,
+           note: noteByDay.get(String(cur.day)) || ""
+         });
+       }
+   
+       // 6) Optional "heute" anhängen, wenn es keinen Daily-Eintrag gibt (zeigt aktuellen Stand)
+       if (rowsAsc.length === 0 || rowsAsc[rowsAsc.length-1].day !== today) {
+         const prevFollowers = rowsAsc.length ? rowsAsc[rowsAsc.length-1].followers : null;
+         const curFollowers  = Number(playlist.followers || 0);
+         rowsAsc.push({
+           day: today,
+           followers: curFollowers,
+           delta: prevFollowers == null ? null : curFollowers - prevFollowers,
+           note: noteByDay.get(today) || ""
+         });
+       }
+   
+       // Neueste oben
+       const rows = rowsAsc.slice().reverse();
+   
+       return json(res, 200, {
+         ok: true,
+         playlist: { id: playlist.id, name: playlist.name, current_followers: Number(playlist.followers || 0) },
+         range: { days, cutoff, today },
+         rows
+       });
+     } catch (e) {
+       return bad(res, 500, `growth_exception: ${e?.message || e}`);
+     }
+   },
+
+
+
+   
    /* ---------- dashboard/cards (GET) ----------
    Query:
      bubble_user_id (required)
