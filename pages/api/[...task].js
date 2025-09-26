@@ -299,111 +299,122 @@ const routes = {
    Query:
      bubble_user_id (required)
      range: 'd'|'w'|'m'|'y'  -> 1/7/30/365 Tage
-     scope (optional): 'all' | 'public' | 'owned'  (default: 'all')
    */
    "dashboard/cards": async (req, res) => {
      if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
    
      const bubble_user_id = req.query.bubble_user_id;
      const range = String(req.query.range || "d").toLowerCase();
-     const scope = String(req.query.scope || "all").toLowerCase();
-   
      if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
    
-     const days =
-       range === "y" ? 365 :
-       range === "m" ? 30  :
-       range === "w" ? 7   : 1;
-   
-     // Baseline-Schwelle (YYYY-MM-DD) = "heute minus days"
+     const days = range === "y" ? 365 : range === "m" ? 30 : range === "w" ? 7 : 1;
+     // Schwelle = inkl. Datum (UTC) – wir vergleichen gegen DATE-Spalte
      const threshold = new Date(Date.now() - days * 86400 * 1000)
        .toISOString()
-       .slice(0, 10);
+       .slice(0, 10); // 'YYYY-MM-DD'
    
-     // --- 1) aktuelle Playlists des Users (robust; scope steuerbar) ---
      const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK } = process.env;
    
-     let filt =
+     // 1) Aktuelle Playlists des Users (Owner + public)
+     const pathNow =
+       `/rest/v1/playlists` +
        `?select=id,name,followers` +
-       `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}`;
-   
-     if (scope === "public") {
-       filt += `&is_public=is.true`;
-     } else if (scope === "owned") {
-       filt += `&is_owner=is.true`; // owned (egal ob public/private)
-     } // 'all' = nur bubble_user_id
-   
-     const pathNow = `/rest/v1/playlists${filt}&order=updated_at.desc`;
+       `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+       `&is_owner=is.true&is_public=is.true` +
+       `&order=updated_at.desc`;
    
      const nowR = await fetch(SUPABASE_URL + pathNow, {
-       headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }
+       headers: { apikey: SRK, Authorization: `Bearer ${SRK}` },
      });
      const nowArr = await nowR.json().catch(() => []);
      if (!nowR.ok) return bad(res, 500, `supabase_now_failed: ${JSON.stringify(nowArr)}`);
    
-     const ids = nowArr.map(x => x.id).filter(Boolean);
-     let baselineById = new Map();
-   
-     // --- 2) Baseline je Playlist = letzter Wert <= threshold ---
-     if (ids.length > 0) {
-       // PostgREST IN()-Syntax: in.(uuid1,uuid2,...) ohne Anführungszeichen
-       const inList = `(${ids.join(",")})`;
-   
-       // 2a) Primär: aus playlist_followers_history
-       const pathHist =
-         `/rest/v1/playlist_followers_history` +
-         `?select=playlist_id,day,followers` +
-         `&playlist_id=in.${encodeURIComponent(inList)}` +
-         `&day=lte.${encodeURIComponent(threshold)}` +
-         `&order=playlist_id.asc,day.desc`;
-   
-       const histR = await fetch(SUPABASE_URL + pathHist, {
-         headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }
+     const playlistsCount = nowArr.length;
+     if (playlistsCount === 0) {
+       return json(res, 200, {
+         ok: true,
+         range: { key: range, days },
+         totals: {
+           total_followers: 0,
+           pct_change: null,
+           total_new_followers: 0,
+           playlists_count: 0,
+         },
+         top_playlist_follower: null,
+         top_playlist_new_followers: null,
+         debug_counts: {
+           playlists_seen: 0,
+           baseline_daily_rows: 0,
+           baseline_history_rows: 0,
+           threshold,
+           scope: "all",
+         },
        });
-       const histArr = await histR.json().catch(() => []);
-       if (!histR.ok) return bad(res, 500, `supabase_hist_failed: ${JSON.stringify(histArr)}`);
+     }
    
-       for (const row of histArr) {
-         // aufgrund der Sortierung ist das erste Auftreten pro playlist_id der jüngste Wert <= threshold
-         if (!baselineById.has(row.playlist_id)) {
-           baselineById.set(row.playlist_id, row.followers ?? 0);
-         }
+     const ids = nowArr.map((x) => x.id).filter(Boolean);
+     const inList = `(${ids.join(",")})`; // PostgREST IN() für UUIDs ok ohne Quotes
+   
+     // 2) Baseline primär aus playlist_followers_daily (<= threshold), pro Playlist jüngster Eintrag
+     const pathDaily =
+       `/rest/v1/playlist_followers_daily` +
+       `?select=playlist_id,day,followers` +
+       `&playlist_id=in.${encodeURIComponent(inList)}` +
+       `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+       `&day=lte.${encodeURIComponent(threshold)}` +
+       `&order=playlist_id.asc,day.desc`;
+   
+     const dailyR = await fetch(SUPABASE_URL + pathDaily, {
+       headers: { apikey: SRK, Authorization: `Bearer ${SRK}` },
+     });
+     const dailyArr = await dailyR.json().catch(() => []);
+     if (!dailyR.ok) return bad(res, 500, `supabase_daily_failed: ${JSON.stringify(dailyArr)}`);
+   
+     const baselineById = new Map(); // playlist_id -> followers
+     for (const row of dailyArr) {
+       if (!baselineById.has(row.playlist_id)) {
+         baselineById.set(row.playlist_id, Number(row.followers ?? 0));
        }
+     }
+     const baselineDailyCount = baselineById.size;
    
-       // 2b) Fallback: falls History leer → versuche playlist_followers_daily
-       if (baselineById.size === 0) {
-         const pathDaily =
-           `/rest/v1/playlist_followers_daily` +
+     // 2b) Optionaler Fallback: fehlende Baselines aus playlist_followers_history
+     if (baselineById.size < ids.length) {
+       const missing = ids.filter((id) => !baselineById.has(id));
+       if (missing.length > 0) {
+         const inMissing = `(${missing.join(",")})`;
+         const pathHist =
+           `/rest/v1/playlist_followers_history` +
            `?select=playlist_id,day,followers` +
-           `&playlist_id=in.${encodeURIComponent(inList)}` +
+           `&playlist_id=in.${encodeURIComponent(inMissing)}` +
            `&day=lte.${encodeURIComponent(threshold)}` +
            `&order=playlist_id.asc,day.desc`;
-   
-         const dailyR = await fetch(SUPABASE_URL + pathDaily, {
-           headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }
+         const histR = await fetch(SUPABASE_URL + pathHist, {
+           headers: { apikey: SRK, Authorization: `Bearer ${SRK}` },
          });
-         const dailyArr = await dailyR.json().catch(() => []);
-         if (!dailyR.ok) return bad(res, 500, `supabase_daily_failed: ${JSON.stringify(dailyArr)}`);
-   
-         for (const row of dailyArr) {
+         const histArr = await histR.json().catch(() => []);
+         if (!histR.ok) return bad(res, 500, `supabase_hist_failed: ${JSON.stringify(histArr)}`);
+         for (const row of histArr) {
            if (!baselineById.has(row.playlist_id)) {
-             baselineById.set(row.playlist_id, row.followers ?? 0);
+             baselineById.set(row.playlist_id, Number(row.followers ?? 0));
            }
          }
        }
      }
+     const baselineHistAdded = baselineById.size - baselineDailyCount;
    
-     // --- 3) KPIs berechnen ---
+     // 3) KPIs berechnen
      let totalCurrent = 0;
      let totalBaseline = 0;
-     const playlistsCount = nowArr.length;
-   
-     let topFollower = null; // {id,name,current,delta}
-     let topNew = null;      // {id,name,current,delta}
+     let topFollower = null; // { id, name, current, delta }
+     let topNew = null; // { id, name, current, delta }
    
      for (const p of nowArr) {
        const current = Number(p.followers || 0);
-       const baseline = Number(baselineById.get(p.id) ?? current); // kein Baseline-Wert → delta 0
+       const baseline = baselineById.has(p.id)
+         ? Number(baselineById.get(p.id))
+         : current; // wenn keine Baseline bekannt → delta 0
+   
        const delta = current - baseline;
    
        totalCurrent += current;
@@ -417,31 +428,30 @@ const routes = {
        }
      }
    
-     const pctChange =
-       totalBaseline > 0
-         ? ((totalCurrent - totalBaseline) * 100.0) / totalBaseline
-         : null;
-   
-     // kleine Debug-Hilfe zurückgeben, um zu verifizieren, dass "now" überhaupt Zeilen sieht
-     const debug_counts = {
-       playlists_seen: Array.isArray(nowArr) ? nowArr.length : 0,
-       scope
-     };
+     const totalNew = totalCurrent - totalBaseline;
+     const pctChange = totalBaseline > 0 ? (totalNew * 100.0) / totalBaseline : null;
    
      return json(res, 200, {
        ok: true,
        range: { key: range, days },
        totals: {
          total_followers: totalCurrent,
-         pct_change: pctChange,                 // z. B. 3.5 (%)
-         total_new_followers: totalCurrent - totalBaseline,
-         playlists_count: playlistsCount
+         pct_change: pctChange, // z.B. 3.5 (%)
+         total_new_followers: totalNew,
+         playlists_count: playlistsCount,
        },
-       top_playlist_follower: topFollower,      // {id,name,current,delta} oder null
-       top_playlist_new_followers: topNew,      // {id,name,current,delta} oder null
-       debug_counts                                // hilft beim Troubleshooting
+       top_playlist_follower: topFollower, // {id,name,current,delta}
+       top_playlist_new_followers: topNew, // {id,name,current,delta}
+       debug_counts: {
+         playlists_seen: playlistsCount,
+         baseline_daily_rows: baselineDailyCount,
+         baseline_history_rows: baselineHistAdded,
+         threshold,
+         scope: "all",
+       },
      });
    },
+
 
    
    
