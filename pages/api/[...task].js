@@ -1747,6 +1747,55 @@ const routes = {
    
        console.log("sync-items:spotify_fetched", { total_items: items.length });
    
+       /* === (Backup) Zustands-Snapshot speichern – vor Expiry/Locks/Reorder === */
+       try {
+         // Meta-Infos für Backup (Name, Bild, Follower etc.)
+         let meta = null;
+         try {
+           const mr = await fetch(
+             `https://api.spotify.com/v1/playlists/${encodeURIComponent(p.playlist_id)}?fields=name,description,images,snapshot_id,followers(total),tracks(total)`,
+             { headers: { Authorization: `Bearer ${access_token}` } }
+           );
+           meta = await mr.json().catch(() => ({}));
+         } catch {/* ignorieren */}
+   
+         // Tracks für Backup (aktuelle Reihenfolge vom Fetch, 0-based Positionen)
+         const tracksForBackup = items.map((it, i) => {
+           const t = it?.track || {};
+           const album = t?.album || {};
+           const artists = Array.isArray(t?.artists) ? t.artists : [];
+           return {
+             position: i,
+             track_id: t.id || null,
+             track_uri: t.uri || null,
+             track_name: t.name || null,
+             artist_names: artists.map(a => a?.name).filter(Boolean).join(", "),
+             album_name: album?.name || null,
+             added_at: it?.added_at || null
+           };
+         });
+   
+         await sb(`/rest/v1/playlist_backups`, {
+           method: "POST",
+           headers: { Prefer: "return=minimal" },
+           body: JSON.stringify([{
+             playlist_id: p.id,
+             spotify_playlist_id: p.playlist_id,
+             snapshot_id: (meta && meta.snapshot_id) || snapshot_id || null,
+             taken_at: new Date().toISOString(),
+             name: meta?.name || null,
+             description: meta?.description || null,
+             image: (meta?.images && meta.images[0]?.url) || null,
+             followers: (meta?.followers && meta.followers.total) ?? null,
+             tracks_total: items.length,
+             tracks: tracksForBackup,
+             bubble_user_id: p.bubble_user_id
+           }])
+         }).catch(e => console.warn("backup_insert_failed", e?.message || e));
+       } catch (e) {
+         console.warn("backup_block_failed", e?.message || e);
+       }
+   
        /* === (A) Expiry: alte, UNGElOCKTE Items löschen (positionsgenau) === */
        let removedPositionsSet = new Set();
        if (p.auto_remove_enabled && Number(p.auto_remove_weeks) > 0) {
@@ -1873,151 +1922,8 @@ const routes = {
                const waitSec = Math.min(60, Math.max(1, ra) * Math.pow(2, attempt)) + (Math.random() * 0.8);
                if (attempt++ >= 6) {
                  await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
-                   method: "PATCH", headers: { Prefer: "return=minimal" },
-                   body: JSON.stringify({ sync_started_at: null, needs_sync: true, next_check_at: new Date(Date.now() + (Math.max(1,ra)+5)*1000).toISOString() })
-                 }).catch(()=>{});
-                 console.timeEnd(timeLabel);
-                 return json(res, 202, { ok:false, rescheduled:true, reason:"rate_limited_reorder" });
-               }
-               await sleep(waitSec * 1000);
-               continue;
-             }
-             if (!re.r.ok) {
-               await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
-                 method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ sync_started_at: null })
-               }).catch(()=>{});
-               console.timeEnd(timeLabel);
-               return bad(res, re.r.status, `spotify reorder failed: ${re.r.status} ${re.text || ""}`);
-             }
-             // lokale Liste & snapshot aktualisieren
-             localMove(order, cur, desired);
-             snapshot_id = re.json?.snapshot_id || snapshot_id;
-             break;
-           }
-   
-           // kleine Pause
-           await sleep(60);
-         }
-   
-         // items an neue Reihenfolge anpassen (damit Upsert-Positionen stimmen)
-         // Wir mappen schnell id -> erstes Item
-         const byId = new Map();
-         for (const it of items) {
-           const t = it?.track;
-           if (t?.id && !byId.has(t.id)) byId.set(t.id, it);
-         }
-         const remapped = order.map(o => byId.get(o.id)).filter(Boolean);
-         items.length = 0;
-         items.push(...remapped);
-       }
-   
-       /* === (C) Map → DB Rows === */
-       const rows = [];
-       for (let i = 0; i < items.length; i++) {
-         const it = items[i] || {};
-         const t = it.track || {};
-         const album = t.album || {};
-         const artists = Array.isArray(t.artists) ? t.artists : [];
-         rows.push({
-           playlist_id: p.id,          // FK -> playlists.id (uuid)
-           position: i,                // 0-based
-           track_id: t.id || null,
-           track_name: t.name || null,
-           track_uri: t.uri || null,
-           artist_names: artists.map((a) => a?.name).filter(Boolean).join(", "),
-           album_name: album.name || null,
-           duration_ms: Number.isFinite(t.duration_ms) ? t.duration_ms : null,
-           popularity: Number.isFinite(t.popularity) ? t.popularity : null,
-           preview_url: t.preview_url || null,
-           cover_url: (album.images && album.images[0]?.url) || null,
-           added_at: it.added_at || null
-         });
-       }
-       console.log("sync-items:mapped_rows", { rows: rows.length });
-   
-       /* === (D) UPSERT in Batches (robust, kein harter return bei Teilausfällen) === */
-       const batches = chunk(rows, 500);
-       let batchIdx = 0, upsertErrors = 0;
-       for (const b of batches) {
-         const tUp = Date.now();
-         const { r, text } = await fetchText(
-           `${process.env.SUPABASE_URL}/rest/v1/playlist_items?on_conflict=playlist_id,position`,
-           {
-             method: "POST",
-             headers: {
-               apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-               Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-               Prefer: "resolution=merge-duplicates,return=minimal",
-               "Content-Type": "application/json"
-             },
-             body: JSON.stringify(b)
-           },
-           20000
-         );
-         if (!r.ok) {
-           upsertErrors++;
-           console.error("sync-items:upsert_failed", { batch: batchIdx, size: b.length, text });
-         } else {
-           console.log("sync-items:upsert_ok", { batch: batchIdx, size: b.length, took_ms: Date.now() - tUp });
-         }
-         batchIdx++;
-       }
-   
-       // Tail-Cleanup (löscht alte Positionen > maxKeep)
-       const maxKeep = Math.max(0, rows.length - 1);
-       const delUrl = `${process.env.SUPABASE_URL}/rest/v1/playlist_items?playlist_id=eq.${encodeURIComponent(
-         p.id
-       )}&position=gt.${maxKeep}`;
-       const tDel = Date.now();
-       const { r: delR, text: dtxt } = await fetchText(
-         delUrl,
-         {
-           method: "DELETE",
-           headers: {
-             apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-             Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-             Prefer: "return=minimal"
-           }
-         },
-         20000
-       );
-       if (!delR.ok) console.warn("sync-items:cleanup_warning", { text: dtxt, took_ms: Date.now() - tDel });
-       else console.log("sync-items:cleanup_ok", { took_ms: Date.now() - tDel });
-   
-       // Erfolgs-Finale: Flags setzen & Guard abbauen
-       await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
-         method: "PATCH",
-         headers: { Prefer: "return=minimal" },
-         body: JSON.stringify({
-           needs_sync: false,
-           sync_started_at: null,
-           last_synced_at: new Date().toISOString()
-         })
-       }).catch(()=>{});
-   
-       console.timeEnd(timeLabel);
-       return json(res, 200, {
-         ok: upsertErrors === 0,
-         inserted_or_updated: rows.length,
-         total_spotify: items.length,
-         upsert_errors: upsertErrors
-       });
-     } catch (e) {
-       const msg = e && e.stack ? e.stack : String(e);
-       console.error("sync-items:error", msg);
-       console.timeEnd(timeLabel);
-       return bad(res, 500, "sync_items_exception: " + msg);
-     } finally {
-       // Guard sicher abbauen, falls noch gesetzt
-       try {
-         if (playlist_row_id) {
-           await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(playlist_row_id)}`, {
-             method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ sync_started_at: null })
-           });
-         }
-       } catch {}
-     }
-   },
+                   method: "PATCH",
+
 
 
   /* ---------- playlists/sync (POST, secret) ---------- */
