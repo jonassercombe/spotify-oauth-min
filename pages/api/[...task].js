@@ -556,7 +556,73 @@ const routes = {
 
    
    
-      
+      /* ---------- dashboard/growth/note/save (POST) ----------
+   Header: X-Bubble-User-Id (required)
+   Body: { playlist_id: uuid, day: 'YYYY-MM-DD', note: string }
+   Leere note => delete
+   */
+   "dashboard/growth/note/save": async (req, res) => {
+     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+     const bubbleUserId = req.headers["x-bubble-user-id"];
+     if (!bubbleUserId) return bad(res, 401, "missing_x_bubble_user_id");
+   
+     const body = await readBody(req);
+     const playlist_id = String(body.playlist_id || "");
+     const day = String(body.day || "").slice(0,10);
+     const note = typeof body.note === "string" ? body.note : "";
+   
+     if (!playlist_id) return bad(res, 400, "missing_playlist_id");
+     if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return bad(res, 400, "invalid_day");
+   
+     try {
+       const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK } = process.env;
+   
+       // Ownership check
+       const pR = await fetch(
+         `${SUPABASE_URL}/rest/v1/playlists?select=id&limit=1&id=eq.${encodeURIComponent(playlist_id)}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`,
+         { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` } }
+       );
+       const pArr = await pR.json().catch(()=>[]);
+       if (!pR.ok) return bad(res, 500, `supabase_playlist_check_failed: ${JSON.stringify(pArr)}`);
+       if (!pArr[0]) return bad(res, 403, "playlist_not_owned_or_not_found");
+   
+       if (!note.trim()) {
+         // Delete
+         const del = await fetch(
+           `${SUPABASE_URL}/rest/v1/playlist_growth_notes?playlist_id=eq.${encodeURIComponent(playlist_id)}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}&day=eq.${encodeURIComponent(day)}`,
+           { method: "DELETE", headers: { apikey: SRK, Authorization: `Bearer ${SRK}`, Prefer: "return=minimal" } }
+         );
+         if (!del.ok) return bad(res, 500, `note_delete_failed: ${await del.text()}`);
+         return json(res, 200, { ok: true, deleted: true });
+       }
+   
+       // Upsert
+       const up = await fetch(
+         `${SUPABASE_URL}/rest/v1/playlist_growth_notes?on_conflict=playlist_id,bubble_user_id,day`,
+         {
+           method: "POST",
+           headers: {
+             apikey: SRK,
+             Authorization: `Bearer ${SRK}`,
+             "Content-Type": "application/json",
+             Prefer: "resolution=merge-duplicates,return=representation"
+           },
+           body: JSON.stringify([{ playlist_id, bubble_user_id: bubbleUserId, day, note }])
+         }
+       );
+       const data = await up.json().catch(()=>[]);
+       if (!up.ok) return bad(res, 500, `note_upsert_failed: ${JSON.stringify(data)}`);
+   
+       return json(res, 200, { ok: true, note: Array.isArray(data) ? data[0] : data });
+     } catch (e) {
+       return bad(res, 500, `note_save_exception: ${e?.message || e}`);
+     }
+   },
+
+
+
+
+   
    /* ---------- dashboard/series (GET) ---------- */
    // Query:
    //   bubble_user_id=...          (required)
