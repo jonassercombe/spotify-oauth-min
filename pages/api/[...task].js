@@ -321,73 +321,108 @@ const routes = {
 
 
 
-
-
-   // POST paypal/subscriptions/link
-      "paypal/subscriptions/link": async (req, res) => {
+         /* ---------- paypal/subscriptions/link (POST) ----------
+   Body: { subscriptionId: "I-...", bubble_user_id: "<id>", environment: "live"|"sandbox" }
+   Header (optional Admin-Override): x-app-secret: <APP_WEBHOOK_SECRET>
+   */
+   "paypal/subscriptions/link": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
      try {
        const body = await readBody(req);
-       const subscriptionId = String(body.subscriptionId || "");
-       const bubble_user_id = String(body.bubble_user_id || "");
-       const environment = (body.environment === "live") ? "live" : "sandbox";
-       if (!subscriptionId || !bubble_user_id) return bad(res, 400, "missing_subscriptionId_or_bubble_user_id");
+       const subscriptionId = String(body.subscriptionId || body.subscription_id || "").trim();
+       const bubble_user_id = String(body.bubble_user_id || "").trim();
+       const environment = (String(body.environment || "").toLowerCase() === "live") ? "live" : "sandbox";
+       if (!subscriptionId || !bubble_user_id) return bad(res, 400, "missing_subscription_id_or_user");
    
-       const token = await paypalAccessToken(environment);
-       const r = await fetch(`${paypalBase(environment)}/v1/billing/subscriptions/${encodeURIComponent(subscriptionId)}`, {
-         headers: { Authorization: `Bearer ${token}` }
-       });
-       const j = await r.json();
-       if (!r.ok) return bad(res, r.status, `paypal_get_subscription_failed: ${JSON.stringify(j)}`);
-   
-       const norm = normalizePaypalSubscription(j);
-       // Wenn custom_id gesetzt ist, validieren wir die Zuordnung:
-       // NEU (tolerant für Alt-Abos)
-         const hasSecret = checkAppSecret(req);
-         
-         // Gibt es bereits eine Zeile für diese Subscription?
-         let existing = null;
-         try {
-           const q = `/rest/v1/subscriptions?select=bubble_user_id&limit=1` +
-                     `&environment=eq.${encodeURIComponent(environment)}` +
-                     `&provider=eq.paypal&provider_subscription_id=eq.${encodeURIComponent(subscriptionId)}`;
-           const exR = await sb(q);
-           if (exR.ok) existing = (await exR.json())?.[0] || null;
-         } catch {}
-         
-         if (norm.custom_id && norm.custom_id !== bubble_user_id) {
-           const sameUserAlready = existing?.bubble_user_id === bubble_user_id;
-           if (!sameUserAlready && !hasSecret) {
-             return bad(res, 409, "custom_id_mismatch");
-           }
-         }
-         
-         // … anschließend normal upserten (provider='paypal', provider_subscription_id=subscriptionId, …)
-
-   
-       // Upsert in Supabase
-       const row = {
-         bubble_user_id,
-         paypal_subscription_id: subscriptionId,
-         plan_id: norm.plan_id,
-         status: norm.status,
-         current_period_start: norm.current_period_start,
-         current_period_end: norm.current_period_end,
-         cancel_at_period_end: norm.cancel_at_period_end,
-         environment,
-         last_event_at: new Date().toISOString()
-       };
-       const up = await sb(`/rest/v1/subscriptions?on_conflict=paypal_subscription_id`, {
+       // Nutzer sicherstellen (idempotent)
+       await sb(`/rest/v1/app_users?on_conflict=bubble_user_id`, {
          method: "POST",
-         headers: { Prefer: "resolution=merge-duplicates,return=representation" },
-         body: JSON.stringify([row])
+         headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
+         body: JSON.stringify([{ bubble_user_id }])
+       }).catch(()=>{});
+   
+       // PayPal token + subscription holen
+       const isLive = environment === "live";
+       const base    = isLive ? "https://api.paypal.com" : "https://api.sandbox.paypal.com";
+       const cid     = need(isLive ? "PAYPAL_CLIENT_ID_LIVE"    : "PAYPAL_CLIENT_ID_SANDBOX");
+       const secret  = need(isLive ? "PAYPAL_CLIENT_SECRET_LIVE" : "PAYPAL_CLIENT_SECRET_SANDBOX");
+       const tokenRes = await fetch(`${base}/v1/oauth2/token`, {
+         method: "POST",
+         headers: { "Authorization": "Basic " + Buffer.from(`${cid}:${secret}`).toString("base64"),
+                    "Content-Type": "application/x-www-form-urlencoded" },
+         body: "grant_type=client_credentials"
+       });
+       const tok = await tokenRes.json().catch(()=> ({}));
+       if (!tokenRes.ok || !tok?.access_token) {
+         return bad(res, 502, `paypal_auth_failed: ${tokenRes.status}`);
+       }
+   
+       const subRes = await fetch(`${base}/v1/billing/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+         headers: { "Authorization": `Bearer ${tok.access_token}` }
+       });
+       const sub = await subRes.json().catch(()=> ({}));
+       if (!subRes.ok) {
+         return bad(res, subRes.status, `paypal_get_failed: ${JSON.stringify(sub)}`);
+       }
+   
+       // Normalize einige Kernfelder
+       const norm = {
+         id: sub?.id || subscriptionId,
+         status: sub?.status || "UNKNOWN",
+         plan_id: sub?.plan_id || null,
+         custom_id: sub?.custom_id || null,
+         next_billing_time: sub?.billing_info?.next_billing_time || null
+       };
+   
+       // --- EXISTING LOOKUP: beide Spalten + Environment berücksichtigen
+       const q1 = `/rest/v1/subscriptions?select=id,bubble_user_id&limit=1`
+                + `&environment=eq.${encodeURIComponent(environment)}`
+                + `&provider=eq.paypal`
+                + `&provider_subscription_id=eq.${encodeURIComponent(subscriptionId)}`;
+       const r1 = await sb(q1); const e1 = r1.ok ? (await r1.json())?.[0] : null;
+   
+       let existing = e1 || null;
+       if (!existing) {
+         const q2 = `/rest/v1/subscriptions?select=id,bubble_user_id&limit=1`
+                  + `&environment=eq.${encodeURIComponent(environment)}`
+                  + `&paypal_subscription_id=eq.${encodeURIComponent(subscriptionId)}`;
+         const r2 = await sb(q2); existing = r2.ok ? (await r2.json())?.[0] : null;
+       }
+   
+       // --- CUSTOM_ID MISMATCH HANDLING (tolerant für Alt-Abos):
+       const hasSecret = checkAppSecret(req);
+       if (norm.custom_id && norm.custom_id !== bubble_user_id) {
+         const sameUserAlready = !!existing && existing.bubble_user_id === bubble_user_id;
+         if (!sameUserAlready && !hasSecret) {
+           // Wer mag, kann zum Debuggen folgende Zeile temporär aktivieren:
+           // return bad(res, 409, `custom_id_mismatch (pp=${norm.custom_id}, ui=${bubble_user_id})`);
+           return bad(res, 409, "custom_id_mismatch");
+         }
+       }
+   
+       // --- UPSERT (provider-agnostisch + Legacy-Spalte füllen)
+       const up = await sb(`/rest/v1/subscriptions?on_conflict=provider,provider_subscription_id`, {
+         method: "POST",
+         headers: { Prefer: "resolution=merge-duplicates,return=representation",
+                    "Content-Type": "application/json" },
+         body: JSON.stringify([{
+           bubble_user_id,
+           provider: "paypal",
+           provider_subscription_id: norm.id,
+           paypal_subscription_id: norm.id,  // für Alt-Schema
+           plan_id: norm.plan_id,
+           status: norm.status,
+           environment,
+           current_period_end: norm.next_billing_time ? new Date(norm.next_billing_time).toISOString() : null,
+           updated_at: new Date().toISOString()
+         }])
        });
        const data = await up.json().catch(()=>[]);
        if (!up.ok) return bad(res, 500, `supabase_upsert_failed: ${JSON.stringify(data)}`);
    
-       return json(res, 200, { ok: true, subscription: Array.isArray(data) ? data[0] : data });
+       return json(res, 200, { ok:true, linked:true, subscription: Array.isArray(data) ? data[0] : data });
      } catch (e) {
-       return bad(res, 500, `link_exception: ${e?.message || e}`);
+       return bad(res, 500, `paypal_link_exception: ${e?.message || e}`);
      }
    },
 
