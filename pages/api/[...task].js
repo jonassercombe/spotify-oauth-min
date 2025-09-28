@@ -1427,23 +1427,21 @@ const routes = {
      const connection_id = body.connection_id;
      if (!connection_id) return bad(res, 400, "missing_connection_id");
    
-     // optionale Query-Flags
-     const url = new URL(req.url, `http://${req.headers.host}`);
-     const qs  = Object.fromEntries(url.searchParams.entries());
-     const staleHours = Number(qs.stale_hours || "24");
-     const maxTotal   = Number(qs.max || "1000");
-     const conc       = Number(qs.concurrency || "4");
-     const perWrite   = Number(qs.batch || "100");
-     const snapshotDaily = qs.snapshot_daily !== "0"; // default: täglich snapshotten
+     // Optional Tuning per Query
+     const staleHours    = Number(req.query.stale_hours || "24");
+     const maxTotal      = Number(req.query.max || "1000");
+     const conc          = Number(req.query.concurrency || "4");
+     const perWrite      = Number(req.query.batch || "100");
+     const snapshotDaily = String(req.query.snapshot_daily || "1") === "1"; // standard: täglich snapshotten
    
      // 1) Connection laden
      const connR = await sb(`/rest/v1/spotify_connections?select=id,bubble_user_id,spotify_user_id&limit=1&id=eq.${encodeURIComponent(connection_id)}`);
      const conn = (await connR.json())?.[0];
      if (!conn) return bad(res, 404, "connection_not_found");
    
-     // 2) Kandidaten-Playlists auswählen (Owner+Public) die stale sind
+     // 2) Kandidaten-Playlists ermitteln (Owner + public), die alt sind oder noch keine follower_checked_at haben
      const sinceIso = new Date(Date.now() - staleHours * 3600 * 1000).toISOString();
-     const order = encodeURIComponent("followers_checked_at.asc.nullsfirst");
+     const order    = encodeURIComponent("followers_checked_at.asc.nullsfirst");
      const path =
        `/rest/v1/playlists?select=playlist_id` +
        `&connection_id=eq.${encodeURIComponent(connection_id)}` +
@@ -1452,12 +1450,14 @@ const routes = {
        `&order=${order}&limit=${maxTotal}`;
      const ids = (await sb(path).then(r => r.json())).map(x => x.playlist_id);
    
-     if (ids.length === 0) return json(res, 200, { ok:true, attempted:0, updated:0, failed:[], reason:"up_to_date" });
+     if (ids.length === 0) {
+       return json(res, 200, { ok:true, attempted:0, updated:0, failed:[], reason:"up_to_date" });
+     }
    
-     // 3) Access Token holen
+     // 3) Access Token
      const access_token = await getAccessTokenFromConnection(connection_id);
    
-     // 4) Parallel Followers holen (mit 429-Backoff)
+     // 4) Followers holen – robust gegen 429/5xx
      const results = await (async () => {
        const out = [];
        let i = 0, running = 0;
@@ -1468,24 +1468,50 @@ const routes = {
              (async () => {
                try {
                  const url = `https://api.spotify.com/v1/playlists/${id}?fields=followers(total)`;
-                 let attempt = 0;
-                 while (true) {
+                 let attempt = 0, done = false;
+                 while (!done) {
                    const r = await fetch(url, { headers: { Authorization: `Bearer ${access_token}` } });
+                   // 429 → exponentieller Backoff + Jitter
                    if (r.status === 429) {
-                     const retry = Number(r.headers.get("retry-after") || "1");
-                     const waitSec = Math.min(60, Math.max(1, retry) * Math.pow(2, attempt)) + (Math.random() * 0.8);
-                     if (attempt++ >= 6) { out.push({ id, followers:null, ok:false, status:429 }); break; }
+                     const ra = Number(r.headers.get("retry-after") || "1");
+                     const waitSec = Math.min(60, Math.max(1, ra) * Math.pow(2, attempt)) + (Math.random() * 0.8);
+                     console.warn("refresh-followers:429", { id, attempt, retry_after_s: ra, wait_s: waitSec.toFixed(1) });
+                     if (attempt++ >= 6) {
+                       out.push({ id, followers: null, ok: false, status: 429 });
+                       break;
+                     }
                      await sleep(waitSec * 1000);
                      continue;
                    }
-                   const j = await r.json().catch(()=> ({}));
-                   if (!r.ok) { out.push({ id, followers:null, ok:false, status:r.status }); }
-                   else { out.push({ id, followers: j?.followers?.total ?? null, ok:true, status:200 }); }
-                   break;
+                   // 5xx → kurzer Backoff, max 3 Versuche
+                   if (r.status >= 500 && r.status < 600) {
+                     const waitSec = 1 + attempt * 2 + Math.random() * 0.8;
+                     console.warn("refresh-followers:5xx", { id, status: r.status, attempt, wait_s: waitSec.toFixed(1) });
+                     if (attempt++ >= 3) {
+                       out.push({ id, followers: null, ok: false, status: r.status });
+                       break;
+                     }
+                     await sleep(waitSec * 1000);
+                     continue;
+                   }
+   
+                   const j = await r.json().catch(() => ({}));
+                   if (!r.ok) {
+                     out.push({ id, followers: null, ok: false, status: r.status });
+                   } else {
+                     const total = Number(j?.followers?.total);
+                     if (Number.isFinite(total)) {
+                       out.push({ id, followers: total, ok: true, status: 200 });
+                     } else {
+                       // Keine valide Zahl → nicht snapshotten/aktualisieren
+                       out.push({ id, followers: null, ok: false, status: 200 });
+                     }
+                   }
+                   done = true;
                  }
                  await sleep(50);
-               } catch {
-                 out.push({ id, followers:null, ok:false, status:500 });
+               } catch (e) {
+                 out.push({ id, followers: null, ok: false, status: 500 });
                } finally {
                  running--; kick();
                }
@@ -1498,16 +1524,18 @@ const routes = {
        return out;
      })();
    
-     // 5) Upsert in playlists
+     // 5) Upsert in playlists (nur valide Zahlen)
      const nowIso = new Date().toISOString();
-     const rows = results.filter(x => x.ok).map(x => ({
-       playlist_id: x.id,
-       connection_id,
-       bubble_user_id: conn.bubble_user_id,
-       followers: x.followers,
-       followers_checked_at: nowIso,
-       updated_at: nowIso,
-     }));
+     const rows = results
+       .filter(x => x.ok && Number.isFinite(Number(x.followers)))
+       .map(x => ({
+         playlist_id: x.id,
+         connection_id,
+         bubble_user_id: conn.bubble_user_id,
+         followers: Number(x.followers),
+         followers_checked_at: nowIso,
+         updated_at: nowIso,
+       }));
    
      for (let i = 0; i < rows.length; i += perWrite) {
        const r = await sb(`/rest/v1/playlists?on_conflict=playlist_id`, {
@@ -1518,14 +1546,15 @@ const routes = {
        if (!r.ok) return bad(res, 500, `supabase upsert failed: ${await r.text()}`);
      }
    
-     // 6) Täglicher Snapshot in playlist_followers_daily
+     // 6) Optional: Tages-Snapshot in playlist_followers_daily (nur valide Zahlen)
+     let snapshot_count = 0;
      if (snapshotDaily && rows.length > 0) {
        const day = new Date().toISOString().slice(0,10); // YYYY-MM-DD
        const dailyRows = rows.map(r => ({
          playlist_id: r.playlist_id,
-         bubble_user_id: conn.bubble_user_id,
+         bubble_user_id: r.bubble_user_id,
          day,
-         followers: r.followers ?? 0
+         followers: r.followers
        }));
    
        for (let i = 0; i < dailyRows.length; i += perWrite) {
@@ -1535,12 +1564,22 @@ const routes = {
            body: JSON.stringify(dailyRows.slice(i, i + perWrite)),
          });
          if (!r.ok) return bad(res, 500, `supabase daily upsert failed: ${await r.text()}`);
+         snapshot_count += Math.min(perWrite, dailyRows.length - i);
        }
      }
    
+     // 7) Antwort
      const failed = results.filter(x => !x.ok).map(x => ({ id: x.id, status: x.status }));
-     return json(res, 200, { ok:true, attempted: ids.length, updated: rows.length, failed, snapshot_daily: snapshotDaily });
+     return json(res, 200, {
+       ok: true,
+       attempted: ids.length,
+       updated: rows.length,
+       failed,
+       snapshot_daily: snapshotDaily,
+       snapshot_count
+     });
    },
+
 
 
 
