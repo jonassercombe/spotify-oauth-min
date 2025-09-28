@@ -342,9 +342,28 @@ const routes = {
    
        const norm = normalizePaypalSubscription(j);
        // Wenn custom_id gesetzt ist, validieren wir die Zuordnung:
-       if (norm.custom_id && norm.custom_id !== bubble_user_id) {
-         return bad(res, 409, "custom_id_mismatch");
-       }
+       // NEU (tolerant für Alt-Abos)
+         const hasSecret = checkAppSecret(req);
+         
+         // Gibt es bereits eine Zeile für diese Subscription?
+         let existing = null;
+         try {
+           const q = `/rest/v1/subscriptions?select=bubble_user_id&limit=1` +
+                     `&environment=eq.${encodeURIComponent(environment)}` +
+                     `&provider=eq.paypal&provider_subscription_id=eq.${encodeURIComponent(subscriptionId)}`;
+           const exR = await sb(q);
+           if (exR.ok) existing = (await exR.json())?.[0] || null;
+         } catch {}
+         
+         if (norm.custom_id && norm.custom_id !== bubble_user_id) {
+           const sameUserAlready = existing?.bubble_user_id === bubble_user_id;
+           if (!sameUserAlready && !hasSecret) {
+             return bad(res, 409, "custom_id_mismatch");
+           }
+         }
+         
+         // … anschließend normal upserten (provider='paypal', provider_subscription_id=subscriptionId, …)
+
    
        // Upsert in Supabase
        const row = {
