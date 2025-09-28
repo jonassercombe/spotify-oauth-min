@@ -1,5 +1,6 @@
 // pages/api/[...task].js
-export const config = { runtime: "nodejs" };
+- export const config = { runtime: "nodejs" };
++ export const config = { api: { bodyParser: false }, runtime: "nodejs" };
 
 /* ==============================
    Shared Utils (Server-only)
@@ -216,11 +217,321 @@ async function setConnectionCooldown(connection_id, seconds) {
 }
 
 
+/* ==============================
+   PayPal helpers
+============================== */
+function paypalBase(env) {
+  return env === "live" ? "https://api.paypal.com" : "https://api.sandbox.paypal.com";
+}
+function getPaypalCreds(env) {
+  if (env === "live") {
+    return {
+      id: need("PAYPAL_CLIENT_ID_LIVE"),
+      secret: need("PAYPAL_CLIENT_SECRET_LIVE"),
+      webhookId: need("PAYPAL_WEBHOOK_ID_LIVE"),
+    };
+  }
+  return {
+    id: need("PAYPAL_CLIENT_ID_SANDBOX"),
+    secret: need("PAYPAL_CLIENT_SECRET_SANDBOX"),
+    webhookId: need("PAYPAL_WEBHOOK_ID_SANDBOX"),
+  };
+}
+async function paypalAccessToken(env) {
+  const { id, secret } = getPaypalCreds(env);
+  const r = await fetch(`${paypalBase(env)}/v1/oauth2/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", Authorization: "Basic " + Buffer.from(`${id}:${secret}`).toString("base64") },
+    body: "grant_type=client_credentials"
+  });
+  const j = await r.json();
+  if (!r.ok || !j.access_token) throw new Error("paypal_token_failed");
+  return j.access_token;
+}
+/** Heuristik: aus Headern Sandbox/Live ableiten; optional ?env= override */
+function inferPaypalEnv(req) {
+  const qpEnv = new URL(req.url, `http://${req.headers.host}`).searchParams.get("env");
+  if (qpEnv === "live" || qpEnv === "sandbox") return qpEnv;
+  const certUrl = String(req.headers["paypal-cert-url"] || "");
+  return /sandbox/.test(certUrl) ? "sandbox" : "live";
+}
+async function readRawBody(req) {
+  return new Promise((resolve) => {
+    let data = "";
+    req.on("data", (c) => (data += c));
+    req.on("end", () => resolve(data));
+  });
+}
+async function verifyPaypalWebhook(req, rawBody, env) {
+  const { webhookId } = getPaypalCreds(env);
+  const token = await paypalAccessToken(env);
+  const payload = {
+    transmission_id: req.headers["paypal-transmission-id"],
+    transmission_time: req.headers["paypal-transmission-time"],
+    cert_url: req.headers["paypal-cert-url"],
+    auth_algo: req.headers["paypal-auth-algo"],
+    transmission_sig: req.headers["paypal-transmission-sig"],
+    webhook_id: webhookId,
+    webhook_event: JSON.parse(rawBody || "{}"),
+  };
+  const r = await fetch(`${paypalBase(env)}/v1/notifications/verify-webhook-signature`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify(payload),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || j.verification_status !== "SUCCESS") {
+    throw new Error(`paypal_webhook_verify_failed: ${r.status} ${JSON.stringify(j)}`);
+  }
+  return j; // enthält u.a. verification_status
+}
+function mapPaypalStatus(s) {
+  // PayPal liefert z.B. APPROVAL_PENDING, ACTIVE, SUSPENDED, CANCELLED, EXPIRED
+  const up = String(s || "").toUpperCase();
+  if (["ACTIVE","SUSPENDED","CANCELLED","EXPIRED","APPROVAL_PENDING"].includes(up)) return up;
+  return up || "UNKNOWN";
+}
+/** Normalisiert wichtige Felder aus GET /v1/billing/subscriptions/{id} */
+function normalizePaypalSubscription(json) {
+  const status = mapPaypalStatus(json?.status);
+  const plan_id = json?.plan_id || null;
+  const create_time = json?.create_time || null;
+  const billing = json?.billing_info || {};
+  const lastPaymentTime = billing?.last_payment?.time || null;
+  const nextBillingTime  = billing?.next_billing_time || null;
+
+  // Grobe Heuristik für Start: letzte Zahlung oder create_time
+  const current_period_start = lastPaymentTime || create_time || null;
+  const current_period_end   = nextBillingTime || null;
+
+  // cancel_at_period_end kennt PayPal so nicht direkt; wir setzen false und leiten realen Status über 'status' ab
+  const cancel_at_period_end = false;
+
+  const custom_id = json?.custom_id || json?.subscriber?.payer_id || null;
+  return { status, plan_id, current_period_start, current_period_end, cancel_at_period_end, custom_id };
+}
+
+
+
 
 /* ==============================
    Route Handlers (map)
 ============================== */
 const routes = {
+
+
+
+
+
+
+   // POST paypal/subscriptions/link
+      "paypal/subscriptions/link": async (req, res) => {
+     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+     try {
+       const body = await readBody(req);
+       const subscriptionId = String(body.subscriptionId || "");
+       const bubble_user_id = String(body.bubble_user_id || "");
+       const environment = (body.environment === "live") ? "live" : "sandbox";
+       if (!subscriptionId || !bubble_user_id) return bad(res, 400, "missing_subscriptionId_or_bubble_user_id");
+   
+       const token = await paypalAccessToken(environment);
+       const r = await fetch(`${paypalBase(environment)}/v1/billing/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+         headers: { Authorization: `Bearer ${token}` }
+       });
+       const j = await r.json();
+       if (!r.ok) return bad(res, r.status, `paypal_get_subscription_failed: ${JSON.stringify(j)}`);
+   
+       const norm = normalizePaypalSubscription(j);
+       // Wenn custom_id gesetzt ist, validieren wir die Zuordnung:
+       if (norm.custom_id && norm.custom_id !== bubble_user_id) {
+         return bad(res, 409, "custom_id_mismatch");
+       }
+   
+       // Upsert in Supabase
+       const row = {
+         bubble_user_id,
+         paypal_subscription_id: subscriptionId,
+         plan_id: norm.plan_id,
+         status: norm.status,
+         current_period_start: norm.current_period_start,
+         current_period_end: norm.current_period_end,
+         cancel_at_period_end: norm.cancel_at_period_end,
+         environment,
+         last_event_at: new Date().toISOString()
+       };
+       const up = await sb(`/rest/v1/subscriptions?on_conflict=paypal_subscription_id`, {
+         method: "POST",
+         headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+         body: JSON.stringify([row])
+       });
+       const data = await up.json().catch(()=>[]);
+       if (!up.ok) return bad(res, 500, `supabase_upsert_failed: ${JSON.stringify(data)}`);
+   
+       return json(res, 200, { ok: true, subscription: Array.isArray(data) ? data[0] : data });
+     } catch (e) {
+       return bad(res, 500, `link_exception: ${e?.message || e}`);
+     }
+   },
+
+   // POST paypal/webhook
+      "paypal/webhook": async (req, res) => {
+     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+     try {
+       const env = inferPaypalEnv(req); // 'sandbox'|'live'
+       const raw = await readRawBody(req);
+       const verified = await verifyPaypalWebhook(req, raw, env);
+       const event = JSON.parse(raw || "{}");
+   
+       // Idempotenz: subscription_events
+       try {
+         await sb(`/rest/v1/subscription_events?on_conflict=paypal_event_id`, {
+           method: "POST",
+           headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
+           body: JSON.stringify([{
+             paypal_event_id: event?.id || null,
+             paypal_subscription_id: event?.resource?.id || null,
+             event_type: event?.event_type || null,
+             payload: event || {},
+           }])
+         });
+       } catch {}
+   
+       const type = String(event?.event_type || "");
+       const subId = String(event?.resource?.id || "");
+   
+       // Für die relevanten Events holen wir den frischen Zustand von PayPal (Pull > Push)
+       const interesting = [
+         "BILLING.SUBSCRIPTION.ACTIVATED",
+         "BILLING.SUBSCRIPTION.CANCELLED",
+         "BILLING.SUBSCRIPTION.SUSPENDED",
+         "BILLING.SUBSCRIPTION.EXPIRED",
+         "BILLING.SUBSCRIPTION.UPDATED",
+         "BILLING.SUBSCRIPTION.RE-ACTIVATED"
+       ];
+       if (subId && interesting.includes(type)) {
+         const token = await paypalAccessToken(env);
+         const r = await fetch(`${paypalBase(env)}/v1/billing/subscriptions/${encodeURIComponent(subId)}`, {
+           headers: { Authorization: `Bearer ${token}` }
+         });
+         const j = await r.json();
+         if (r.ok) {
+           const norm = normalizePaypalSubscription(j);
+           // bubble_user_id bestimmen: bevorzugt custom_id, sonst vorhandene Row ziehen
+           let bubble_user_id = norm.custom_id || null;
+           if (!bubble_user_id) {
+             const sel = await sb(`/rest/v1/subscriptions?select=bubble_user_id&limit=1&paypal_subscription_id=eq.${encodeURIComponent(subId)}`);
+             const arr = await sel.json().catch(()=>[]);
+             bubble_user_id = arr?.[0]?.bubble_user_id || null;
+           }
+   
+           const upRow = {
+             bubble_user_id, // falls null und Datensatz existiert, überschreibt PostgREST nicht (wir nutzen merge-duplicates)
+             paypal_subscription_id: subId,
+             plan_id: norm.plan_id,
+             status: norm.status,
+             current_period_start: norm.current_period_start,
+             current_period_end: norm.current_period_end,
+             cancel_at_period_end: norm.cancel_at_period_end,
+             environment: env,
+             last_event_at: new Date().toISOString()
+           };
+           await sb(`/rest/v1/subscriptions?on_conflict=paypal_subscription_id`, {
+             method: "POST",
+             headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+             body: JSON.stringify([upRow])
+           }).catch(()=>{});
+         }
+       }
+   
+       return json(res, 200, { ok: true });
+     } catch (e) {
+       // Bei Verifikationsfehlern bitte 400 zurückgeben (PayPal retried nicht auf 5xx)
+       const msg = e?.message || String(e);
+       return bad(res, 400, `webhook_error: ${msg}`);
+     }
+   },
+
+
+
+
+   // GET subscriptions/status
+   "subscriptions/status": async (req, res) => {
+  if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+  const bubble_user_id = String(req.query.bubble_user_id || "");
+  if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
+  const env = (req.query.environment === "live") ? "live" : "sandbox"; // optional, default sandbox
+  const r = await sb(`/rest/v1/subscriptions?select=paypal_subscription_id,plan_id,status,current_period_end,environment,updated_at&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&environment=eq.${encodeURIComponent(env)}&order=updated_at.desc&limit=1`);
+  const arr = await r.json().catch(()=>[]);
+  if (!r.ok) return bad(res, 500, `supabase_error: ${JSON.stringify(arr)}`);
+  const row = arr?.[0] || null;
+  return json(res, 200, row ? {
+    ok: true,
+    status: row.status,
+    current_period_end: row.current_period_end,
+    plan_id: row.plan_id,
+    subscription_id: row.paypal_subscription_id,
+    environment: row.environment
+  } : { ok: true, status: null });
+},
+
+   // POST subscriptions/refresh
+      "subscriptions/refresh": async (req, res) => {
+     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+     try {
+       const body = await readBody(req);
+       const environment = (body.environment === "live") ? "live" : "sandbox";
+       let subscription_id = String(body.subscription_id || "");
+       const bubble_user_id = String(body.bubble_user_id || "");
+   
+       if (!subscription_id && !bubble_user_id) {
+         return bad(res, 400, "need_subscription_id_or_bubble_user_id");
+       }
+       if (!subscription_id && bubble_user_id) {
+         const sel = await sb(`/rest/v1/subscriptions?select=paypal_subscription_id&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&environment=eq.${encodeURIComponent(environment)}&order=updated_at.desc&limit=1`);
+         const arr = await sel.json().catch(()=>[]);
+         subscription_id = arr?.[0]?.paypal_subscription_id || "";
+       }
+       if (!subscription_id) return bad(res, 404, "subscription_not_found_for_user");
+   
+       const token = await paypalAccessToken(environment);
+       const r = await fetch(`${paypalBase(environment)}/v1/billing/subscriptions/${encodeURIComponent(subscription_id)}`, {
+         headers: { Authorization: `Bearer ${token}` }
+       });
+       const j = await r.json().catch(()=> ({}));
+       if (!r.ok) return bad(res, r.status, `paypal_get_failed: ${JSON.stringify(j)}`);
+   
+       const norm = normalizePaypalSubscription(j);
+       const up = await sb(`/rest/v1/subscriptions?on_conflict=paypal_subscription_id`, {
+         method: "POST",
+         headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+         body: JSON.stringify([{
+           bubble_user_id: bubble_user_id || norm.custom_id || null,
+           paypal_subscription_id: subscription_id,
+           plan_id: norm.plan_id,
+           status: norm.status,
+           current_period_start: norm.current_period_start,
+           current_period_end: norm.current_period_end,
+           cancel_at_period_end: norm.cancel_at_period_end,
+           environment,
+           last_event_at: new Date().toISOString()
+         }])
+       });
+       const data = await up.json().catch(()=>[]);
+       if (!up.ok) return bad(res, 500, `supabase_upsert_failed: ${JSON.stringify(data)}`);
+   
+       return json(res, 200, {
+         ok: true,
+         status: norm.status,
+         current_period_end: norm.current_period_end,
+         plan_id: norm.plan_id,
+         subscription_id
+       });
+     } catch (e) {
+       return bad(res, 500, `refresh_exception: ${e?.message || e}`);
+     }
+   },
+
+   
   /* ---------- connections/list (GET) ---------- */
   "connections/list": async (req, res) => {
     const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -2887,6 +3198,9 @@ const routes = {
   /* ---------- ping ---------- */
   "watch/ping": async (_req, res) => json(res, 200, { ok: true }),
 };
+
+
+
 
 /* ==============================
    Dispatcher
