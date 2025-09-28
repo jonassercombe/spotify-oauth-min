@@ -1,6 +1,5 @@
 // pages/api/[...task].js
-- export const config = { runtime: "nodejs" };
-+ export const config = { api: { bodyParser: false }, runtime: "nodejs" };
+export const config = { api: { bodyParser: false } };
 
 /* ==============================
    Shared Utils (Server-only)
