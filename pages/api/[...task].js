@@ -1427,77 +1427,81 @@ const routes = {
      const connection_id = body.connection_id;
      if (!connection_id) return bad(res, 400, "missing_connection_id");
    
-     const staleHours = Number(req.query.stale_hours || "24");
-     const maxTotal   = Number(req.query.max || "1000");
-     const conc       = Number(req.query.concurrency || "4");
-     const perWrite   = Number(req.query.batch || "100");
+     // optionale Query-Flags
+     const url = new URL(req.url, `http://${req.headers.host}`);
+     const qs  = Object.fromEntries(url.searchParams.entries());
+     const staleHours = Number(qs.stale_hours || "24");
+     const maxTotal   = Number(qs.max || "1000");
+     const conc       = Number(qs.concurrency || "4");
+     const perWrite   = Number(qs.batch || "100");
+     const snapshotDaily = qs.snapshot_daily !== "0"; // default: täglich snapshotten
    
+     // 1) Connection laden
      const connR = await sb(`/rest/v1/spotify_connections?select=id,bubble_user_id,spotify_user_id&limit=1&id=eq.${encodeURIComponent(connection_id)}`);
      const conn = (await connR.json())?.[0];
      if (!conn) return bad(res, 404, "connection_not_found");
    
+     // 2) Kandidaten-Playlists auswählen (Owner+Public) die stale sind
      const sinceIso = new Date(Date.now() - staleHours * 3600 * 1000).toISOString();
      const order = encodeURIComponent("followers_checked_at.asc.nullsfirst");
      const path =
-       `/rest/v1/playlists?select=id,playlist_id` +                           // <-- NEU: auch UUID ziehen
+       `/rest/v1/playlists?select=playlist_id` +
        `&connection_id=eq.${encodeURIComponent(connection_id)}` +
        `&is_owner=is.true&is_public=is.true` +
        `&or=(followers.is.null,followers_checked_at.lt.${encodeURIComponent(sinceIso)})` +
        `&order=${order}&limit=${maxTotal}`;
+     const ids = (await sb(path).then(r => r.json())).map(x => x.playlist_id);
    
-     const targets = await sb(path).then(r => r.json()); // [{ id: <uuid>, playlist_id: <spotify_id> }, ...]
-     if (!Array.isArray(targets) || targets.length === 0) {
-       return json(res, 200, { ok:true, attempted:0, updated:0, failed:[], reason:"up_to_date" });
-     }
+     if (ids.length === 0) return json(res, 200, { ok:true, attempted:0, updated:0, failed:[], reason:"up_to_date" });
    
+     // 3) Access Token holen
      const access_token = await getAccessTokenFromConnection(connection_id);
    
-     // parallel Followers laden
+     // 4) Parallel Followers holen (mit 429-Backoff)
      const results = await (async () => {
        const out = [];
        let i = 0, running = 0;
        await new Promise((resolve) => {
          const kick = () => {
-           while (running < conc && i < targets.length) {
-             const t = targets[i++]; running++;
+           while (running < conc && i < ids.length) {
+             const id = ids[i++]; running++;
              (async () => {
-               const row_id = t.id;              // UUID in unserer DB
-               const sp_id  = t.playlist_id;     // Spotify ID
                try {
-                 const url = `https://api.spotify.com/v1/playlists/${encodeURIComponent(sp_id)}?fields=followers(total)`;
-                 let resFollowers = { ok:false, status:0, row_id, sp_id, followers:null };
+                 const url = `https://api.spotify.com/v1/playlists/${id}?fields=followers(total)`;
+                 let attempt = 0;
                  while (true) {
                    const r = await fetch(url, { headers: { Authorization: `Bearer ${access_token}` } });
                    if (r.status === 429) {
                      const retry = Number(r.headers.get("retry-after") || "1");
-                     await sleep((retry + 0.2)*1000);
+                     const waitSec = Math.min(60, Math.max(1, retry) * Math.pow(2, attempt)) + (Math.random() * 0.8);
+                     if (attempt++ >= 6) { out.push({ id, followers:null, ok:false, status:429 }); break; }
+                     await sleep(waitSec * 1000);
                      continue;
                    }
                    const j = await r.json().catch(()=> ({}));
-                   if (!r.ok) { resFollowers = { row_id, sp_id, followers:null, ok:false, status:r.status }; }
-                   else { resFollowers = { row_id, sp_id, followers: j?.followers?.total ?? null, ok:true, status:200 }; }
+                   if (!r.ok) { out.push({ id, followers:null, ok:false, status:r.status }); }
+                   else { out.push({ id, followers: j?.followers?.total ?? null, ok:true, status:200 }); }
                    break;
                  }
-                 out.push(resFollowers);
                  await sleep(50);
                } catch {
-                 out.push({ row_id, sp_id, followers:null, ok:false, status:500 });
+                 out.push({ id, followers:null, ok:false, status:500 });
                } finally {
                  running--; kick();
                }
              })();
            }
-           if (running === 0 && i >= targets.length) resolve();
+           if (running === 0 && i >= ids.length) resolve();
          };
          kick();
        });
        return out;
      })();
    
-     // Upsert in playlists (aktuelle Follower + checked_at)
+     // 5) Upsert in playlists
      const nowIso = new Date().toISOString();
      const rows = results.filter(x => x.ok).map(x => ({
-       playlist_id: x.sp_id,                // Spotify-ID, on_conflict=playlist_id
+       playlist_id: x.id,
        connection_id,
        bubble_user_id: conn.bubble_user_id,
        followers: x.followers,
@@ -1507,37 +1511,37 @@ const routes = {
    
      for (let i = 0; i < rows.length; i += perWrite) {
        const r = await sb(`/rest/v1/playlists?on_conflict=playlist_id`, {
-         method: "POST", headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+         method: "POST",
+         headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
          body: JSON.stringify(rows.slice(i, i + perWrite)),
        });
        if (!r.ok) return bad(res, 500, `supabase upsert failed: ${await r.text()}`);
      }
    
-     // --- NEU: Tages-Snapshot in playlist_followers_history (UUID-Referenz) ---
-     const sample_date = new Date().toISOString().slice(0,10); // 'YYYY-MM-DD' UTC
-     const histRows = results
-       .filter(x => x.ok && Number.isFinite(x.followers))
-       .map(x => ({
-         playlist_id: x.row_id,              // UUID (playlists.id)
+     // 6) Täglicher Snapshot in playlist_followers_daily
+     if (snapshotDaily && rows.length > 0) {
+       const day = new Date().toISOString().slice(0,10); // YYYY-MM-DD
+       const dailyRows = rows.map(r => ({
+         playlist_id: r.playlist_id,
          bubble_user_id: conn.bubble_user_id,
-         sample_date,                        // DATE-Spalte
-         followers: x.followers
+         day,
+         followers: r.followers ?? 0
        }));
    
-     for (let i = 0; i < histRows.length; i += perWrite) {
-       const rHist = await sb(`/rest/v1/playlist_followers_history?on_conflict=playlist_id,sample_date`, {
-         method: "POST",
-         headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-         body: JSON.stringify(histRows.slice(i, i + perWrite))
-       });
-       if (!rHist.ok) {
-         return bad(res, 500, `supabase history upsert failed: ${await rHist.text()}`);
+       for (let i = 0; i < dailyRows.length; i += perWrite) {
+         const r = await sb(`/rest/v1/playlist_followers_daily?on_conflict=playlist_id,bubble_user_id,day`, {
+           method: "POST",
+           headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+           body: JSON.stringify(dailyRows.slice(i, i + perWrite)),
+         });
+         if (!r.ok) return bad(res, 500, `supabase daily upsert failed: ${await r.text()}`);
        }
      }
    
-     const failed = results.filter(x => !x.ok).map(x => ({ spotify_id: x.sp_id, status: x.status }));
-     return json(res, 200, { ok:true, attempted: targets.length, updated: rows.length, history: histRows.length, failed });
+     const failed = results.filter(x => !x.ok).map(x => ({ id: x.id, status: x.status }));
+     return json(res, 200, { ok:true, attempted: ids.length, updated: rows.length, failed, snapshot_daily: snapshotDaily });
    },
+
 
 
   /* ---------- playlists/sync-items (POST, secret) ---------- */
