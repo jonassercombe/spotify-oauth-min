@@ -578,6 +578,122 @@ const routes = {
    },
 
 
+   /* ---------- subscriptions/refresh (POST) ----------
+   Body:
+     {
+       "subscription_id": "I-…",           // oder "subscriptionId"
+       "bubble_user_id": "<Bubble UID>",   // optional, aber empfohlen
+       "environment": "live" | "sandbox"   // default: "live"
+     }
+   
+   Optionaler Admin-Override (falls Abo bereits einem anderen User gehört):
+     Header: x-app-secret: <APP_WEBHOOK_SECRET>
+   */
+   "subscriptions/refresh": async (req, res) => {
+     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+     try {
+       const body = await readBody(req);
+       const subscriptionId = String(body.subscription_id || body.subscriptionId || "").trim();
+       const bubble_user_id = String(body.bubble_user_id || "").trim();
+       const environment = (String(body.environment || "live").toLowerCase() === "sandbox") ? "sandbox" : "live";
+       if (!subscriptionId) return bad(res, 400, "missing_subscription_id");
+   
+       // optional: User idempotent anlegen
+       if (bubble_user_id) {
+         await sb(`/rest/v1/app_users?on_conflict=bubble_user_id`, {
+           method: "POST",
+           headers: { Prefer: "resolution=ignore-duplicates,return=minimal", "Content-Type":"application/json" },
+           body: JSON.stringify([{ bubble_user_id }])
+         }).catch(()=>{});
+       }
+   
+       // PayPal creds + base URL wählen
+       const isLive = environment === "live";
+       const base   = isLive ? "https://api.paypal.com" : "https://api.sandbox.paypal.com";
+       const cid    = need(isLive ? "PAYPAL_CLIENT_ID_LIVE"     : "PAYPAL_CLIENT_ID_SANDBOX");
+       const secret = need(isLive ? "PAYPAL_CLIENT_SECRET_LIVE" : "PAYPAL_CLIENT_SECRET_SANDBOX");
+   
+       // OAuth2 client_credentials
+       const tokRes = await fetch(`${base}/v1/oauth2/token`, {
+         method: "POST",
+         headers: {
+           "Authorization": "Basic " + Buffer.from(`${cid}:${secret}`).toString("base64"),
+           "Content-Type": "application/x-www-form-urlencoded"
+         },
+         body: "grant_type=client_credentials"
+       });
+       const tok = await tokRes.json().catch(()=> ({}));
+       if (!tokRes.ok || !tok?.access_token) {
+         return bad(res, 502, `paypal_auth_failed: ${tokRes.status}`);
+       }
+   
+       // Subscription holen
+       const subRes = await fetch(`${base}/v1/billing/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+         headers: { "Authorization": `Bearer ${tok.access_token}` }
+       });
+       const sub = await subRes.json().catch(()=> ({}));
+       if (!subRes.ok) {
+         return bad(res, subRes.status, `paypal_get_failed: ${JSON.stringify(sub)}`);
+       }
+   
+       // Normalisieren
+       const norm = {
+         id: sub?.id || subscriptionId,
+         status: sub?.status || "UNKNOWN",
+         plan_id: sub?.plan_id || null,
+         next_billing_time: sub?.billing_info?.next_billing_time || null,
+         custom_id: sub?.custom_id || null
+       };
+   
+       // Falls es in DB schon einen Eintrag für dieses Abo gibt, Ownership respektieren
+       let existing = null;
+       try {
+         const q = `/rest/v1/subscriptions?select=bubble_user_id&limit=1`
+                 + `&provider=eq.paypal`
+                 + `&provider_subscription_id=eq.${encodeURIComponent(subscriptionId)}`
+                 + `&environment=eq.${encodeURIComponent(environment)}`;
+         const exR = await sb(q);
+         if (exR.ok) existing = (await exR.json())?.[0] || null;
+       } catch {}
+   
+       const hasSecret = checkAppSecret(req);
+       if (existing?.bubble_user_id && bubble_user_id && existing.bubble_user_id !== bubble_user_id && !hasSecret) {
+         return bad(res, 409, "subscription_belongs_to_other_user");
+       }
+   
+       // Upsert (provider-agnostisch + Legacy-Spalte füllen)
+       const up = await sb(`/rest/v1/subscriptions?on_conflict=provider,provider_subscription_id`, {
+         method: "POST",
+         headers: {
+           Prefer: "resolution=merge-duplicates,return=representation",
+           "Content-Type": "application/json"
+         },
+         body: JSON.stringify([{
+           // bubble_user_id nur setzen, wenn neu oder gleich – sonst unverändert lassen
+           bubble_user_id: bubble_user_id || existing?.bubble_user_id || null,
+           provider: "paypal",
+           provider_subscription_id: norm.id,
+           paypal_subscription_id: norm.id, // Legacy-Kompatibilität
+           plan_id: norm.plan_id,
+           status: norm.status,
+           environment,
+           current_period_end: norm.next_billing_time ? new Date(norm.next_billing_time).toISOString() : null,
+           updated_at: new Date().toISOString()
+         }])
+       });
+       const data = await up.json().catch(()=>[]);
+       if (!up.ok) return bad(res, 500, `supabase_upsert_failed: ${JSON.stringify(data)}`);
+   
+       return json(res, 200, {
+         ok: true,
+         refreshed: true,
+         subscription: Array.isArray(data) ? data[0] : data
+       });
+     } catch (e) {
+       return bad(res, 500, `subscriptions_refresh_exception: ${e?.message || e}`);
+     }
+   },
+
    
   /* ---------- connections/list (GET) ---------- */
   "connections/list": async (req, res) => {
