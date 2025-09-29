@@ -1902,148 +1902,160 @@ const routes = {
        const connection_id = body.connection_id;
        if (!connection_id) return bad(res, 400, "missing_connection_id");
    
-       // Tuning per Query
-       const staleHours = Number(req.query.stale_hours || "24");   // nur Playlists updaten, deren followers alt/NULL sind
-       const maxTotal   = Number(req.query.max || "1000");         // max # Playlists in einem Lauf
-       const conc       = Number(req.query.concurrency || "4");    // parallele Spotify-Calls
-       const perWrite   = Number(req.query.batch || "200");        // Batchgröße für Upserts
+       // Query-Parameter
+       const staleHours = Number(req.query.stale_hours || "24");
+       const maxTotal   = Number(req.query.max || "1000");
+       const conc       = Number(req.query.concurrency || "4");
+       const perWrite   = Number(req.query.batch || "100");
+       const onlyPid    = req.query.only_playlist_id && String(req.query.only_playlist_id);
    
-       // Connection prüfen (brauchen bubble_user_id)
+       // Connection holen
        const connR = await sb(`/rest/v1/spotify_connections?select=id,bubble_user_id,spotify_user_id&limit=1&id=eq.${encodeURIComponent(connection_id)}`);
        if (!connR.ok) return bad(res, 500, `supabase_select_connection_failed: ${await connR.text()}`);
        const conn = (await connR.json())?.[0];
        if (!conn) return bad(res, 404, "connection_not_found");
    
-       // Kandidaten-Playlists laden (owner + public, followers alt/NULL)
-       const sinceIso = new Date(Date.now() - staleHours * 3600 * 1000).toISOString();
-       const order = encodeURIComponent("followers_checked_at.asc.nullsfirst");
-       const listPath =
-         `/rest/v1/playlists` +
-         `?select=id,playlist_id,bubble_user_id` +
-         `&connection_id=eq.${encodeURIComponent(connection_id)}` +
-         `&is_owner=is.true&is_public=is.true` +
-         `&or=(followers.is.null,followers_checked_at.lt.${encodeURIComponent(sinceIso)})` +
-         `&order=${order}&limit=${maxTotal}`;
+       // Kandidaten bestimmen
+       let playlistsToUpdate = [];
+       if (onlyPid) {
+         const oneR = await sb(
+           `/rest/v1/playlists?select=id,playlist_id,bubble_user_id,is_owner,is_public,followers,followers_checked_at&limit=1&id=eq.${encodeURIComponent(onlyPid)}`
+         );
+         if (!oneR.ok) return bad(res, 500, `supabase_select_one_failed: ${await oneR.text()}`);
+         const one = (await oneR.json())?.[0];
+         if (!one || !one.is_owner || !one.is_public) {
+           return bad(res, 404, "playlist_not_found_or_not_allowed");
+         }
+         playlistsToUpdate = [one];
+       } else {
+         const sinceIso = new Date(Date.now() - staleHours * 3600 * 1000).toISOString();
+         const order = encodeURIComponent("followers_checked_at.asc.nullsfirst");
+         const selPath =
+           `/rest/v1/playlists?select=id,playlist_id,bubble_user_id,is_owner,is_public,followers,followers_checked_at` +
+           `&connection_id=eq.${encodeURIComponent(connection_id)}` +
+           `&is_owner=is.true&is_public=is.true` +
+           `&or=(followers.is.null,followers_checked_at.lt.${encodeURIComponent(sinceIso)})` +
+           `&order=${order}&limit=${maxTotal}`;
+         const selR = await sb(selPath);
+         if (!selR.ok) return bad(res, 500, `supabase_select_failed: ${await selR.text()}`);
+         playlistsToUpdate = await selR.json();
+       }
    
-       const plsR = await sb(listPath);
-       const pls = await plsR.json();
-       if (!plsR.ok) return bad(res, 500, `supabase_select_playlists_failed: ${JSON.stringify(pls)}`);
-       if (!Array.isArray(pls) || pls.length === 0) {
+       if (!Array.isArray(playlistsToUpdate) || playlistsToUpdate.length === 0) {
          return json(res, 200, { ok:true, attempted:0, updated:0, daily_upserts:0, failed:[], reason:"up_to_date" });
        }
    
-       // Token
+       // Spotify Access Token
        const access_token = await getAccessTokenFromConnection(connection_id);
    
-       // Spotify-Fetch mit Parallelität & 429/5xx-Handling
+       // Followers parallel holen (mit Rate-Limit-Retry)
        const results = [];
-       let i = 0, running = 0, gotGlobal429 = false, globalRetry = 5;
-   
+       let i = 0, running = 0;
        await new Promise((resolve) => {
          const kick = () => {
-           while (!gotGlobal429 && running < conc && i < pls.length) {
-             const row = pls[i++]; running++;
+           while (running < conc && i < playlistsToUpdate.length) {
+             const row = playlistsToUpdate[i++]; running++;
              (async () => {
+               const id = row.playlist_id;
+               let resFollowers = { ok:false, id, followers:null, status:0 };
                try {
-                 const url = `https://api.spotify.com/v1/playlists/${row.playlist_id}?fields=followers(total)`;
                  let attempt = 0;
                  while (true) {
-                   const r = await fetch(url, { headers: { Authorization: `Bearer ${access_token}` } });
+                   const r = await fetch(
+                     `https://api.spotify.com/v1/playlists/${encodeURIComponent(id)}?fields=followers(total)`,
+                     { headers: { Authorization: `Bearer ${access_token}` } }
+                   );
                    if (r.status === 429) {
-                     const ra = Number(r.headers.get("retry-after") || "5");
-                     const waitSec = Math.min(60, Math.max(1, ra) * Math.pow(2, attempt)) + Math.random()*0.6;
-                     if (attempt++ >= 6) {
-                       gotGlobal429 = true; globalRetry = Math.max(5, ra);
-                       break;
-                     }
+                     const ra = Number(r.headers.get("retry-after") || "1");
+                     const waitSec = Math.min(60, Math.max(1, ra) * Math.pow(2, attempt)) + (Math.random()*0.8);
+                     if (attempt++ >= 6) break;
                      await sleep(waitSec * 1000);
                      continue;
                    }
-                   if (r.status >= 500 && r.status < 600) {
-                     // kurze 5xx-Retries
-                     if (attempt++ < 3) { await sleep((1 + Math.random()*0.8) * 1000); continue; }
-                   }
                    const j = await r.json().catch(()=> ({}));
-                   if (r.ok) {
-                     const followers = j?.followers?.total ?? null;
-                     results.push({ ok:true, status:200, playlist_id: row.playlist_id, row_id: row.id, bubble_user_id: row.bubble_user_id, followers });
+                   if (!r.ok) {
+                     resFollowers = { ok:false, id, followers:null, status:r.status };
                    } else {
-                     results.push({ ok:false, status:r.status, playlist_id: row.playlist_id, row_id: row.id, bubble_user_id: row.bubble_user_id });
+                     resFollowers = { ok:true, id, followers: j?.followers?.total ?? null, status:200 };
                    }
                    break;
                  }
                } catch {
-                 results.push({ ok:false, status:500, playlist_id: row.playlist_id, row_id: row.id, bubble_user_id: row.bubble_user_id });
+                 resFollowers = { ok:false, id, followers:null, status:500 };
                } finally {
+                 results.push({ row, ...resFollowers });
                  running--; kick();
                }
              })();
            }
-           if (running === 0 && (i >= pls.length || gotGlobal429)) resolve();
+           if (running === 0 && i >= playlistsToUpdate.length) resolve();
          };
          kick();
        });
    
-       // Falls global 429 → Cooldown setzen und sanft beenden
-       if (gotGlobal429) {
-         const until = await setConnectionCooldown(connection_id, globalRetry + 5);
-         return json(res, 200, { ok:true, hit_429:true, retry_after_s: globalRetry, cooldown_until: until, attempted: results.length });
+       // Rows für PATCH / Upsert vorbereiten
+       const nowIso = new Date().toISOString();
+       const today  = new Date().toISOString().slice(0,10); // YYYY-MM-DD
+   
+       const patchRows = []; // -> playlists
+       const dailyRows = []; // -> playlist_followers_daily
+   
+       for (const r of results) {
+         if (!r.ok || typeof r.followers !== "number") continue;
+         patchRows.push({
+           playlist_id: r.row.playlist_id,      // wir upserten per on_conflict=playlist_id
+           followers: r.followers,
+           followers_checked_at: nowIso,
+           updated_at: nowIso,
+           bubble_user_id: r.row.bubble_user_id // harmless für playlists
+         });
+         dailyRows.push({
+           playlist_id: r.row.id,               // ACHTUNG: hier die UUID aus playlists.id
+           bubble_user_id: r.row.bubble_user_id,
+           day: today,
+           followers: r.followers
+           // KEIN refreshed_at mehr!
+         });
        }
    
-       // Erfolgreiche Ergebnisse → Batch-Upsert in playlists & daily
-       const okRes = results.filter(r => r.ok && Number.isFinite(r.followers));
-       const nowIso = new Date().toISOString();
-       const today = nowIso.slice(0,10); // YYYY-MM-DD
-   
-       // 1) playlists updaten (followers + followers_checked_at)
-       const playlistUpserts = okRes.map(r => ({
-         playlist_id: r.playlist_id,           // ON CONFLICT-Key
-         connection_id,                        // (hilft bei Merge)
-         bubble_user_id: r.bubble_user_id,
-         followers: r.followers,
-         followers_checked_at: nowIso,
-         updated_at: nowIso
-       }));
-   
-       for (let k = 0; k < playlistUpserts.length; k += perWrite) {
-         const batch = playlistUpserts.slice(k, k + perWrite);
+       // Upsert Playlists
+       let updated = 0;
+       for (let k=0; k<patchRows.length; k+=perWrite) {
+         const chunkRows = patchRows.slice(k, k+perWrite);
          const up = await sb(`/rest/v1/playlists?on_conflict=playlist_id`, {
            method: "POST",
            headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-           body: JSON.stringify(batch),
+           body: JSON.stringify(chunkRows)
          });
          if (!up.ok) return bad(res, 500, `supabase playlists upsert failed: ${await up.text()}`);
+         updated += chunkRows.length;
+         await sleep(40);
        }
    
-       // 2) daily idempotent: (playlist_id, bubble_user_id, day) → followers
-       const dailyRows = okRes.map(r => ({
-         playlist_id: r.row_id,                // Achtung: hier die UUID (FK zu playlists.id)
-         bubble_user_id: r.bubble_user_id,
-         day: today,
-         followers: r.followers,
-         refreshed_at: nowIso
-       }));
-   
-       for (let k = 0; k < dailyRows.length; k += perWrite) {
-         const batch = dailyRows.slice(k, k + perWrite);
-         const up = await sb(`/rest/v1/playlist_followers_daily?on_conflict=playlist_id,bubble_user_id,day`, {
+       // Upsert Daily: on_conflict = (playlist_id,day) – entspricht deinem Schema
+       let dailyUpserts = 0;
+       for (let k=0; k<dailyRows.length; k+=perWrite) {
+         const chunkRows = dailyRows.slice(k, k+perWrite);
+         const up = await sb(`/rest/v1/playlist_followers_daily?on_conflict=playlist_id,day`, {
            method: "POST",
            headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-           body: JSON.stringify(batch),
+           body: JSON.stringify(chunkRows)
          });
          if (!up.ok) return bad(res, 500, `supabase daily upsert failed: ${await up.text()}`);
+         dailyUpserts += chunkRows.length;
+         await sleep(40);
        }
    
-       const failed = results.filter(r => !r.ok).map(r => ({ playlist_id: r.playlist_id, status: r.status }));
+       const failed = results.filter(x => !x.ok).map(x => ({ playlist_id: x.row.playlist_id, status: x.status }));
        return json(res, 200, {
          ok: true,
-         attempted: pls.length,
-         updated: okRes.length,
-         daily_upserts: dailyRows.length,
+         attempted: results.length,
+         updated,
+         daily_upserts: dailyUpserts,
          failed
        });
      } catch (e) {
-       return bad(res, 500, `refresh_followers_exception: ${e?.message || e}`);
+       return bad(res, 500, String(e?.message || e));
      }
    },
 
