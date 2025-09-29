@@ -1915,11 +1915,13 @@ const routes = {
        const conn = (await connR.json())?.[0];
        if (!conn) return bad(res, 404, "connection_not_found");
    
-       // Kandidaten bestimmen
+       // Kandidaten bestimmen (immer aus playlists-Tabelle → garantiert existierende Zeilen)
        let playlistsToUpdate = [];
        if (onlyPid) {
          const oneR = await sb(
-           `/rest/v1/playlists?select=id,playlist_id,bubble_user_id,is_owner,is_public,followers,followers_checked_at&limit=1&id=eq.${encodeURIComponent(onlyPid)}`
+           `/rest/v1/playlists` +
+           `?select=id,playlist_id,bubble_user_id,is_owner,is_public,followers,followers_checked_at` +
+           `&limit=1&id=eq.${encodeURIComponent(onlyPid)}`
          );
          if (!oneR.ok) return bad(res, 500, `supabase_select_one_failed: ${await oneR.text()}`);
          const one = (await oneR.json())?.[0];
@@ -1973,11 +1975,8 @@ const routes = {
                      continue;
                    }
                    const j = await r.json().catch(()=> ({}));
-                   if (!r.ok) {
-                     resFollowers = { ok:false, id, followers:null, status:r.status };
-                   } else {
-                     resFollowers = { ok:true, id, followers: j?.followers?.total ?? null, status:200 };
-                   }
+                   if (!r.ok) resFollowers = { ok:false, id, followers:null, status:r.status };
+                   else       resFollowers = { ok:true, id, followers: j?.followers?.total ?? null, status:200 };
                    break;
                  }
                } catch {
@@ -1993,46 +1992,39 @@ const routes = {
          kick();
        });
    
-       // Rows für PATCH / Upsert vorbereiten
        const nowIso = new Date().toISOString();
        const today  = new Date().toISOString().slice(0,10); // YYYY-MM-DD
    
-       const patchRows = []; // -> playlists
-       const dailyRows = []; // -> playlist_followers_daily
-   
+       // (1) playlists: PATCH (kein Insert/Upsert!)
+       let updated = 0;
        for (const r of results) {
          if (!r.ok || typeof r.followers !== "number") continue;
-         patchRows.push({
-           playlist_id: r.row.playlist_id,      // wir upserten per on_conflict=playlist_id
-           followers: r.followers,
-           followers_checked_at: nowIso,
-           updated_at: nowIso,
-           bubble_user_id: r.row.bubble_user_id // harmless für playlists
+         const patch = await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(r.row.id)}`, {
+           method: "PATCH",
+           headers: { Prefer: "return=minimal" },
+           body: JSON.stringify({
+             followers: r.followers,
+             followers_checked_at: nowIso,
+             updated_at: nowIso
+           })
          });
-         dailyRows.push({
-           playlist_id: r.row.id,               // ACHTUNG: hier die UUID aus playlists.id
+         if (!patch.ok) {
+           return bad(res, 500, `supabase playlists patch failed: ${await patch.text()}`);
+         }
+         updated++;
+         await sleep(10);
+       }
+   
+       // (2) daily: Upsert auf (playlist_id, day)
+       const dailyRows = results
+         .filter(r => r.ok && typeof r.followers === "number")
+         .map(r => ({
+           playlist_id: r.row.id,               // UUID aus playlists.id
            bubble_user_id: r.row.bubble_user_id,
            day: today,
            followers: r.followers
-           // KEIN refreshed_at mehr!
-         });
-       }
+         }));
    
-       // Upsert Playlists
-       let updated = 0;
-       for (let k=0; k<patchRows.length; k+=perWrite) {
-         const chunkRows = patchRows.slice(k, k+perWrite);
-         const up = await sb(`/rest/v1/playlists?on_conflict=playlist_id`, {
-           method: "POST",
-           headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-           body: JSON.stringify(chunkRows)
-         });
-         if (!up.ok) return bad(res, 500, `supabase playlists upsert failed: ${await up.text()}`);
-         updated += chunkRows.length;
-         await sleep(40);
-       }
-   
-       // Upsert Daily: on_conflict = (playlist_id,day) – entspricht deinem Schema
        let dailyUpserts = 0;
        for (let k=0; k<dailyRows.length; k+=perWrite) {
          const chunkRows = dailyRows.slice(k, k+perWrite);
@@ -2043,7 +2035,7 @@ const routes = {
          });
          if (!up.ok) return bad(res, 500, `supabase daily upsert failed: ${await up.text()}`);
          dailyUpserts += chunkRows.length;
-         await sleep(40);
+         await sleep(20);
        }
    
        const failed = results.filter(x => !x.ok).map(x => ({ playlist_id: x.row.playlist_id, status: x.status }));
@@ -2058,6 +2050,7 @@ const routes = {
        return bad(res, 500, String(e?.message || e));
      }
    },
+
 
 
 
