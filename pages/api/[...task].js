@@ -634,12 +634,11 @@ const routes = {
    /* ---------- subscriptions/refresh (POST) ----------
    Body:
      {
-       "subscription_id": "I-…",           // oder "subscriptionId"
-       "bubble_user_id": "<Bubble UID>",   // optional, aber empfohlen
+       "subscription_id": "I-…",           // or "subscriptionId"
+       "bubble_user_id": "<Bubble UID>",   // optional but recommended
        "environment": "live" | "sandbox"   // default: "live"
      }
-   
-   Optionaler Admin-Override (falls Abo bereits einem anderen User gehört):
+   Admin override ownership (optional):
      Header: x-app-secret: <APP_WEBHOOK_SECRET>
    */
    "subscriptions/refresh": async (req, res) => {
@@ -651,7 +650,26 @@ const routes = {
        const environment = (String(body.environment || "live").toLowerCase() === "sandbox") ? "sandbox" : "live";
        if (!subscriptionId) return bad(res, 400, "missing_subscription_id");
    
-       // optional: User idempotent anlegen
+       // Helper: plan lookup by provider_plan_id
+       async function getPlanByProviderPlanId(provider_plan_id) {
+         const r = await sb(
+           `/rest/v1/subscription_plans` +
+           `?select=plan_code,display_name,term,provider_plan_id,price_cents,currency,seats_limit,features` +
+           `&provider=eq.paypal&provider_plan_id=eq.${encodeURIComponent(provider_plan_id)}&limit=1`
+         );
+         const arr = await r.json().catch(()=>[]);
+         return arr?.[0] || null;
+       }
+       function parseCustomId(custom_id) {
+         const m = String(custom_id||"").split("|").reduce((a,p)=>{
+           const [k,v] = p.split(":"); if(k&&v) a[k.trim()] = v.trim(); return a;
+         },{});
+         const term = (m.term === 'y' || m.term === 'yearly') ? 'y' : 'm';
+         const code = m.code || null;
+         return { code, term, plan_code: code ? (term === 'y' ? `${code}_y` : code) : null };
+       }
+   
+       // idempotent: app_user anlegen
        if (bubble_user_id) {
          await sb(`/rest/v1/app_users?on_conflict=bubble_user_id`, {
            method: "POST",
@@ -660,7 +678,7 @@ const routes = {
          }).catch(()=>{});
        }
    
-       // PayPal creds + base URL wählen
+       // PayPal creds
        const isLive = environment === "live";
        const base   = isLive ? "https://api.paypal.com" : "https://api.sandbox.paypal.com";
        const cid    = need(isLive ? "PAYPAL_CLIENT_ID_LIVE"     : "PAYPAL_CLIENT_ID_SANDBOX");
@@ -685,20 +703,26 @@ const routes = {
          headers: { "Authorization": `Bearer ${tok.access_token}` }
        });
        const sub = await subRes.json().catch(()=> ({}));
-       if (!subRes.ok) {
-         return bad(res, subRes.status, `paypal_get_failed: ${JSON.stringify(sub)}`);
-       }
+       if (!subRes.ok) return bad(res, subRes.status, `paypal_get_failed: ${JSON.stringify(sub)}`);
    
        // Normalisieren
-       const norm = {
-         id: sub?.id || subscriptionId,
-         status: sub?.status || "UNKNOWN",
-         plan_id: sub?.plan_id || null,
-         next_billing_time: sub?.billing_info?.next_billing_time || null,
-         custom_id: sub?.custom_id || null
-       };
+       const provider_plan_id = sub?.plan_id || null;
+       const status = (sub?.status || "UNKNOWN").toUpperCase();
+       const next_billing_time = sub?.billing_info?.next_billing_time || null;
+       const customParsed = parseCustomId(sub?.custom_id);
    
-       // Falls es in DB schon einen Eintrag für dieses Abo gibt, Ownership respektieren
+       // Plan auflösen (DB)
+       let plan = provider_plan_id ? await getPlanByProviderPlanId(provider_plan_id) : null;
+       if (!plan && customParsed.plan_code) {
+         const r2 = await sb(
+           `/rest/v1/subscription_plans?select=plan_code,display_name,term,provider_plan_id,price_cents,currency,seats_limit,features` +
+           `&plan_code=eq.${encodeURIComponent(customParsed.plan_code)}&limit=1`
+         );
+         const arr2 = await r2.json().catch(()=>[]);
+         plan = arr2?.[0] || null;
+       }
+   
+       // Ownership respektieren
        let existing = null;
        try {
          const q = `/rest/v1/subscriptions?select=bubble_user_id&limit=1`
@@ -708,44 +732,59 @@ const routes = {
          const exR = await sb(q);
          if (exR.ok) existing = (await exR.json())?.[0] || null;
        } catch {}
-   
        const hasSecret = checkAppSecret(req);
        if (existing?.bubble_user_id && bubble_user_id && existing.bubble_user_id !== bubble_user_id && !hasSecret) {
          return bad(res, 409, "subscription_belongs_to_other_user");
        }
    
-       // Upsert (provider-agnostisch + Legacy-Spalte füllen)
+       // Seats bestimmen (Plan -> seats_limit; sonst Heuristik aus custom_id)
+       const seats_limit =
+         plan?.seats_limit ??
+         (/first/i.test(sub?.custom_id||"") ? 10 :
+          /business/i.test(sub?.custom_id||"") ? 3 :
+          /economy/i.test(sub?.custom_id||"") ? 1 :
+          /luggage/i.test(sub?.custom_id||"") ? 0 : 1);
+   
+       // Upsert
        const up = await sb(`/rest/v1/subscriptions?on_conflict=provider,provider_subscription_id`, {
          method: "POST",
-         headers: {
-           Prefer: "resolution=merge-duplicates,return=representation",
-           "Content-Type": "application/json"
-         },
+         headers: { "Content-Type":"application/json", Prefer:"resolution=merge-duplicates,return=representation" },
          body: JSON.stringify([{
-           // bubble_user_id nur setzen, wenn neu oder gleich – sonst unverändert lassen
            bubble_user_id: bubble_user_id || existing?.bubble_user_id || null,
            provider: "paypal",
-           provider_subscription_id: norm.id,
-           paypal_subscription_id: norm.id, // Legacy-Kompatibilität
-           plan_id: norm.plan_id,
-           status: norm.status,
+           provider_subscription_id: subscriptionId,
+           paypal_subscription_id: subscriptionId,                // legacy
+           provider_plan_id,
+           plan_code: plan?.plan_code ?? customParsed.plan_code ?? null,
+           plan_term: plan?.term ?? customParsed.term ?? null,
+           seats_limit,
            environment,
-           current_period_end: norm.next_billing_time ? new Date(norm.next_billing_time).toISOString() : null,
+           status,
+           current_period_end: next_billing_time ? new Date(next_billing_time).toISOString() : null,
+           cancel_at_period_end: status === "CANCELLED" ? true : null,
            updated_at: new Date().toISOString()
          }])
        });
        const data = await up.json().catch(()=>[]);
        if (!up.ok) return bad(res, 500, `supabase_upsert_failed: ${JSON.stringify(data)}`);
    
+       const row = Array.isArray(data) ? data[0] : data;
+   
        return json(res, 200, {
          ok: true,
          refreshed: true,
-         subscription: Array.isArray(data) ? data[0] : data
+         subscription: row,
+         plan: plan ? {
+           code: plan.plan_code, name: plan.display_name, term: plan.term,
+           seats_limit: plan.seats_limit, features: plan.features,
+           price_cents: plan.price_cents, currency: plan.currency
+         } : null
        });
      } catch (e) {
        return bad(res, 500, `subscriptions_refresh_exception: ${e?.message || e}`);
      }
    },
+
 
    
   /* ---------- connections/list (GET) ---------- */
@@ -1655,151 +1694,176 @@ const routes = {
   },
 
   /* ---------- oauth/spotify/callback (GET) ---------- */
-  "oauth/spotify/callback": async (req, res) => {
-    try {
-      const assertEnv = (n) => need(n);
-      assertEnv("SPOTIFY_CLIENT_ID");
-      assertEnv("SPOTIFY_CLIENT_SECRET");
-      assertEnv("SPOTIFY_REDIRECT_URI");
-      assertEnv("SUPABASE_URL");
-      assertEnv("SUPABASE_SERVICE_ROLE_KEY");
-      assertEnv("ENC_SECRET");
-
-      const code = req.query.code;
-      const state = req.query.state;
-      if (!code || !state) return res.status(400).send("Missing code/state");
-
-      let parsed;
-      try { parsed = JSON.parse(Buffer.from(state, "base64url").toString("utf8")); }
-      catch { return res.status(400).send("Invalid state"); }
-      const bubble_user_id = parsed.bubble_user_id;
-      const label = parsed.label || "";
-      const return_to = parsed.return_to || "/";
-      if (!bubble_user_id) return res.status(400).send("Missing bubble_user_id in state");
-
-      // exchange
-      const tokenRes = await fetch("https://accounts.spotify.com/api/token", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          Authorization: "Basic " + Buffer.from(
-            `${process.env.SPOTIFY_CLIENT_ID}:${process.env.SPOTIFY_CLIENT_SECRET}`
-          ).toString("base64"),
-        },
-        body: new URLSearchParams({
-          grant_type: "authorization_code",
-          code,
-          redirect_uri: process.env.SPOTIFY_REDIRECT_URI,
-        }),
-      }).then(r => r.json());
-
-      if (!tokenRes || !tokenRes.access_token) {
-        console.error("Token exchange failed:", tokenRes);
-        return res.status(400).send("Failed to get access token from Spotify");
-      }
-
-      const meResp = await fetch("https://api.spotify.com/v1/me", {
-        headers: { Authorization: `Bearer ${tokenRes.access_token}` },
-      });
-      if (!meResp.ok) {
-        const t = await meResp.text();
-        console.error("Spotify /me failed:", meResp.status, t);
-        return res.status(400).send(`Spotify /me failed: ${meResp.status}\n\n${t}`);
-      }
-      const me = await meResp.json();
-      const spotify_user_id = me.id;
-      const display_name = me.display_name || label || "";
-      const avatar_url = (me.images && me.images[0]?.url) || null;
-
-      // ensure app_user exists (ignore dup)
-      await fetch(`${process.env.SUPABASE_URL}/rest/v1/app_users?on_conflict=bubble_user_id`, {
-        method: "POST",
-        headers: {
-          apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-          Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-          "Content-Type": "application/json",
-          Prefer: "resolution=ignore-duplicates,return=minimal"
-        },
-        body: JSON.stringify({ bubble_user_id }),
-      });
-
-      // existing connection?
-      const existing = await fetch(
-        `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?` +
-        `select=id,refresh_token_enc,cron_bucket&` +   // <-- NEU
-        `bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&` +
-        `spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}&limit=1`,
-        {
-          headers: {
-            apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-            Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-          }
-        }
-      ).then(r => r.json()).then(a => (Array.isArray(a) && a[0]) ? a[0] : null);
-
-      let refresh_token_enc = null;
-      if (tokenRes.refresh_token) refresh_token_enc = encToken(tokenRes.refresh_token);
-      else if (existing?.refresh_token_enc) refresh_token_enc = existing.refresh_token_enc;
-      else return res.status(400).send("No refresh_token received. Please retry (consent required).");
-
-      const access_token_enc = encToken(tokenRes.access_token);
-      const access_expires_at = new Date(Date.now() + (tokenRes.expires_in || 3600) * 1000).toISOString();
-
-      // stabilen Bucket bestimmen: vorhandenen behalten, sonst neu würfeln (0..59)
-      const cron_bucket =
-        Number.isInteger(existing?.cron_bucket) ? existing.cron_bucket : Math.floor(Math.random() * 60);
-      
-      const payload = {
-        bubble_user_id,
-        spotify_user_id,
-        display_name,
-        avatar_url,
-        scope: "playlist-read-private playlist-modify-private playlist-modify-public",
-        refresh_token_enc,
-        access_token_enc,
-        access_expires_at,
-        cron_bucket, // <-- NEU
-      };
-
-
-      if (existing) {
-        await fetch(
-          `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?` +
-          `bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&` +
-          `spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}`,
-          {
-            method: "PATCH",
-            headers: {
-              apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-              Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-              "Content-Type": "application/json",
-              Prefer: "return=representation"
-            },
-            body: JSON.stringify(payload),
-          }
-        );
-      } else {
-        await fetch(`${process.env.SUPABASE_URL}/rest/v1/spotify_connections`, {
-          method: "POST",
-          headers: {
-            apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-            Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-            "Content-Type": "application/json",
-            Prefer: "return=representation"
-          },
-          body: JSON.stringify(payload),
-        });
-      }
-
-      const qs = `?spotify_linked=1&spotify_user=${encodeURIComponent(spotify_user_id)}`;
-      const back = (return_to || "/") + qs;
-      return res.redirect(back);
-    } catch (e) {
-      console.error("callback error:", e);
-      const msg = e && e.stack ? e.stack : String(e);
-      return res.status(500).send("callback error – " + msg);
-    }
-  },
+   "oauth/spotify/callback": async (req, res) => {
+     try {
+       const assertEnv = (n) => need(n);
+       assertEnv("SPOTIFY_CLIENT_ID");
+       assertEnv("SPOTIFY_CLIENT_SECRET");
+       assertEnv("SPOTIFY_REDIRECT_URI");
+       assertEnv("SUPABASE_URL");
+       assertEnv("SUPABASE_SERVICE_ROLE_KEY");
+       assertEnv("ENC_SECRET");
+   
+       const code = req.query.code;
+       const state = req.query.state;
+       if (!code || !state) return res.status(400).send("Missing code/state");
+   
+       let parsed;
+       try { parsed = JSON.parse(Buffer.from(state, "base64url").toString("utf8")); }
+       catch { return res.status(400).send("Invalid state"); }
+       const bubble_user_id = parsed.bubble_user_id;
+       const label = parsed.label || "";
+       const return_to = parsed.return_to || "/";
+       if (!bubble_user_id) return res.status(400).send("Missing bubble_user_id in state");
+   
+       // exchange
+       const tokenRes = await fetch("https://accounts.spotify.com/api/token", {
+         method: "POST",
+         headers: {
+           "Content-Type": "application/x-www-form-urlencoded",
+           Authorization: "Basic " + Buffer.from(
+             `${process.env.SPOTIFY_CLIENT_ID}:${process.env.SPOTIFY_CLIENT_SECRET}`
+           ).toString("base64"),
+         },
+         body: new URLSearchParams({
+           grant_type: "authorization_code",
+           code,
+           redirect_uri: process.env.SPOTIFY_REDIRECT_URI,
+         }),
+       }).then(r => r.json());
+   
+       if (!tokenRes || !tokenRes.access_token) {
+         console.error("Token exchange failed:", tokenRes);
+         return res.status(400).send("Failed to get access token from Spotify");
+       }
+   
+       const meResp = await fetch("https://api.spotify.com/v1/me", {
+         headers: { Authorization: `Bearer ${tokenRes.access_token}` },
+       });
+       if (!meResp.ok) {
+         const t = await meResp.text();
+         console.error("Spotify /me failed:", meResp.status, t);
+         return res.status(400).send(`Spotify /me failed: ${meResp.status}\n\n${t}`);
+       }
+       const me = await meResp.json();
+       const spotify_user_id = me.id;
+       const display_name = me.display_name || label || "";
+       const avatar_url = (me.images && me.images[0]?.url) || null;
+   
+       // ensure app_user exists (ignore dup)
+       await fetch(`${process.env.SUPABASE_URL}/rest/v1/app_users?on_conflict=bubble_user_id`, {
+         method: "POST",
+         headers: {
+           apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+           Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+           "Content-Type": "application/json",
+           Prefer: "resolution=ignore-duplicates,return=minimal"
+         },
+         body: JSON.stringify({ bubble_user_id }),
+       });
+   
+       // OPTIONAL ENFORCEMENT: Subscription & Seats prüfen
+       // (Comment out if you want to allow connecting before purchase)
+       try {
+         const sR = await sb(
+           `/rest/v1/subscriptions` +
+           `?select=status,seats_limit,plan_code,provider_subscription_id` +
+           `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+           `&environment=eq.live` +
+           `&order=updated_at.desc&limit=1`
+         );
+         const s = sR.ok ? (await sR.json())?.[0] : null;
+         const isActive = s?.status === "ACTIVE";
+         const allowedSeats = Number.isFinite(s?.seats_limit) ? s.seats_limit : 1;
+         if (!isActive) {
+           return res.status(402).send("subscription_required");
+         }
+         // count existing connections
+         const cR = await sb(`/rest/v1/spotify_connections?select=id&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}`);
+         const seatUsed = (cR.ok ? (await cR.json()) : []).length;
+         if (seatUsed >= allowedSeats) {
+           return res.status(403).send("seat_limit_reached");
+         }
+       } catch (e) {
+         // Wenn du grace-mode willst, ignoriere Fehler hier:
+         // console.warn("seat-check skipped:", e?.message || e);
+       }
+   
+       // existing connection?
+       const existing = await fetch(
+         `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?` +
+         `select=id,refresh_token_enc,cron_bucket&` +
+         `bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&` +
+         `spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}&limit=1`,
+         {
+           headers: {
+             apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+             Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+           }
+         }
+       ).then(r => r.json()).then(a => (Array.isArray(a) && a[0]) ? a[0] : null);
+   
+       let refresh_token_enc = null;
+       if (tokenRes.refresh_token) refresh_token_enc = encToken(tokenRes.refresh_token);
+       else if (existing?.refresh_token_enc) refresh_token_enc = existing.refresh_token_enc;
+       else return res.status(400).send("No refresh_token received. Please retry (consent required).");
+   
+       const access_token_enc = encToken(tokenRes.access_token);
+       const access_expires_at = new Date(Date.now() + (tokenRes.expires_in || 3600) * 1000).toISOString();
+   
+       const cron_bucket =
+         Number.isInteger(existing?.cron_bucket) ? existing.cron_bucket : Math.floor(Math.random() * 60);
+   
+       const payload = {
+         bubble_user_id,
+         spotify_user_id,
+         display_name,
+         avatar_url,
+         scope: "playlist-read-private playlist-modify-private playlist-modify-public",
+         refresh_token_enc,
+         access_token_enc,
+         access_expires_at,
+         cron_bucket,
+       };
+   
+       if (existing) {
+         await fetch(
+           `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?` +
+           `bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&` +
+           `spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}`,
+           {
+             method: "PATCH",
+             headers: {
+               apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+               Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+               "Content-Type": "application/json",
+               Prefer: "return=representation"
+             },
+             body: JSON.stringify(payload),
+           }
+         );
+       } else {
+         await fetch(`${process.env.SUPABASE_URL}/rest/v1/spotify_connections`, {
+           method: "POST",
+           headers: {
+             apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+             Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+             "Content-Type": "application/json",
+             Prefer: "return=representation"
+           },
+           body: JSON.stringify(payload),
+         });
+       }
+   
+       const qs = `?spotify_linked=1&spotify_user=${encodeURIComponent(spotify_user_id)}`;
+       const back = (return_to || "/") + qs;
+       return res.redirect(back);
+     } catch (e) {
+       console.error("callback error:", e);
+       const msg = e && e.stack ? e.stack : String(e);
+       return res.status(500).send("callback error – " + msg);
+     }
+   },
 
    /* ---------- playlists/settings/save (POST, Bubble) ---------- */
    "playlists/settings/save": async (req, res) => {
