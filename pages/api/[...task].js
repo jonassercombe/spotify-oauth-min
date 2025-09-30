@@ -1865,6 +1865,7 @@ const routes = {
      }
    },
 
+
    /* ---------- playlists/settings/save (POST, Bubble) ---------- */
    "playlists/settings/save": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
