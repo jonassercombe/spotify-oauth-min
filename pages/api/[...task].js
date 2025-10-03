@@ -606,6 +606,7 @@ const routes = {
    // GET subscriptions/status
    "subscriptions/status": async (req, res) => {
      if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+   
      const bubble_user_id = String(req.query.bubble_user_id || "").trim();
      const environment = String(req.query.environment || "").toLowerCase(); // optional
      if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
@@ -614,32 +615,61 @@ const routes = {
      const r = await sb(`/rest/v1/subscriptions?select=provider,provider_subscription_id,paypal_subscription_id,environment,status,plan_id,current_period_end,updated_at&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}${envFilter}&order=updated_at.desc&limit=1`);
      const arr = r.ok ? await r.json() : [];
      if (!r.ok) return bad(res, 500, `supabase_select_failed: ${await r.text()}`);
-     const row = arr?.[0] || null;
    
-     const normalizeActive = (s) => s === "ACTIVE";
-     return json(res, 200, row ? {
+     const row = arr?.[0] || null;
+     if (!row) return json(res, 200, { ok: true, status: "NONE", is_active: false });
+   
+     // Fetch plan meta (join by provider + provider_plan_id=plan_id)
+     let plan = null;
+     if (row.plan_id) {
+       const pr = await sb(`/rest/v1/subscription_plans?select=plan_code,display_name,term,provider_plan_id,price_cents,seats_limit,features&provider=eq.${encodeURIComponent(row.provider||'paypal')}&provider_plan_id=eq.${encodeURIComponent(row.plan_id)}&limit=1`);
+       if (pr.ok) {
+         const a = await pr.json();
+         plan = a?.[0] || null;
+       }
+     }
+   
+     const normalizeActive = (s, endISO) => {
+       // ACTIVE → true
+       // CANCELLED but still before current_period_end → grace (true)
+       if (s === "ACTIVE") return true;
+       if (s === "CANCELLED" && endISO) {
+         try { return new Date(endISO).getTime() > Date.now(); } catch {}
+       }
+       return false;
+     };
+   
+     const is_active = normalizeActive(row.status, row.current_period_end);
+   
+     return json(res, 200, {
        ok: true,
        provider: row.provider || (row.paypal_subscription_id ? "paypal" : null),
        environment: row.environment || null,
        status: row.status || "UNKNOWN",
-       is_active: normalizeActive(row.status),
-       plan_id: row.plan_id || null,
+       is_active,
+       plan_id: row.plan_id || null,                 // PayPal plan id
+       plan_code: plan?.plan_code || null,           // our internal plan key
+       plan_name: plan?.display_name || null,
+       term: plan?.term || null,                     // 'm' | 'y'
+       seats_limit: plan?.seats_limit ?? null,
+       features: plan?.features ?? null,
+       price_cents: plan?.price_cents ?? null,
        current_period_end: row.current_period_end || null,
        updated_at: row.updated_at || null,
        subscription_id: row.provider_subscription_id || row.paypal_subscription_id || null
-     } : { ok: true, status: "NONE", is_active: false });
+     });
    },
 
 
    /* ---------- subscriptions/refresh (POST) ----------
    Body:
-     {
-       "subscription_id": "I-…",           // or "subscriptionId"
-       "bubble_user_id": "<Bubble UID>",   // optional but recommended
-       "environment": "live" | "sandbox"   // default: "live"
-     }
-   Admin override ownership (optional):
-     Header: x-app-secret: <APP_WEBHOOK_SECRET>
+   {
+     "subscription_id": "I-…",           // or "subscriptionId"
+     "bubble_user_id": "<Bubble UID>",   // optional, recommended
+     "environment": "live" | "sandbox"   // default: "live"
+   }
+   Header (optional admin override if sub belongs to another user):
+     x-app-secret: <APP_WEBHOOK_SECRET>
    */
    "subscriptions/refresh": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
@@ -650,26 +680,7 @@ const routes = {
        const environment = (String(body.environment || "live").toLowerCase() === "sandbox") ? "sandbox" : "live";
        if (!subscriptionId) return bad(res, 400, "missing_subscription_id");
    
-       // Helper: plan lookup by provider_plan_id
-       async function getPlanByProviderPlanId(provider_plan_id) {
-         const r = await sb(
-           `/rest/v1/subscription_plans` +
-           `?select=plan_code,display_name,term,provider_plan_id,price_cents,currency,seats_limit,features` +
-           `&provider=eq.paypal&provider_plan_id=eq.${encodeURIComponent(provider_plan_id)}&limit=1`
-         );
-         const arr = await r.json().catch(()=>[]);
-         return arr?.[0] || null;
-       }
-       function parseCustomId(custom_id) {
-         const m = String(custom_id||"").split("|").reduce((a,p)=>{
-           const [k,v] = p.split(":"); if(k&&v) a[k.trim()] = v.trim(); return a;
-         },{});
-         const term = (m.term === 'y' || m.term === 'yearly') ? 'y' : 'm';
-         const code = m.code || null;
-         return { code, term, plan_code: code ? (term === 'y' ? `${code}_y` : code) : null };
-       }
-   
-       // idempotent: app_user anlegen
+       // idempotent ensure user
        if (bubble_user_id) {
          await sb(`/rest/v1/app_users?on_conflict=bubble_user_id`, {
            method: "POST",
@@ -678,13 +689,12 @@ const routes = {
          }).catch(()=>{});
        }
    
-       // PayPal creds
        const isLive = environment === "live";
        const base   = isLive ? "https://api.paypal.com" : "https://api.sandbox.paypal.com";
        const cid    = need(isLive ? "PAYPAL_CLIENT_ID_LIVE"     : "PAYPAL_CLIENT_ID_SANDBOX");
        const secret = need(isLive ? "PAYPAL_CLIENT_SECRET_LIVE" : "PAYPAL_CLIENT_SECRET_SANDBOX");
    
-       // OAuth2 client_credentials
+       // OAuth2
        const tokRes = await fetch(`${base}/v1/oauth2/token`, {
          method: "POST",
          headers: {
@@ -698,31 +708,24 @@ const routes = {
          return bad(res, 502, `paypal_auth_failed: ${tokRes.status}`);
        }
    
-       // Subscription holen
+       // PayPal subscription
        const subRes = await fetch(`${base}/v1/billing/subscriptions/${encodeURIComponent(subscriptionId)}`, {
          headers: { "Authorization": `Bearer ${tok.access_token}` }
        });
        const sub = await subRes.json().catch(()=> ({}));
-       if (!subRes.ok) return bad(res, subRes.status, `paypal_get_failed: ${JSON.stringify(sub)}`);
-   
-       // Normalisieren
-       const provider_plan_id = sub?.plan_id || null;
-       const status = (sub?.status || "UNKNOWN").toUpperCase();
-       const next_billing_time = sub?.billing_info?.next_billing_time || null;
-       const customParsed = parseCustomId(sub?.custom_id);
-   
-       // Plan auflösen (DB)
-       let plan = provider_plan_id ? await getPlanByProviderPlanId(provider_plan_id) : null;
-       if (!plan && customParsed.plan_code) {
-         const r2 = await sb(
-           `/rest/v1/subscription_plans?select=plan_code,display_name,term,provider_plan_id,price_cents,currency,seats_limit,features` +
-           `&plan_code=eq.${encodeURIComponent(customParsed.plan_code)}&limit=1`
-         );
-         const arr2 = await r2.json().catch(()=>[]);
-         plan = arr2?.[0] || null;
+       if (!subRes.ok) {
+         return bad(res, subRes.status, `paypal_get_failed: ${JSON.stringify(sub)}`);
        }
    
-       // Ownership respektieren
+       const norm = {
+         id: sub?.id || subscriptionId,
+         status: sub?.status || "UNKNOWN",
+         plan_id: sub?.plan_id || null,
+         next_billing_time: sub?.billing_info?.next_billing_time || null,
+         custom_id: sub?.custom_id || null
+       };
+   
+       // existing owner?
        let existing = null;
        try {
          const q = `/rest/v1/subscriptions?select=bubble_user_id&limit=1`
@@ -732,58 +735,40 @@ const routes = {
          const exR = await sb(q);
          if (exR.ok) existing = (await exR.json())?.[0] || null;
        } catch {}
+   
        const hasSecret = checkAppSecret(req);
        if (existing?.bubble_user_id && bubble_user_id && existing.bubble_user_id !== bubble_user_id && !hasSecret) {
          return bad(res, 409, "subscription_belongs_to_other_user");
        }
    
-       // Seats bestimmen (Plan -> seats_limit; sonst Heuristik aus custom_id)
-       const seats_limit =
-         plan?.seats_limit ??
-         (/first/i.test(sub?.custom_id||"") ? 10 :
-          /business/i.test(sub?.custom_id||"") ? 3 :
-          /economy/i.test(sub?.custom_id||"") ? 1 :
-          /luggage/i.test(sub?.custom_id||"") ? 0 : 1);
-   
-       // Upsert
+       // Upsert (respect existing owner; fill legacy column)
        const up = await sb(`/rest/v1/subscriptions?on_conflict=provider,provider_subscription_id`, {
          method: "POST",
-         headers: { "Content-Type":"application/json", Prefer:"resolution=merge-duplicates,return=representation" },
+         headers: {
+           Prefer: "resolution=merge-duplicates,return=representation",
+           "Content-Type": "application/json"
+         },
          body: JSON.stringify([{
            bubble_user_id: bubble_user_id || existing?.bubble_user_id || null,
            provider: "paypal",
-           provider_subscription_id: subscriptionId,
-           paypal_subscription_id: subscriptionId,                // legacy
-           provider_plan_id,
-           plan_code: plan?.plan_code ?? customParsed.plan_code ?? null,
-           plan_term: plan?.term ?? customParsed.term ?? null,
-           seats_limit,
+           provider_subscription_id: norm.id,
+           paypal_subscription_id: norm.id, // legacy
+           plan_id: norm.plan_id,           // <-- PayPal plan id (we join to subscription_plans on status read)
+           status: norm.status,
            environment,
-           status,
-           current_period_end: next_billing_time ? new Date(next_billing_time).toISOString() : null,
-           cancel_at_period_end: status === "CANCELLED" ? true : null,
+           current_period_end: norm.next_billing_time ? new Date(norm.next_billing_time).toISOString() : null,
            updated_at: new Date().toISOString()
          }])
        });
        const data = await up.json().catch(()=>[]);
        if (!up.ok) return bad(res, 500, `supabase_upsert_failed: ${JSON.stringify(data)}`);
    
-       const row = Array.isArray(data) ? data[0] : data;
-   
-       return json(res, 200, {
-         ok: true,
-         refreshed: true,
-         subscription: row,
-         plan: plan ? {
-           code: plan.plan_code, name: plan.display_name, term: plan.term,
-           seats_limit: plan.seats_limit, features: plan.features,
-           price_cents: plan.price_cents, currency: plan.currency
-         } : null
-       });
+       return json(res, 200, { ok: true, refreshed: true, subscription: Array.isArray(data) ? data[0] : data });
      } catch (e) {
        return bad(res, 500, `subscriptions_refresh_exception: ${e?.message || e}`);
      }
    },
+
 
 
    
