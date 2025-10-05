@@ -219,6 +219,22 @@ async function setConnectionCooldown(connection_id, seconds) {
 /* ==============================
    PayPal helpers
 ============================== */
+
+// Maps PayPal plan_id -> your internal plan info
+export const PLAN_MAP = {
+  // monthly
+  "P-37R54649L5313890NNCUH6UQ": { plan_code: "economy",  term: "m", seats: 1,  features: { playlist_tools:true, feedback:true } },
+  "P-8W102166E7155104WNDNNXLA": { plan_code: "business", term: "m", seats: 3,  features: { playlist_tools:true, feedback:true } },
+  "P-12L562319L893910WNDNNYUQ": { plan_code: "first",    term: "m", seats: 10, features: { playlist_tools:true, feedback:true } },
+  "P-3VM522122Y492971MNDOASFY": { plan_code: "luggage",  term: "m", seats: 0,  features: { playlist_tools:false, feedback:true } },
+
+  // yearly
+  "P-64J2759572685030ANDOAVVI": { plan_code: "economy_y",  term: "y", seats: 1,  features: { playlist_tools:true, feedback:true } },
+  "P-0AY14242ML673252HNDOAVEQ": { plan_code: "business_y", term: "y", seats: 3,  features: { playlist_tools:true, feedback:true } },
+  "P-76U26120YA480793KNDOAULQ": { plan_code: "first_y",    term: "y", seats: 10, features: { playlist_tools:true, feedback:true } },
+  "P-0AF75583E6596344TNDOAWDQ": { plan_code: "luggage_y",  term: "y", seats: 0,  features: { playlist_tools:false, feedback:true } },
+};
+
 function paypalBase(env) {
   return env === "live" ? "https://api.paypal.com" : "https://api.sandbox.paypal.com";
 }
@@ -606,59 +622,37 @@ const routes = {
    // GET subscriptions/status
    "subscriptions/status": async (req, res) => {
      if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
-   
      const bubble_user_id = String(req.query.bubble_user_id || "").trim();
-     const environment = String(req.query.environment || "").toLowerCase(); // optional
      if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
    
-     const envFilter = environment ? `&environment=eq.${encodeURIComponent(environment)}` : "";
-     const r = await sb(`/rest/v1/subscriptions?select=provider,provider_subscription_id,paypal_subscription_id,environment,status,plan_id,current_period_end,updated_at&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}${envFilter}&order=updated_at.desc&limit=1`);
-     const arr = r.ok ? await r.json() : [];
+     const r = await sb(
+       `/rest/v1/app_users` +
+       `?select=provider,provider_subscription_id,environment,plan_code,term,sub_status,is_active,seats_limit,features,current_period_end,last_synced_at` +
+       `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&limit=1`
+     );
      if (!r.ok) return bad(res, 500, `supabase_select_failed: ${await r.text()}`);
+     const row = (await r.json())?.[0] || null;
    
-     const row = arr?.[0] || null;
-     if (!row) return json(res, 200, { ok: true, status: "NONE", is_active: false });
-   
-     // Fetch plan meta (join by provider + provider_plan_id=plan_id)
-     let plan = null;
-     if (row.plan_id) {
-       const pr = await sb(`/rest/v1/subscription_plans?select=plan_code,display_name,term,provider_plan_id,price_cents,seats_limit,features&provider=eq.${encodeURIComponent(row.provider||'paypal')}&provider_plan_id=eq.${encodeURIComponent(row.plan_id)}&limit=1`);
-       if (pr.ok) {
-         const a = await pr.json();
-         plan = a?.[0] || null;
-       }
+     if (!row || !row.provider_subscription_id) {
+       return json(res, 200, { ok:true, status:"NONE", is_active:false });
      }
-   
-     const normalizeActive = (s, endISO) => {
-       // ACTIVE → true
-       // CANCELLED but still before current_period_end → grace (true)
-       if (s === "ACTIVE") return true;
-       if (s === "CANCELLED" && endISO) {
-         try { return new Date(endISO).getTime() > Date.now(); } catch {}
-       }
-       return false;
-     };
-   
-     const is_active = normalizeActive(row.status, row.current_period_end);
    
      return json(res, 200, {
        ok: true,
-       provider: row.provider || (row.paypal_subscription_id ? "paypal" : null),
-       environment: row.environment || null,
-       status: row.status || "UNKNOWN",
-       is_active,
-       plan_id: row.plan_id || null,                 // PayPal plan id
-       plan_code: plan?.plan_code || null,           // our internal plan key
-       plan_name: plan?.display_name || null,
-       term: plan?.term || null,                     // 'm' | 'y'
-       seats_limit: plan?.seats_limit ?? null,
-       features: plan?.features ?? null,
-       price_cents: plan?.price_cents ?? null,
+       provider: row.provider || "paypal",
+       environment: row.environment || "live",
+       status: row.sub_status || "UNKNOWN",
+       is_active: !!row.is_active,
+       plan_code: row.plan_code || null,
+       term: row.term || null,                          // 'm' | 'y'
+       seats_limit: typeof row.seats_limit === "number" ? row.seats_limit : 0,
+       features: row.features || {},
        current_period_end: row.current_period_end || null,
-       updated_at: row.updated_at || null,
-       subscription_id: row.provider_subscription_id || row.paypal_subscription_id || null
+       subscription_id: row.provider_subscription_id || null,
+       last_synced_at: row.last_synced_at || null
      });
    },
+
 
 
    /* ---------- subscriptions/refresh (POST) ----------
@@ -680,21 +674,21 @@ const routes = {
        const environment = (String(body.environment || "live").toLowerCase() === "sandbox") ? "sandbox" : "live";
        if (!subscriptionId) return bad(res, 400, "missing_subscription_id");
    
-       // idempotent ensure user
+       // Ensure user row exists (idempotent)
        if (bubble_user_id) {
          await sb(`/rest/v1/app_users?on_conflict=bubble_user_id`, {
            method: "POST",
-           headers: { Prefer: "resolution=ignore-duplicates,return=minimal", "Content-Type":"application/json" },
+           headers: { Prefer: "resolution=ignore-duplicates,return=minimal", "Content-Type": "application/json" },
            body: JSON.stringify([{ bubble_user_id }])
          }).catch(()=>{});
        }
    
+       // PayPal auth
        const isLive = environment === "live";
        const base   = isLive ? "https://api.paypal.com" : "https://api.sandbox.paypal.com";
        const cid    = need(isLive ? "PAYPAL_CLIENT_ID_LIVE"     : "PAYPAL_CLIENT_ID_SANDBOX");
        const secret = need(isLive ? "PAYPAL_CLIENT_SECRET_LIVE" : "PAYPAL_CLIENT_SECRET_SANDBOX");
    
-       // OAuth2
        const tokRes = await fetch(`${base}/v1/oauth2/token`, {
          method: "POST",
          headers: {
@@ -708,7 +702,7 @@ const routes = {
          return bad(res, 502, `paypal_auth_failed: ${tokRes.status}`);
        }
    
-       // PayPal subscription
+       // Pull subscription
        const subRes = await fetch(`${base}/v1/billing/subscriptions/${encodeURIComponent(subscriptionId)}`, {
          headers: { "Authorization": `Bearer ${tok.access_token}` }
        });
@@ -717,57 +711,57 @@ const routes = {
          return bad(res, subRes.status, `paypal_get_failed: ${JSON.stringify(sub)}`);
        }
    
-       const norm = {
-         id: sub?.id || subscriptionId,
-         status: sub?.status || "UNKNOWN",
-         plan_id: sub?.plan_id || null,
-         next_billing_time: sub?.billing_info?.next_billing_time || null,
-         custom_id: sub?.custom_id || null
-       };
+       const paypal_status = String(sub?.status || "UNKNOWN").toUpperCase();
+       const plan_id       = sub?.plan_id || null;
+       const next_time     = sub?.billing_info?.next_billing_time || null;
+       const meta          = plan_id ? PLAN_MAP[plan_id] : null;
    
-       // existing owner?
-       let existing = null;
-       try {
-         const q = `/rest/v1/subscriptions?select=bubble_user_id&limit=1`
-                 + `&provider=eq.paypal`
-                 + `&provider_subscription_id=eq.${encodeURIComponent(subscriptionId)}`
-                 + `&environment=eq.${encodeURIComponent(environment)}`;
-         const exR = await sb(q);
-         if (exR.ok) existing = (await exR.json())?.[0] || null;
-       } catch {}
+       // active if ACTIVE, or CANCELLED but still within paid period
+       const active = (() => {
+         if (paypal_status === "ACTIVE") return true;
+         if (paypal_status === "CANCELLED" && next_time) {
+           try { return new Date(next_time).getTime() > Date.now(); } catch {}
+         }
+         return false;
+       })();
    
-       const hasSecret = checkAppSecret(req);
-       if (existing?.bubble_user_id && bubble_user_id && existing.bubble_user_id !== bubble_user_id && !hasSecret) {
-         return bad(res, 409, "subscription_belongs_to_other_user");
+       // Update user row (single source of truth)
+       if (bubble_user_id) {
+         const patch = await sb(`/rest/v1/app_users?bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}`, {
+           method: "PATCH",
+           headers: { "Content-Type":"application/json", Prefer:"return=representation" },
+           body: JSON.stringify({
+             provider: "paypal",
+             provider_subscription_id: sub?.id || subscriptionId,
+             environment,
+             plan_code: meta?.plan_code || null,
+             term: meta?.term || null,
+             sub_status: paypal_status,
+             is_active: active,
+             seats_limit: meta?.seats ?? 0,
+             features: meta?.features ?? {},
+             current_period_end: next_time ? new Date(next_time).toISOString() : null,
+             last_synced_at: new Date().toISOString()
+           })
+         });
+         if (!patch.ok) {
+           const err = await patch.text().catch(()=>"?");
+           return bad(res, 500, `supabase_update_failed: ${err}`);
+         }
+         const data = await patch.json().catch(()=>[]);
+         return json(res, 200, { ok:true, refreshed:true, user: Array.isArray(data) ? data[0] : data });
        }
    
-       // Upsert (respect existing owner; fill legacy column)
-       const up = await sb(`/rest/v1/subscriptions?on_conflict=provider,provider_subscription_id`, {
-         method: "POST",
-         headers: {
-           Prefer: "resolution=merge-duplicates,return=representation",
-           "Content-Type": "application/json"
-         },
-         body: JSON.stringify([{
-           bubble_user_id: bubble_user_id || existing?.bubble_user_id || null,
-           provider: "paypal",
-           provider_subscription_id: norm.id,
-           paypal_subscription_id: norm.id, // legacy
-           plan_id: norm.plan_id,           // <-- PayPal plan id (we join to subscription_plans on status read)
-           status: norm.status,
-           environment,
-           current_period_end: norm.next_billing_time ? new Date(norm.next_billing_time).toISOString() : null,
-           updated_at: new Date().toISOString()
-         }])
+       // If no user id provided (e.g. webhook test), return raw info
+       return json(res, 200, {
+         ok:true, refreshed:true,
+         subscription: { id: sub?.id || subscriptionId, status: paypal_status, plan_id }
        });
-       const data = await up.json().catch(()=>[]);
-       if (!up.ok) return bad(res, 500, `supabase_upsert_failed: ${JSON.stringify(data)}`);
-   
-       return json(res, 200, { ok: true, refreshed: true, subscription: Array.isArray(data) ? data[0] : data });
      } catch (e) {
        return bad(res, 500, `subscriptions_refresh_exception: ${e?.message || e}`);
      }
    },
+
 
 
 
