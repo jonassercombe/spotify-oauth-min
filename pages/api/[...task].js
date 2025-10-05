@@ -803,33 +803,46 @@ const routes = {
 
    
   /* ---------- connections/list (GET) ---------- */
-  "connections/list": async (req, res) => {
-    const SUPABASE_URL = process.env.SUPABASE_URL;
-    const SRK = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    if (!SUPABASE_URL || !SRK) {
-      return json(res, 500, {
-        error: "missing_env",
-        have: { SUPABASE_URL: !!SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: !!SRK }
-      });
-    }
-    if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
-    const bubble_user_id = req.query.bubble_user_id;
-    if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
+   "connections/list": async (req, res) => {
+     const SUPABASE_URL = process.env.SUPABASE_URL;
+     const SRK = process.env.SUPABASE_SERVICE_ROLE_KEY;
+     if (!SUPABASE_URL || !SRK) {
+       return json(res, 500, {
+         error: "missing_env",
+         have: { SUPABASE_URL: !!SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: !!SRK }
+       });
+     }
+     if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+   
+     const bubble_user_id = String(req.query.bubble_user_id || "").trim();
+     if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
+   
+     // Default: nur aktive. Mit ?include_inactive=1 bekommst du alle.
+     const includeInactive = String(req.query.include_inactive || "0") === "1";
+   
+     let path =
+       `/rest/v1/spotify_connections` +
+       `?select=id,display_name,avatar_url,spotify_user_id,created_at,is_active,disconnected_at` +
+       `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+       `&order=created_at.desc`;
+   
+     if (!includeInactive) {
+       path += `&is_active=is.true`;
+     }
+   
+     const r = await fetch(SUPABASE_URL + path, {
+       headers: { apikey: SRK, Authorization: `Bearer ${SRK}` },
+       cache: "no-store"
+     });
+   
+     const txt = await r.text();
+     if (!r.ok) {
+       return json(res, 500, { error:"supabase_error", status:r.status, body:txt, url: SUPABASE_URL+path });
+     }
+   
+     return json(res, 200, txt ? JSON.parse(txt) : []);
+   };
 
-    const path =
-      `/rest/v1/spotify_connections` +
-      `?select=id,display_name,avatar_url,spotify_user_id,created_at` +
-      `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
-      `&order=created_at.desc`;
-
-    const r = await fetch(SUPABASE_URL + path, {
-      headers: { apikey: SRK, Authorization: `Bearer ${SRK}` },
-      cache: "no-store"
-    });
-    const txt = await r.text();
-    if (!r.ok) return json(res, 500, { error:"supabase_error", status:r.status, body:txt, url: SUPABASE_URL+path });
-    return json(res, 200, txt ? JSON.parse(txt) : []);
-  },
 
 
    /* ---------- connections/disconnect (POST) ---------- */
