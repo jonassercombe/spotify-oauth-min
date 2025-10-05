@@ -846,6 +846,113 @@ const routes = {
 
 
 
+   /* ---------- connections/activate (POST) ----------
+   Body:
+     { connection_id?: uuid, spotify_user_id?: string }
+   Header:
+     X-Bubble-User-Id: <required, außer Admin ruft’s intern>
+   */
+   "connections/activate": async (req, res) => {
+     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+     try {
+       const body = await readBody(req);
+   
+       const bubbleUserId = req.headers["x-bubble-user-id"] || body.bubble_user_id || "";
+       const connection_id = body.connection_id || "";
+       const spotify_user_id = body.spotify_user_id || "";
+   
+       if (!bubbleUserId && !checkAppSecret(req)) {
+         return bad(res, 401, "missing_x_bubble_user_id");
+       }
+       if (!connection_id && !spotify_user_id) {
+         return bad(res, 400, "missing_connection_identifier");
+       }
+   
+       // 1) Verbindung auflösen
+       let selPath = `/rest/v1/spotify_connections?select=id,bubble_user_id,spotify_user_id,refresh_token_enc,is_active,disabled_at&limit=1`;
+       if (connection_id) {
+         selPath += `&id=eq.${encodeURIComponent(connection_id)}`;
+       } else {
+         selPath += `&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}&spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}`;
+       }
+       const sR = await sb(selPath);
+       const conn = sR.ok ? (await sR.json())?.[0] : null;
+       if (!conn) return bad(res, 404, "connection_not_found");
+       if (bubbleUserId && conn.bubble_user_id !== bubbleUserId && !checkAppSecret(req)) {
+         return bad(res, 403, "forbidden");
+       }
+   
+       // 2) Ohne refresh_token kein Re-Enable möglich -> User muss bei Spotify neu zustimmen
+       if (!conn.refresh_token_enc) {
+         return bad(res, 409, "reconsent_required");
+       }
+   
+       // 3) Seats-Limit prüfen (nur aktive Verbindungen zählen)
+       const uR = await sb(`/rest/v1/app_users?select=seats_limit&limit=1&bubble_user_id=eq.${encodeURIComponent(conn.bubble_user_id)}`);
+       const u = uR.ok ? (await uR.json())?.[0] : null;
+       const seats_limit = Number.isFinite(u?.seats_limit) ? Number(u.seats_limit) : 1;
+   
+       const cR = await sb(
+         `/rest/v1/spotify_connections?select=id&bubble_user_id=eq.${encodeURIComponent(conn.bubble_user_id)}&is_active=is.true`
+       );
+       const activeNow = cR.ok ? (await cR.json()).length : 0;
+   
+       // Wenn diese Verbindung bereits aktiv ist, zählen wir sie nicht doppelt
+       const willBeActiveCount = conn.is_active ? activeNow : activeNow + 1;
+       if (willBeActiveCount > seats_limit) {
+         return bad(res, 403, "seat_limit_reached");
+       }
+   
+       // 4) Reaktivieren (falls is_active generiert ist, reicht disabled_at=null)
+       const patchPayload = {
+         is_active: true,
+         disabled_at: null,
+         updated_at: new Date().toISOString()
+       };
+       const pR = await sb(`/rest/v1/spotify_connections?id=eq.${encodeURIComponent(conn.id)}`, {
+         method: "PATCH",
+         headers: { Prefer: "return=representation" },
+         body: JSON.stringify(patchPayload)
+       });
+       const pJ = pR.ok ? (await pR.json())?.[0] : null;
+       if (!pR.ok || !pJ) {
+         return bad(res, 500, `supabase_activate_failed: ${await pR.text()}`);
+       }
+   
+       // 5) seats_used aktualisieren (Quality-of-life; optional)
+       try {
+         const usedR = await sb(
+           `/rest/v1/spotify_connections?select=id&bubble_user_id=eq.${encodeURIComponent(conn.bubble_user_id)}&is_active=is.true`
+         );
+         if (usedR.ok) {
+           const used = (await usedR.json()).length;
+           await sb(`/rest/v1/app_users?bubble_user_id=eq.${encodeURIComponent(conn.bubble_user_id)}`, {
+             method: "PATCH",
+             headers: { Prefer: "return=minimal" },
+             body: JSON.stringify({ seats_used: used, updated_at: new Date().toISOString() })
+           }).catch(()=>{});
+         }
+       } catch {}
+   
+       // 6) Optional: ersten Sync anstoßen (asynchron, errors ignorieren)
+       try {
+         const base = process.env.PUBLIC_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
+         if (base) {
+           fetch(`${base}/api/playlists/sync`, {
+             method: "POST",
+             headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+             body: JSON.stringify({ connection_id: conn.id })
+           }).catch(()=>{});
+         }
+       } catch {}
+   
+       return json(res, 200, { ok: true, activated: true, connection: { id: pJ.id, is_active: pJ.is_active, disabled_at: pJ.disabled_at } });
+     } catch (e) {
+       return bad(res, 500, `activate_exception: ${e?.message || e}`);
+     }
+   },
+   
+      
    /* ---------- connections/disconnect (POST) ---------- */
    "connections/disconnect": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
