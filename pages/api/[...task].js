@@ -3378,6 +3378,72 @@ const routes = {
 
 
 
+   /* ---------- followers/cron-refresh-all (GET/POST) ----------
+   Läuft idealerweise jede Minute.
+   - verteilt Last über 60 "buckets" (cron_bucket pro Connection)
+   - ruft intern playlists/refresh-followers für jede aktive Connection im Bucket
+   Query-Params (optional):
+     stale_hours=23   -> nur Playlists updaten, deren Stand älter ist
+     max=600          -> max Playlists pro Connection pro Lauf
+     concurrency=3    -> parallele Spotify-GETs pro Connection (wird an Sub-Route gereicht)
+     batch=100        -> Batch-Größe fürs Upsert der Daily-Tabelle
+     bucket=NN        -> manuelles Bucket-Override (0..59), sonst UTC Minute
+   */
+   "followers/cron-refresh-all": async (req, res) => {
+     if (!checkCronAuth(req)) return bad(res, 401, "unauthorized_cron");
+   
+     const inUrl = new URL(req.url, `http://${req.headers.host}`);
+     const qp = inUrl.searchParams;
+   
+     const staleHours = Number(qp.get("stale_hours") || "23");
+     const maxTotal   = Number(qp.get("max") || "600");
+     const conc       = Number(qp.get("concurrency") || "3");
+     const perWrite   = Number(qp.get("batch") || "100");
+   
+     const bucketOverride = qp.get("bucket");
+     const nowUtcMin = new Date().getUTCMinutes();
+     const bucket = bucketOverride !== null ? Number(bucketOverride) : nowUtcMin;
+   
+     // Nur aktive Connections im aktuellen Bucket
+     const conns = await sb(
+       `/rest/v1/spotify_connections?select=id&is_active=is.true&cron_bucket=eq.${encodeURIComponent(bucket)}`
+     ).then(r => r.json());
+   
+     let ok=0, fail=0;
+     for (const c of conns) {
+       // interner Aufruf deiner bestehenden Subroute (mit Secret-Header)
+       const reqOne = {
+         ...req,
+         method: "POST",
+         headers: { ...req.headers, "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+         // Query-Params an Subroute durchreichen
+         url: `/api/playlists/refresh-followers?stale_hours=${encodeURIComponent(String(staleHours))}` +
+              `&max=${encodeURIComponent(String(maxTotal))}` +
+              `&concurrency=${encodeURIComponent(String(conc))}` +
+              `&batch=${encodeURIComponent(String(perWrite))}`,
+         query: {
+           stale_hours: String(staleHours),
+           max: String(maxTotal),
+           concurrency: String(conc),
+           batch: String(perWrite)
+         },
+         body: { connection_id: c.id }
+       };
+   
+       const dummyRes = { status: () => ({ json: () => {} }) };
+       try {
+         const r = await routes["playlists/refresh-followers"](reqOne, dummyRes);
+         r?.ok ? ok++ : fail++;
+       } catch {
+         fail++;
+       }
+       await sleep(60); // leichter Jitter zwischen Connections
+     }
+   
+     return json(res, 200, { ok:true, bucket, connections: conns.length, dispatched_ok: ok, dispatched_fail: fail });
+   },
+   
+      
    /* ---------- watch/cron-refresh-all (GET/POST) ---------- */
    "followers/cron-refresh-all": async (req, res) => {
      if (!checkCronAuth(req)) return bad(res, 401, "unauthorized_cron");
