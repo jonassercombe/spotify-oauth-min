@@ -3061,41 +3061,45 @@ const routes = {
 
   /* ---------- watch/cron-check-all (GET/POST) ---------- */
   "watch/cron-check-all": async (req, res) => {
-    if (!checkCronAuth(req)) return bad(res, 401, "unauthorized_cron");
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const qs  = Object.fromEntries(url.searchParams.entries());
+     if (!checkCronAuth(req)) return bad(res, 401, "unauthorized_cron");
+   
+     const conns = await sb(
+       `/rest/v1/spotify_connections?select=id&is_active=is.true`
+     ).then(r => r.json());
+   
+     let ok=0, fail=0;
+     for (const c of conns) {
+       const resp = await routes["watch/check-updates"](
+         { ...req, method:"POST", headers: { ...req.headers, "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" }, url: req.url, query: req.query, body: { connection_id: c.id } },
+         { status: ()=>({ json: ()=>{} }) }
+       ).catch(()=>({ ok:false }));
+       resp?.ok ? ok++ : fail++;
+       await sleep(80);
+     }
+     return json(res, 200, { ok:true, connections: conns.length, dispatched_ok: ok, dispatched_fail: fail });
+   },
 
-    const conns = await sb(`/rest/v1/spotify_connections?select=id`).then(r=>r.json());
-    let ok=0, fail=0;
-    for (const c of conns) {
-      const resp = await routes["watch/check-updates"](
-        { ...req, method:"POST", headers: { ...req.headers, "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" }, url: req.url, query: req.query, body: { connection_id: c.id } },
-        { status: ()=>({ json: ()=>{} }) } // dummy, we won't use
-      ).catch(()=>({ ok:false }));
-      resp?.ok ? ok++ : fail++;
-      await sleep(80);
-    }
-    return json(res, 200, { ok:true, connections: conns.length, dispatched_ok: ok, dispatched_fail: fail });
-  },
 
   /* ---------- watch/cron-sync-all (GET/POST) ---------- */
   "watch/cron-sync-all": async (req, res) => {
-    if (!checkCronAuth(req)) return bad(res, 401, "unauthorized_cron");
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const qs  = Object.fromEntries(url.searchParams.entries());
+     if (!checkCronAuth(req)) return bad(res, 401, "unauthorized_cron");
+   
+     const conns = await sb(
+       `/rest/v1/spotify_connections?select=id&is_active=is.true`
+     ).then(r=>r.json());
+   
+     let ok=0, fail=0;
+     for (const c of conns) {
+       const resp = await routes["watch/sync-needed"](
+         { ...req, method:"POST", headers: { ...req.headers, "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" }, url: req.url, query: req.query, body: { connection_id: c.id } },
+         { status: ()=>({ json: ()=>{} }) }
+       ).catch(()=>({ ok:false }));
+       resp?.ok ? ok++ : fail++;
+       await sleep(80);
+     }
+     return json(res, 200, { ok:true, connections: conns.length, dispatched_ok: ok, dispatched_fail: fail });
+   },
 
-    const conns = await sb(`/rest/v1/spotify_connections?select=id`).then(r=>r.json());
-    let ok=0, fail=0;
-    for (const c of conns) {
-      const resp = await routes["watch/sync-needed"](
-        { ...req, method:"POST", headers: { ...req.headers, "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" }, url: req.url, query: req.query, body: { connection_id: c.id } },
-        { status: ()=>({ json: ()=>{} }) }
-      ).catch(()=>({ ok:false }));
-      resp?.ok ? ok++ : fail++;
-      await sleep(80);
-    }
-    return json(res, 200, { ok:true, connections: conns.length, dispatched_ok: ok, dispatched_fail: fail });
-  },
 
   /* ---------- watch/cron-all (GET/POST) ---------- */
    "watch/cron-all": async (req, res) => {
@@ -3104,25 +3108,21 @@ const routes = {
    
      const inUrl = new URL(req.url, `http://${req.headers.host}`);
      const qp = inUrl.searchParams;
-   
-     // Shard/ Bucket bestimmen (0..59). Optional Override via ?bucket=NN
      const bucketOverride = qp.get("bucket");
      const nowUtcMin = new Date().getUTCMinutes();
      const bucket = bucketOverride !== null ? Number(bucketOverride) : nowUtcMin;
    
-     // Per-Subroute Budgets aus Query (global fallback)
      const limitCheck = qp.get("limit_check") ?? qp.get("limit") ?? "5";
      const concCheck  = qp.get("conc_check")  ?? qp.get("concurrency") ?? "2";
      const limitSync  = qp.get("limit_sync")  ?? qp.get("limit") ?? "2";
      const concSync   = qp.get("conc_sync")   ?? qp.get("concurrency") ?? "1";
    
-     // Nur Connections in diesem Bucket laden
-     const conns = await sb(`/rest/v1/spotify_connections?select=id&cron_bucket=eq.${encodeURIComponent(bucket)}`)
-                         .then(r => r.json());
+     const conns = await sb(
+       `/rest/v1/spotify_connections?select=id&is_active=is.true&cron_bucket=eq.${encodeURIComponent(bucket)}`
+     ).then(r => r.json());
    
      let ok=0, fail=0;
      for (const c of conns) {
-       // CHECK-Updates für diese Connection
        const reqCheck = {
          ...req,
          method: "POST",
@@ -3134,7 +3134,6 @@ const routes = {
        const r1 = await routes["watch/check-updates"](reqCheck, { status:()=>({ json:()=>{} }) }).catch(()=>({ ok:false }));
        r1?.ok ? ok++ : fail++;
    
-       // SYNC-needed für diese Connection
        const reqSync = {
          ...req,
          method: "POST",
@@ -3146,11 +3145,12 @@ const routes = {
        const r2 = await routes["watch/sync-needed"](reqSync, { status:()=>({ json:()=>{} }) }).catch(()=>({ ok:false }));
        r2?.ok ? ok++ : fail++;
    
-       await sleep(60); // mini-jitter zwischen Connections
+       await sleep(60);
      }
    
      return json(res, 200, { ok:true, bucket, connections: conns.length, dispatched_ok: ok, dispatched_fail: fail });
    },
+
 
 
 
