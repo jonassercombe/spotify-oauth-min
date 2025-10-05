@@ -1781,7 +1781,7 @@ const routes = {
 
   /* ---------- oauth/spotify/callback (GET) ---------- */
    "oauth/spotify/callback": async (req, res) => {
-     // kleine Helper
+     // Redirect-Helfer für Fehler
      const backWithError = (return_to, code) => {
        const base = return_to || "/";
        const sep = base.includes("?") ? "&" : "?";
@@ -1861,39 +1861,41 @@ const routes = {
          body: JSON.stringify({ bubble_user_id }),
        }).catch(() => {});
    
-       // --- Seats-Gate (aus app_users lesen; seats_used enthält nur aktive Seats)
+       // --- Seats-Gate (nur aktive)
        let seats_limit = 1;
-       let seats_used = 0;
-       let sub_status = "active";
+       let seats_used  = 0;
+       let sub_status  = "active";
        let sub_expires = null;
    
        try {
+         // 1) aus app_users lesen
          const uR = await sb(
-           `/rest/v1/app_users?select=seats_limit,seats_used,subscription_status,subscription_expires_at&limit=1&bubble_user_id=eq.${encodeURIComponent(
-             bubble_user_id
-           )}`
+           `/rest/v1/app_users?select=seats_limit,seats_used,subscription_status,subscription_expires_at` +
+           `&limit=1&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}`
          );
          const u = uR.ok ? (await uR.json())?.[0] : null;
          if (u) {
            if (Number.isFinite(Number(u.seats_limit))) seats_limit = Number(u.seats_limit);
-           if (Number.isFinite(Number(u.seats_used))) seats_used = Number(u.seats_used);
-           sub_status = String(u.subscription_status || "active");
+           if (Number.isFinite(Number(u.seats_used)))  seats_used  = Number(u.seats_used);
+           sub_status  = String(u.subscription_status || "active");
            sub_expires = u.subscription_expires_at || null;
-         } else {
-           // Fallback: live zählen (nur aktive Verbindungen)
+         }
+   
+         // 2) Fallback: live zählen, falls seats_used fehlt
+         if (!Number.isFinite(seats_used)) {
            const cR = await sb(
-             `/rest/v1/spotify_connections?select=id&bubble_user_id=eq.${encodeURIComponent(
-               bubble_user_id
-             )}&is_active=is.true`
+             `/rest/v1/spotify_connections?select=id` +
+             `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+             `&is_active=is.true`
            );
            const arr = cR.ok ? await cR.json() : [];
            seats_used = Array.isArray(arr) ? arr.length : 0;
          }
        } catch {
-         // im Zweifel keine Blockade
+         // bei Fehlern nicht blocken
        }
    
-       // Subscription-Validierung (optional – so wie bisher)
+       // Subscription-Validierung (optional – wie zuvor)
        const subActive =
          sub_status !== "canceled" &&
          (!sub_expires || new Date(sub_expires) > new Date());
@@ -1904,12 +1906,13 @@ const routes = {
          return backWithError(return_to, "seat_limit_reached");
        }
    
-       // --- vorhandene Verbindung suchen
+       // --- vorhandene Verbindung suchen (neueste zuerst, falls Dubletten)
        const existing = await fetch(
          `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?` +
-           `select=id,refresh_token_enc,cron_bucket,is_active&` +
+           `select=id,refresh_token_enc,cron_bucket,is_active,disabled_at,created_at&` +
            `bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&` +
-           `spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}&limit=1`,
+           `spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}&` +
+           `order=created_at.desc&limit=1`,
          {
            headers: {
              apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1946,20 +1949,17 @@ const routes = {
          spotify_user_id,
          display_name,
          avatar_url,
-         scope:
-           "playlist-read-private playlist-modify-private playlist-modify-public",
+         scope: "playlist-read-private playlist-modify-private playlist-modify-public",
          refresh_token_enc,
          access_token_enc,
          access_expires_at,
          cron_bucket,
        };
    
-       // ---- Upsert (robust): wenn vorhanden -> PATCH per id; sonst INSERT
+       // ---- Upsert: wenn vorhanden → PATCH per id; sonst INSERT
        if (existing) {
          const up = await fetch(
-           `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?id=eq.${encodeURIComponent(
-             existing.id
-           )}`,
+           `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?id=eq.${encodeURIComponent(existing.id)}`,
            {
              method: "PATCH",
              headers: {
@@ -1976,31 +1976,20 @@ const routes = {
              }),
            }
          );
-   
          if (!up.ok) {
            return backWithError(return_to, `supabase_patch_failed_${up.status}`);
          }
    
-         // Sicherheitscheck: is_active wirklich true?
-         try {
-           const vr = await fetch(
-             `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?select=id,is_active,disabled_at&limit=1&id=eq.${encodeURIComponent(
-               existing.id
-             )}`,
-             {
-               headers: {
-                 apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-                 Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-               },
-             }
-           );
-           const vj = vr.ok ? await vr.json() : [];
-           if (!vj?.[0]?.is_active) {
-             return backWithError(return_to, "reconnect_is_active_still_false");
+         // Sicherheits-Update (breit) – falls Dublett/andere Zeile die aktive ist
+         await sb(
+           `/rest/v1/spotify_connections?bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+           `&spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}`,
+           {
+             method: "PATCH",
+             headers: { Prefer: "return=minimal" },
+             body: JSON.stringify({ is_active: true, disabled_at: null, updated_at: new Date().toISOString() })
            }
-         } catch {
-           // ignorierbar
-         }
+         ).catch(()=>{});
        } else {
          const ins = await fetch(
            `${process.env.SUPABASE_URL}/rest/v1/spotify_connections`,
@@ -2026,10 +2015,45 @@ const routes = {
          }
        }
    
-       // --- erfolgreicher Abschluss → zurück ins UI
-       const qs = `?spotify_linked=1&spotify_user=${encodeURIComponent(
-         spotify_user_id
-       )}`;
+       // --- Verifizieren: ist jetzt aktiv?
+       try {
+         const vr = await fetch(
+           `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?` +
+             `select=id,is_active,disabled_at&limit=1&` +
+             `bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&` +
+             `spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}`,
+           {
+             headers: {
+               apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+               Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+             },
+           }
+         );
+         const vj = vr.ok ? await vr.json() : [];
+         if (!vj?.[0]?.is_active) {
+           return backWithError(return_to, "is_active_update_failed");
+         }
+       } catch {
+         // ignorierbar
+       }
+   
+       // --- seats_used sofort neu berechnen & in app_users schreiben
+       try {
+         const cR = await sb(
+           `/rest/v1/spotify_connections?select=id&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&is_active=is.true`
+         );
+         const arr = cR.ok ? await cR.json() : [];
+         const used = Array.isArray(arr) ? arr.length : 0;
+   
+         await sb(`/rest/v1/app_users?bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}`, {
+           method: "PATCH",
+           headers: { Prefer: "return=minimal" },
+           body: JSON.stringify({ seats_used: used, updated_at: new Date().toISOString() })
+         }).catch(()=>{});
+       } catch {/* no-op */}
+   
+       // --- zurück ins UI
+       const qs = `?spotify_linked=1&spotify_user=${encodeURIComponent(spotify_user_id)}`;
        const back = (return_to || "/") + qs;
        return res.redirect(back);
      } catch (e) {
@@ -2037,6 +2061,7 @@ const routes = {
        return backWithError("/", `callback_exception_${encodeURIComponent(msg)}`);
      }
    },
+
 
 
 
