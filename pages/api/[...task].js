@@ -343,22 +343,52 @@ const routes = {
      const bubbleUserId = req.headers["x-bubble-user-id"];
      if (!bubbleUserId) return bad(res, 401, "missing_x_bubble_user_id");
    
-     const r = await sb(`/rest/v1/app_users?select=bubble_user_id,sync_paused,auto_remove_enabled,position_lock_enabled,subscription_status,subscription_expires_at&limit=1&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`);
-     const arr = await r.json().catch(()=>[]);
+     const r = await sb(
+       `/rest/v1/app_users` +
+         `?select=` +
+         [
+           "bubble_user_id",
+           "sync_paused",
+           "auto_remove_enabled",
+           "position_lock_enabled",
+           "subscription_status",
+           "subscription_expires_at",
+           "seats_limit",
+           "subscription_plan_code",
+         ].join(",") +
+         `&limit=1&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`
+     );
+   
+     const arr = await r.json().catch(() => []);
      if (!r.ok) return bad(res, 500, `supabase_select_failed: ${JSON.stringify(arr)}`);
    
-     // falls Row noch nicht existiert: Defaults anzeigen (und auf Wunsch hier auto-anlegen)
-     const row = arr?.[0] || {
+     // Defaults if the user row doesn't exist yet
+     const defaults = {
        bubble_user_id: bubbleUserId,
        sync_paused: false,
        auto_remove_enabled: true,
        position_lock_enabled: true,
        subscription_status: "active",
-       subscription_expires_at: null
+       subscription_expires_at: null,
+       seats_limit: 1,               // <— default; change if you want 0 for free/luggage
+       subscription_plan_code: null,
      };
    
-     return json(res, 200, { ok:true, settings: row });
+     const rowInDb = arr?.[0];
+     const row = rowInDb
+       ? {
+           ...defaults,
+           ...rowInDb,
+           // ensure seats_limit is a number with a sane fallback
+           seats_limit: Number.isFinite(Number(rowInDb.seats_limit))
+             ? Number(rowInDb.seats_limit)
+             : defaults.seats_limit,
+         }
+       : defaults;
+   
+     return json(res, 200, { ok: true, settings: row });
    },
+
 
 
    /* ---------- users/settings/save (POST) ---------- */
