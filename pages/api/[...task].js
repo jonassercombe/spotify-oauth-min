@@ -833,59 +833,60 @@ const routes = {
 
 
    /* ---------- connections/disconnect (POST) ---------- */
-   /* Body: { connection_id: "<uuid>", archive_playlists?: true, revoke_tokens?: true }
-      Header: X-Bubble-User-Id: <uid>  (Ownership-Check)
-   */
    "connections/disconnect": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
-     const uid = req.headers["x-bubble-user-id"];
-     if (!uid) return bad(res, 401, "missing_x_bubble_user_id");
    
-     const { connection_id, archive_playlists = true, revoke_tokens = true } = await readBody(req);
+     const bubbleUserId = req.headers["x-bubble-user-id"];
+     if (!bubbleUserId) return bad(res, 401, "missing_x_bubble_user_id");
+   
+     const body = await readBody(req);
+     const connection_id = String(
+       body.connection_id || body.id || body.connectionId || req.query.connection_id || req.query.id || ""
+     ).trim();
      if (!connection_id) return bad(res, 400, "missing_connection_id");
    
      // Ownership prüfen
-     const cr = await sb(`/rest/v1/spotify_connections?select=id,bubble_user_id&limit=1&id=eq.${encodeURIComponent(connection_id)}`);
-     const cArr = cr.ok ? await cr.json() : [];
-     const conn = cArr?.[0];
-     if (!cr.ok) return bad(res, 500, `supabase_select_failed: ${await cr.text()}`);
-     if (!conn) return bad(res, 404, "connection_not_found");
-     if (conn.bubble_user_id !== uid) return bad(res, 403, "forbidden");
+     const sel = await sb(
+       `/rest/v1/spotify_connections?select=id,bubble_user_id,is_active&limit=1&id=eq.${encodeURIComponent(connection_id)}`
+     );
+     if (!sel.ok) return bad(res, 500, `supabase_select_failed: ${await sel.text()}`);
+     const row = (await sel.json())?.[0];
+     if (!row) return bad(res, 404, "connection_not_found");
+     if (row.bubble_user_id !== bubbleUserId) return bad(res, 403, "forbidden");
    
-     // Soft-Disconnect
-     const patch = {
-       is_active: false,
-       disconnected_at: new Date().toISOString(),
-     };
-     if (revoke_tokens) {
-       patch.refresh_token_enc = null;
-       patch.access_token_enc = null;
-       patch.access_expires_at = null;
-     }
-     const up = await sb(`/rest/v1/spotify_connections?id=eq.${encodeURIComponent(connection_id)}`, {
+     // **Soft disconnect**: nur Flags setzen (KEINE Token-Felder anfassen)
+     const patch = await sb(`/rest/v1/spotify_connections?id=eq.${encodeURIComponent(connection_id)}`, {
        method: "PATCH",
-       headers: { Prefer: "return=minimal" },
-       body: JSON.stringify(patch)
+       headers: { Prefer: "return=representation" },
+       body: JSON.stringify({
+         is_active: false,
+         disconnected_at: new Date().toISOString()
+       })
      });
-     if (!up.ok) return bad(res, 500, `supabase_disconnect_failed: ${await up.text()}`);
+     if (!patch.ok) {
+       const t = await patch.text().catch(()=>"?");
+       return bad(res, 500, `supabase_disconnect_failed: ${t}`);
+     }
    
-     // Playlists dieser Connection archivieren (optional)
-     if (archive_playlists) {
-       await sb(`/rest/v1/playlists?connection_id=eq.${encodeURIComponent(connection_id)}`, {
+     // seats_used neu zählen (nur aktive Verbindungen)
+     let seats_used = 0;
+     try {
+       const cr = await sb(
+         `/rest/v1/spotify_connections?select=id&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}&is_active=is.true`
+       );
+       const arr = cr.ok ? await cr.json() : [];
+       seats_used = Array.isArray(arr) ? arr.length : 0;
+   
+       await sb(`/rest/v1/app_users?bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`, {
          method: "PATCH",
          headers: { Prefer: "return=minimal" },
-         body: JSON.stringify({
-           is_archived: true,
-           archived_at: new Date().toISOString(),
-           needs_sync: false,
-           next_check_at: null
-         })
+         body: JSON.stringify({ seats_used })
        }).catch(()=>{});
-     }
+     } catch {}
    
-     // Seats werden durch Trigger neu gezählt → kein Extra-Call nötig.
-     return json(res, 200, { ok:true, disconnected:true });
+     return json(res, 200, { ok: true, disconnected: true, connection_id, seats_used });
    },
+
    
       
    /* ---------- dashboard/expiring-next (GET) ---------- */
