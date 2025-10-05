@@ -3378,6 +3378,35 @@ const routes = {
 
 
 
+   /* ---------- watch/cron-refresh-all (GET/POST) ---------- */
+   "followers/cron-refresh-all": async (req, res) => {
+     if (!checkCronAuth(req)) return bad(res, 401, "unauthorized_cron");
+   
+     const conns = await sb(`/rest/v1/spotify_connections?select=id&is_active=is.true`).then(r => r.json());
+     let ok=0, fail=0;
+   
+     for (const c of conns) {
+       try {
+         const r = await routes["playlists/refresh-followers"](
+           {
+             ...req,
+             method: "POST",
+             headers: { ...req.headers, "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+             url: req.url,
+             query: { stale_hours: "24", with_followers: "1" }, // optional
+             body: { connection_id: c.id }
+           },
+           { status: ()=>({ json: ()=>{} }) }
+         );
+         r?.ok ? ok++ : fail++;
+       } catch { fail++; }
+       await sleep(80);
+     }
+     return json(res, 200, { ok:true, connections: conns.length, dispatched_ok: ok, dispatched_fail: fail });
+   },
+   
+   
+      
    /* ---------- playlist-items/move (POST) ---------- */
    "playlist-items/move": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
