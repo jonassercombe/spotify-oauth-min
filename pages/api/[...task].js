@@ -841,7 +841,7 @@ const routes = {
      }
    
      return json(res, 200, txt ? JSON.parse(txt) : []);
-   };
+   },
 
 
 
