@@ -845,6 +845,7 @@ const routes = {
 
 
 
+
    /* ---------- connections/disconnect (POST) ---------- */
    "connections/disconnect": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
