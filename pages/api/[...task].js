@@ -343,6 +343,7 @@ const routes = {
      const bubbleUserId = req.headers["x-bubble-user-id"];
      if (!bubbleUserId) return bad(res, 401, "missing_x_bubble_user_id");
    
+     // HINWEIS: Wenn du die View-Variante nutzt, ersetze /app_users durch /app_users_with_seats
      const r = await sb(
        `/rest/v1/app_users` +
          `?select=` +
@@ -353,8 +354,9 @@ const routes = {
            "position_lock_enabled",
            "subscription_status",
            "subscription_expires_at",
-           "seats_limit",
            "subscription_plan_code",
+           "seats_limit",
+           "seats_used",       // <- NEU: kommt aus Spalte + Trigger ODER aus View
          ].join(",") +
          `&limit=1&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`
      );
@@ -362,7 +364,7 @@ const routes = {
      const arr = await r.json().catch(() => []);
      if (!r.ok) return bad(res, 500, `supabase_select_failed: ${JSON.stringify(arr)}`);
    
-     // Defaults if the user row doesn't exist yet
+     // Defaults, falls User-Zeile noch nicht existiert
      const defaults = {
        bubble_user_id: bubbleUserId,
        sync_paused: false,
@@ -370,8 +372,9 @@ const routes = {
        position_lock_enabled: true,
        subscription_status: "active",
        subscription_expires_at: null,
-       seats_limit: 1,               // <— default; change if you want 0 for free/luggage
        subscription_plan_code: null,
+       seats_limit: 1,  // Default (z.B. für Free/Luggage 0, wenn du willst)
+       seats_used: 0,   // Default
      };
    
      const rowInDb = arr?.[0];
@@ -379,10 +382,13 @@ const routes = {
        ? {
            ...defaults,
            ...rowInDb,
-           // ensure seats_limit is a number with a sane fallback
+           // Numerik-Absicherung
            seats_limit: Number.isFinite(Number(rowInDb.seats_limit))
              ? Number(rowInDb.seats_limit)
              : defaults.seats_limit,
+           seats_used: Number.isFinite(Number(rowInDb.seats_used))
+             ? Number(rowInDb.seats_used)
+             : defaults.seats_used,
          }
        : defaults;
    
