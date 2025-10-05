@@ -1741,32 +1741,34 @@ const routes = {
          body: JSON.stringify({ bubble_user_id }),
        });
    
-       // OPTIONAL ENFORCEMENT: Subscription & Seats prüfen
-       // (Comment out if you want to allow connecting before purchase)
+       // ===== SEAT / SUBSCRIPTION ENFORCEMENT (read from app_users) =====
        try {
-         const sR = await sb(
-           `/rest/v1/subscriptions` +
-           `?select=status,seats_limit,plan_code,provider_subscription_id` +
-           `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
-           `&environment=eq.live` +
-           `&order=updated_at.desc&limit=1`
+         const uR = await sb(
+           `/rest/v1/app_users?select=sub_status,is_active,seats_limit&limit=1&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}`
          );
-         const s = sR.ok ? (await sR.json())?.[0] : null;
-         const isActive = s?.status === "ACTIVE";
-         const allowedSeats = Number.isFinite(s?.seats_limit) ? s.seats_limit : 1;
+         const u = uR.ok ? (await uR.json())?.[0] : null;
+   
+         // Treat as active only if explicitly marked active AND status ACTIVE
+         const isActive = !!u?.is_active && String(u?.sub_status || "").toUpperCase() === "ACTIVE";
+         const allowedSeats = Number.isFinite(u?.seats_limit) ? u.seats_limit : 1;
+   
          if (!isActive) {
            return res.status(402).send("subscription_required");
          }
-         // count existing connections
+   
+         // Current seat usage
          const cR = await sb(`/rest/v1/spotify_connections?select=id&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}`);
-         const seatUsed = (cR.ok ? (await cR.json()) : []).length;
+         const seatUsed = cR.ok ? (await cR.json()).length : 0;
          if (seatUsed >= allowedSeats) {
            return res.status(403).send("seat_limit_reached");
          }
        } catch (e) {
-         // Wenn du grace-mode willst, ignoriere Fehler hier:
-         // console.warn("seat-check skipped:", e?.message || e);
+         // If you prefer hard-fail on errors, replace the following line with:
+         // return res.status(500).send("subscription_check_failed");
+         // For now: be permissive on transient errors.
+         console.warn("seat-check warning:", e?.message || e);
        }
+       // ===== END ENFORCEMENT =====
    
        // existing connection?
        const existing = await fetch(
@@ -1790,6 +1792,7 @@ const routes = {
        const access_token_enc = encToken(tokenRes.access_token);
        const access_expires_at = new Date(Date.now() + (tokenRes.expires_in || 3600) * 1000).toISOString();
    
+       // stable per-minute bucket for staggering cron
        const cron_bucket =
          Number.isInteger(existing?.cron_bucket) ? existing.cron_bucket : Math.floor(Math.random() * 60);
    
