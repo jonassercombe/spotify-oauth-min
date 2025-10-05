@@ -1,0 +1,6 @@
+{
+  "crons": [
+    { "path": "/api/watch/cron-all",             "schedule": "* * * * *"    },
+    { "path": "/api/watch/cron-maintenance-all", "schedule": "0 4 * * *"    }
+  ]
+}
