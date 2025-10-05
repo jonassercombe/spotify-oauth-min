@@ -1781,15 +1781,15 @@ const routes = {
 
   /* ---------- oauth/spotify/callback (GET) ---------- */
    "oauth/spotify/callback": async (req, res) => {
-     // kleiner Helper für Redirects mit Fehlercode
-     const backWithError = (ret, code) => {
-       const base = ret || "/";
+     // kleine Helper
+     const backWithError = (return_to, code) => {
+       const base = return_to || "/";
        const sep = base.includes("?") ? "&" : "?";
        return res.redirect(`${base}${sep}spotify_error=${encodeURIComponent(code)}`);
      };
    
      try {
-       // ---- Env prüfen
+       // --- Env prüfen
        const assertEnv = (n) => need(n);
        assertEnv("SPOTIFY_CLIENT_ID");
        assertEnv("SPOTIFY_CLIENT_SECRET");
@@ -1798,14 +1798,12 @@ const routes = {
        assertEnv("SUPABASE_SERVICE_ROLE_KEY");
        assertEnv("ENC_SECRET");
    
-       // ---- Query lesen
-       const code = req.query.code;
+       // --- Query-Params
+       const code  = req.query.code;
        const state = req.query.state;
-       if (!code || !state) {
-         return backWithError("/", "missing_code_or_state");
-       }
+       if (!code || !state) return backWithError("/", "missing_code_or_state");
    
-       // ---- state parsen
+       // --- state decodieren
        let parsed;
        try {
          parsed = JSON.parse(Buffer.from(state, "base64url").toString("utf8"));
@@ -1813,13 +1811,11 @@ const routes = {
          return backWithError("/", "invalid_state");
        }
        const bubble_user_id = parsed.bubble_user_id;
-       const label = parsed.label || "";
+       const label     = parsed.label || "";
        const return_to = parsed.return_to || "/";
-       if (!bubble_user_id) {
-         return backWithError(return_to, "missing_bubble_user_id");
-       }
+       if (!bubble_user_id) return backWithError(return_to, "missing_user_in_state");
    
-       // ---- Token-Exchange
+       // --- Token-Exchange
        const tokenRes = await fetch("https://accounts.spotify.com/api/token", {
          method: "POST",
          headers: {
@@ -1835,29 +1831,25 @@ const routes = {
            code,
            redirect_uri: process.env.SPOTIFY_REDIRECT_URI,
          }),
-       });
-       const tokenJson = await tokenRes.json().catch(() => ({}));
-       if (!tokenRes.ok || !tokenJson?.access_token) {
+       }).then((r) => r.json());
+   
+       if (!tokenRes || !tokenRes.access_token) {
          return backWithError(return_to, "token_exchange_failed");
        }
    
-       // ---- /me
+       // --- /me ziehen
        const meResp = await fetch("https://api.spotify.com/v1/me", {
-         headers: { Authorization: `Bearer ${tokenJson.access_token}` },
+         headers: { Authorization: `Bearer ${tokenRes.access_token}` },
        });
        if (!meResp.ok) {
-         const t = await meResp.text().catch(() => "");
          return backWithError(return_to, `spotify_me_failed_${meResp.status}`);
        }
        const me = await meResp.json();
-       const spotify_user_id = me?.id;
-       const display_name = me?.display_name || label || "";
-       const avatar_url = (me?.images && me.images[0]?.url) || null;
-       if (!spotify_user_id) {
-         return backWithError(return_to, "spotify_me_no_id");
-       }
+       const spotify_user_id = me.id;
+       const display_name = me.display_name || label || "";
+       const avatar_url = (me.images && me.images[0]?.url) || null;
    
-       // ---- User anlegen (idempotent)
+       // --- app_user idempotent anlegen
        await fetch(`${process.env.SUPABASE_URL}/rest/v1/app_users?on_conflict=bubble_user_id`, {
          method: "POST",
          headers: {
@@ -1869,49 +1861,50 @@ const routes = {
          body: JSON.stringify({ bubble_user_id }),
        }).catch(() => {});
    
-       // ---- Seat-Limit aus app_users lesen
-       const userR = await fetch(
-         `${process.env.SUPABASE_URL}/rest/v1/app_users?select=seats_limit,subscription_status,subscription_expires_at&limit=1&bubble_user_id=eq.${encodeURIComponent(
-           bubble_user_id
-         )}`,
-         {
-           headers: {
-             apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-             Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-           },
+       // --- Seats-Gate (aus app_users lesen; seats_used enthält nur aktive Seats)
+       let seats_limit = 1;
+       let seats_used = 0;
+       let sub_status = "active";
+       let sub_expires = null;
+   
+       try {
+         const uR = await sb(
+           `/rest/v1/app_users?select=seats_limit,seats_used,subscription_status,subscription_expires_at&limit=1&bubble_user_id=eq.${encodeURIComponent(
+             bubble_user_id
+           )}`
+         );
+         const u = uR.ok ? (await uR.json())?.[0] : null;
+         if (u) {
+           if (Number.isFinite(Number(u.seats_limit))) seats_limit = Number(u.seats_limit);
+           if (Number.isFinite(Number(u.seats_used))) seats_used = Number(u.seats_used);
+           sub_status = String(u.subscription_status || "active");
+           sub_expires = u.subscription_expires_at || null;
+         } else {
+           // Fallback: live zählen (nur aktive Verbindungen)
+           const cR = await sb(
+             `/rest/v1/spotify_connections?select=id&bubble_user_id=eq.${encodeURIComponent(
+               bubble_user_id
+             )}&is_active=is.true`
+           );
+           const arr = cR.ok ? await cR.json() : [];
+           seats_used = Array.isArray(arr) ? arr.length : 0;
          }
-       );
-       const userArr = userR.ok ? await userR.json() : [];
-       const userRow = userArr?.[0] || {};
-       const seats_limit = Number.isFinite(Number(userRow.seats_limit))
-         ? Number(userRow.seats_limit)
-         : 1;
+       } catch {
+         // im Zweifel keine Blockade
+       }
    
-       // (Optional) Subscription-Gate – wenn du Status/Expiry prüfen willst:
-       // const subActive = !userRow.subscription_expires_at || new Date(userRow.subscription_expires_at) > new Date();
-       // const subOk = (userRow.subscription_status || "active") !== "canceled" && subActive;
-       // if (!subOk) return backWithError(return_to, "subscription_inactive");
-   
-       // ---- aktive Verbindungen zählen (nur is_active = true!)
-       const activeConnResp = await fetch(
-         `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?select=id&bubble_user_id=eq.${encodeURIComponent(
-           bubble_user_id
-         )}&is_active=is.true`,
-         {
-           headers: {
-             apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-             Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-           },
-         }
-       );
-       const activeConns = activeConnResp.ok ? await activeConnResp.json() : [];
-       const seats_used = Array.isArray(activeConns) ? activeConns.length : 0;
-   
+       // Subscription-Validierung (optional – so wie bisher)
+       const subActive =
+         sub_status !== "canceled" &&
+         (!sub_expires || new Date(sub_expires) > new Date());
+       if (!subActive) {
+         return backWithError(return_to, "subscription_required");
+       }
        if (seats_used >= seats_limit) {
          return backWithError(return_to, "seat_limit_reached");
        }
    
-       // ---- bestehende Verbindung suchen (auch wenn aktuell inaktiv)
+       // --- vorhandene Verbindung suchen
        const existing = await fetch(
          `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?` +
            `select=id,refresh_token_enc,cron_bucket,is_active&` +
@@ -1925,27 +1918,25 @@ const routes = {
          }
        )
          .then((r) => r.json())
-         .then((a) => (Array.isArray(a) && a[0]) ? a[0] : null)
+         .then((a) => (Array.isArray(a) && a[0] ? a[0] : null))
          .catch(() => null);
    
-       // ---- Token Encryption
+       // --- Tokens verschlüsseln
        let refresh_token_enc = null;
-       if (tokenJson.refresh_token) {
-         refresh_token_enc = encToken(tokenJson.refresh_token);
+       if (tokenRes.refresh_token) {
+         refresh_token_enc = encToken(tokenRes.refresh_token);
        } else if (existing?.refresh_token_enc) {
-         // Spotify schickt beim Reconnect nicht immer einen refresh_token
          refresh_token_enc = existing.refresh_token_enc;
        } else {
-         // Ohne Refresh-Token können wir die Verbindung nicht dauerhaft halten
-         return backWithError(return_to, "consent_required");
+         return backWithError(return_to, "no_refresh_token_consent_required");
        }
    
-       const access_token_enc = encToken(tokenJson.access_token);
+       const access_token_enc = encToken(tokenRes.access_token);
        const access_expires_at = new Date(
-         Date.now() + (tokenJson.expires_in || 3600) * 1000
+         Date.now() + (tokenRes.expires_in || 3600) * 1000
        ).toISOString();
    
-       // stabilen cron_bucket beibehalten (0..59)
+       // stabiler Cron-Bucket
        const cron_bucket = Number.isInteger(existing?.cron_bucket)
          ? existing.cron_bucket
          : Math.floor(Math.random() * 60);
@@ -1961,16 +1952,14 @@ const routes = {
          access_token_enc,
          access_expires_at,
          cron_bucket,
-         is_active: true,     // << Reconnect aktivieren
-         disabled_at: null,   // << evtl. früheres Deaktivierungsdatum entfernen
        };
    
-       // ---- Upsert
+       // ---- Upsert (robust): wenn vorhanden -> PATCH per id; sonst INSERT
        if (existing) {
          const up = await fetch(
-           `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?` +
-             `bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&` +
-             `spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}`,
+           `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?id=eq.${encodeURIComponent(
+             existing.id
+           )}`,
            {
              method: "PATCH",
              headers: {
@@ -1979,12 +1968,38 @@ const routes = {
                "Content-Type": "application/json",
                Prefer: "return=representation",
              },
-             body: JSON.stringify(payload),
+             body: JSON.stringify({
+               ...payload,
+               is_active: true,      // Re-Enable
+               disabled_at: null,    // Soft-Delete zurücksetzen
+               updated_at: new Date().toISOString(),
+             }),
            }
          );
+   
          if (!up.ok) {
-           const t = await up.text().catch(() => "");
-           return backWithError(return_to, "supabase_patch_failed");
+           return backWithError(return_to, `supabase_patch_failed_${up.status}`);
+         }
+   
+         // Sicherheitscheck: is_active wirklich true?
+         try {
+           const vr = await fetch(
+             `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?select=id,is_active,disabled_at&limit=1&id=eq.${encodeURIComponent(
+               existing.id
+             )}`,
+             {
+               headers: {
+                 apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+                 Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+               },
+             }
+           );
+           const vj = vr.ok ? await vr.json() : [];
+           if (!vj?.[0]?.is_active) {
+             return backWithError(return_to, "reconnect_is_active_still_false");
+           }
+         } catch {
+           // ignorierbar
          }
        } else {
          const ins = await fetch(
@@ -1997,27 +2012,32 @@ const routes = {
                "Content-Type": "application/json",
                Prefer: "return=representation",
              },
-             body: JSON.stringify(payload),
+             body: JSON.stringify({
+               ...payload,
+               is_active: true,
+               disabled_at: null,
+               created_at: new Date().toISOString(),
+               updated_at: new Date().toISOString(),
+             }),
            }
          );
          if (!ins.ok) {
-           const t = await ins.text().catch(() => "");
-           return backWithError(return_to, "supabase_insert_failed");
+           return backWithError(return_to, `supabase_insert_failed_${ins.status}`);
          }
        }
    
-       // ---- Erfolg → zurück ins UI
-       const sep = (return_to || "/").includes("?") ? "&" : "?";
-       const back = `${return_to || "/"}${sep}spotify_linked=1&spotify_user=${encodeURIComponent(
+       // --- erfolgreicher Abschluss → zurück ins UI
+       const qs = `?spotify_linked=1&spotify_user=${encodeURIComponent(
          spotify_user_id
        )}`;
+       const back = (return_to || "/") + qs;
        return res.redirect(back);
      } catch (e) {
-       const msg = e && e.message ? e.message : "callback_exception";
-       // keine Details leaken, nur generischer Fehlercode
-       return res.redirect(`/${"?spotify_error=" + encodeURIComponent(msg)}`);
+       const msg = e?.message || String(e);
+       return backWithError("/", `callback_exception_${encodeURIComponent(msg)}`);
      }
    },
+
 
 
 
