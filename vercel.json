@@ -1,7 +1,7 @@
 {
   "crons": [
-    { "path": "/api/watch/cron-all",              "schedule": "* * * * *" },
-    { "path": "/api/followers/cron-refresh-all",  "schedule": "* * * * *" },
-    { "path": "/api/watch/cron-maintenance-all",  "schedule": "0 4 * * *" }
+    { "path": "/api/followers/cron-refresh-all", "schedule": "* * * * *" },
+    { "path": "/api/watch/cron-all",             "schedule": "* * * * *" },
+    { "path": "/api/watch/cron-maintenance-all", "schedule": "0 4 * * *" }
   ]
 }
