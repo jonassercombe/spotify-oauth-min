@@ -57,12 +57,13 @@ function checkCronAuth(req) {
   const gotAuth = req.headers?.authorization || "";
   const url = new URL(req.url, `http://${req.headers.host}`);
   const qpKey = url.searchParams.get("key") || url.searchParams.get("cron_secret");
-  const isVercelCron = req.headers["x-vercel-cron"] === "1" || process.env.VERCEL === "1";
+  const isVercelCron = (req.headers["x-vercel-cron"] === "1") && (process.env.VERCEL === "1");
 
   if (want && (gotAuth === `Bearer ${want}` || qpKey === want)) return true;
-  if (isVercelCron) return true;      // erlaubt Aufrufe vom Vercel Scheduler
-  return !want;                       // falls kein Secret gesetzt ist, erlauben
+  if (isVercelCron) return true;
+  return !want;  // falls ohne Secret explizit offen gewünscht
 }
+
 
 function checkAppSecret(req) {
   const want = process.env.APP_WEBHOOK_SECRET;
