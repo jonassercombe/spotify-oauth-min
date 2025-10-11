@@ -2273,14 +2273,14 @@ const routes = {
 
 
   /* ---------- playlists/refresh-followers (POST, secret) ----------
-    Body: { connection_id: uuid }
-    Query (optional):
-      stale_hours=23
-      max=600
-      concurrency=3      // wir nutzen sie intern moderat (2-4)
-      batch=100
-      only_playlist_id=<uuid>  // Single-Playlist Test
-   */
+       Body: { connection_id: uuid }
+       Query (optional):
+         stale_hours=23
+         max=600
+         concurrency=3      // wir nutzen sie intern moderat (2-4)
+         batch=100
+         only_playlist_id=<uuid>  // Single-Playlist Test
+      */
    "playlists/refresh-followers": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
      if (process.env.APP_WEBHOOK_SECRET) {
@@ -2377,6 +2377,13 @@ const routes = {
          }
    
          if (ok) {
+           // (Debug) Log, was wirklich von Spotify kam
+           console.log("followers:fresh", {
+             playlist_row_id: row.id,
+             spotify_playlist_id: row.playlist_id,
+             followers
+           });
+   
            // 4a) playlists patchen (SOURCE OF TRUTH im UI)
            const patch = await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(row.id)}`, {
              method: "PATCH",
@@ -2402,27 +2409,17 @@ const routes = {
          return json(res, 200, { ok:true, attempted: playlistsToUpdate.length, updated:0, daily_upserts:0, reason:"no_fresh_values" });
        }
    
-       // 5) Daily upserten – aus der DB re-lesen (sicher, dass wir den DB-Stand schreiben)
-       const ids = freshResults.map(fr => fr.row.id);
-       const inList = `(${ids.join(",")})`;
-       const latestR = await sb(
-         `/rest/v1/playlists?select=id,followers&` +
-         `id=in.${encodeURIComponent(inList)}`
-       );
-       if (!latestR.ok) return bad(res, 500, `supabase_reselect_failed: ${await latestR.text()}`);
-       const latest = await latestR.json();
-       const byId = new Map(latest.map(x => [x.id, x.followers || 0]));
-   
-       const dailyRows = ids.map(pid => ({
-         playlist_id: pid,
-         bubble_user_id: freshResults.find(fr => fr.row.id === pid)?.row.bubble_user_id || null,
+       // 5) Daily upserten – direkt die frisch geholten Spotify-Werte verwenden (kein Re-Select aus playlists)
+       const dailyRows = freshResults.map(fr => ({
+         playlist_id: fr.row.id,
+         bubble_user_id: fr.row.bubble_user_id || null,
          day: today,
-         followers: Number(byId.get(pid) || 0)
+         followers: Number(fr.followers || 0)
        }));
    
        let dailyUpserts = 0;
-       for (let i=0; i<dailyRows.length; i+=perWrite) {
-         const chunk = dailyRows.slice(i, i+perWrite);
+       for (let i = 0; i < dailyRows.length; i += perWrite) {
+         const chunk = dailyRows.slice(i, i + perWrite);
          const up = await sb(`/rest/v1/playlist_followers_daily?on_conflict=playlist_id,day`, {
            method: "POST",
            headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
@@ -2443,6 +2440,7 @@ const routes = {
        return bad(res, 500, `refresh_followers_exception: ${e?.message || e}`);
      }
    },
+
 
 
 
