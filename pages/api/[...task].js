@@ -2274,14 +2274,14 @@ const routes = {
 
 
   /* ---------- playlists/refresh-followers (POST, secret) ----------
-       Body: { connection_id: uuid }
-       Query (optional):
-         stale_hours=23
-         max=600
-         concurrency=3      // wir nutzen sie intern moderat (2-4)
-         batch=100
-         only_playlist_id=<uuid>  // Single-Playlist Test
-      */
+          Body: { connection_id: uuid }
+          Query (optional):
+            stale_hours=23
+            max=600
+            concurrency=3      // wir nutzen sie intern moderat (2-4)
+            batch=100
+            only_playlist_id=<uuid>  // Single-Playlist Test
+         */
    "playlists/refresh-followers": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
      if (process.env.APP_WEBHOOK_SECRET) {
@@ -2306,7 +2306,7 @@ const routes = {
        if (!conn) return bad(res, 404, "connection_not_found");
        if (conn.is_active === false) return json(res, 200, { ok:true, skipped:true, reason:"connection_inactive" });
    
-       // 2) Kandidaten-Playlists bestimmen
+       // 2) Kandidaten-Playlists bestimmen (stale window)
        let playlistsToUpdate = [];
        if (onlyPid) {
          const oneR = await sb(
@@ -2333,18 +2333,42 @@ const routes = {
          playlistsToUpdate = await selR.json();
        }
    
+       // 2b) SAFETY: Heute-Row garantieren → alle Owned/Public ziehen & fehlende „heute“-Rows ergänzen
+       const today  = new Date().toISOString().slice(0,10); // UTC YYYY-MM-DD
+       const allR = await sb(
+         `/rest/v1/playlists?select=id,playlist_id,bubble_user_id,followers` +
+         `&connection_id=eq.${encodeURIComponent(connection_id)}` +
+         `&is_owner=is.true&is_public=is.true`
+       );
+       const allOwned = allR.ok ? await allR.json() : [];
+       if (allOwned.length) {
+         const inList = `(${allOwned.map(p => p.id).join(",")})`; // UUIDs ohne Quotes ok
+         const dR = await sb(
+           `/rest/v1/playlist_followers_daily?select=playlist_id` +
+           `&playlist_id=in.${encodeURIComponent(inList)}` +
+           `&day=eq.${encodeURIComponent(today)}`
+         );
+         const haveToday = new Set((dR.ok ? await dR.json() : []).map(r => r.playlist_id));
+         const seen = new Set(playlistsToUpdate.map(p => p.id));
+         for (const p of allOwned) {
+           if (!haveToday.has(p.id) && !seen.has(p.id)) {
+             playlistsToUpdate.push(p); // heute noch keine Row → heute zwingend versuchen
+             seen.add(p.id);
+           }
+         }
+       }
+   
        if (!Array.isArray(playlistsToUpdate) || playlistsToUpdate.length === 0) {
-         return json(res, 200, { ok:true, attempted:0, updated:0, daily_upserts:0, reason:"up_to_date" });
+         // Nichts zu tun, aber evtl. gab es bereits Today-Rows; melden wir sauber zurück.
+         return json(res, 200, { ok:true, attempted:0, updated:0, daily_upserts:0, fallback_upserts:0, reason:"up_to_date" });
        }
    
        // 3) Spotify Token
        const access_token = await getAccessTokenFromConnection(connection_id);
    
-       // 4) Pro Playlist frischen Wert holen (sequentiell + Backoff, robust & simpel)
+       // 4) Pro Playlist frischen Wert holen (sequentiell + Backoff, robust)
        const nowIso = new Date().toISOString();
-       const today  = new Date().toISOString().slice(0,10); // UTC YYYY-MM-DD
-   
-       const freshResults = []; // { row, followers } nur wenn echt geholt
+       const freshResults = []; // { row, followers }
    
        for (const row of playlistsToUpdate) {
          const id = row.playlist_id;
@@ -2364,11 +2388,11 @@ const routes = {
            }
            const { json, text } = await parseJsonSafe(r);
            if (!r.ok) {
-             // not fatal: markiere followers_checked_at, gehe weiter
+             // WICHTIG: Bei Fehlern NICHT followers_checked_at hochzählen, damit sie bald erneut versucht wird
              await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(row.id)}`, {
                method: "PATCH",
                headers: { Prefer: "return=minimal" },
-               body: JSON.stringify({ followers_checked_at: nowIso, updated_at: nowIso })
+               body: JSON.stringify({ updated_at: nowIso })
              }).catch(()=>{});
              break;
            }
@@ -2378,14 +2402,13 @@ const routes = {
          }
    
          if (ok) {
-           // (Debug) Log, was wirklich von Spotify kam
            console.log("followers:fresh", {
              playlist_row_id: row.id,
              spotify_playlist_id: row.playlist_id,
              followers
            });
    
-           // 4a) playlists patchen (SOURCE OF TRUTH im UI)
+           // Erfolgreich → playlists patchen (SOURCE OF TRUTH im UI)
            const patch = await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(row.id)}`, {
              method: "PATCH",
              headers: { Prefer: "return=minimal" },
@@ -2398,49 +2421,89 @@ const routes = {
            if (!patch.ok) return bad(res, 500, `supabase playlists patch failed: ${await patch.text()}`);
    
            freshResults.push({ row, followers });
-         } else {
-           // kein frischer Wert -> keine daily-Zeile erzeugen
          }
    
          // kleiner Jitter
          await sleep(40);
        }
    
-       if (freshResults.length === 0) {
-         return json(res, 200, { ok:true, attempted: playlistsToUpdate.length, updated:0, daily_upserts:0, reason:"no_fresh_values" });
+       // 5) Daily upserten – direkt die frisch geholten Spotify-Werte verwenden
+       let dailyUpserts = 0;
+       if (freshResults.length > 0) {
+         const dailyRows = freshResults.map(fr => ({
+           playlist_id: fr.row.id,
+           bubble_user_id: fr.row.bubble_user_id || null,
+           day: today,
+           followers: Number(fr.followers || 0)
+         }));
+   
+         for (let i = 0; i < dailyRows.length; i += perWrite) {
+           const chunk = dailyRows.slice(i, i + perWrite);
+           const up = await sb(`/rest/v1/playlist_followers_daily?on_conflict=playlist_id,day`, {
+             method: "POST",
+             headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+             body: JSON.stringify(chunk)
+           });
+           if (!up.ok) return bad(res, 500, `supabase daily upsert failed: ${await up.text()}`);
+           dailyUpserts += chunk.length;
+           await sleep(20);
+         }
        }
    
-       // 5) Daily upserten – direkt die frisch geholten Spotify-Werte verwenden (kein Re-Select aus playlists)
-       const dailyRows = freshResults.map(fr => ({
-         playlist_id: fr.row.id,
-         bubble_user_id: fr.row.bubble_user_id || null,
-         day: today,
-         followers: Number(fr.followers || 0)
-       }));
+       // 6) SAFETY NET: Falls es Playlists ohne „heute“-Row gibt (und kein frischer Wert),
+       // schreibe einen Today-Row mit dem aktuell bekannten playlists.followers.
+       let fallbackUpserts = 0;
+       if (allOwned.length) {
+         // Neu laden, welche heute bereits existieren (inkl. gerade frisch upserteter)
+         const inList2 = `(${allOwned.map(p => p.id).join(",")})`;
+         const dR2 = await sb(
+           `/rest/v1/playlist_followers_daily?select=playlist_id` +
+           `&playlist_id=in.${encodeURIComponent(inList2)}` +
+           `&day=eq.${encodeURIComponent(today)}`
+         );
+         const haveTodayNow = new Set((dR2.ok ? await dR2.json() : []).map(r => r.playlist_id));
+         const dailyFallbackRows = [];
+         const freshSet = new Set(freshResults.map(fr => fr.row.id));
    
-       let dailyUpserts = 0;
-       for (let i = 0; i < dailyRows.length; i += perWrite) {
-         const chunk = dailyRows.slice(i, i + perWrite);
-         const up = await sb(`/rest/v1/playlist_followers_daily?on_conflict=playlist_id,day`, {
-           method: "POST",
-           headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-           body: JSON.stringify(chunk)
-         });
-         if (!up.ok) return bad(res, 500, `supabase daily upsert failed: ${await up.text()}`);
-         dailyUpserts += chunk.length;
-         await sleep(20);
+         for (const p of allOwned) {
+           if (!haveTodayNow.has(p.id)) {
+             // Noch kein Today-Row → Fallback mit letztem bekannten Stand
+             dailyFallbackRows.push({
+               playlist_id: p.id,
+               bubble_user_id: p.bubble_user_id || null,
+               day: today,
+               followers: Number(p.followers ?? 0)
+             });
+           }
+         }
+   
+         if (dailyFallbackRows.length) {
+           for (let i = 0; i < dailyFallbackRows.length; i += perWrite) {
+             const chunk = dailyFallbackRows.slice(i, i + perWrite);
+             const up = await sb(`/rest/v1/playlist_followers_daily?on_conflict=playlist_id,day`, {
+               method: "POST",
+               headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+               body: JSON.stringify(chunk)
+             });
+             if (!up.ok) return bad(res, 500, `supabase daily fallback upsert failed: ${await up.text()}`);
+             fallbackUpserts += chunk.length;
+             await sleep(20);
+           }
+         }
        }
    
        return json(res, 200, {
          ok: true,
          attempted: playlistsToUpdate.length,
          updated: freshResults.length,
-         daily_upserts: dailyUpserts
+         daily_upserts: dailyUpserts,
+         fallback_upserts: fallbackUpserts
        });
      } catch (e) {
        return bad(res, 500, `refresh_followers_exception: ${e?.message || e}`);
      }
    },
+
 
 
 
