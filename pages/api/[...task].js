@@ -1847,7 +1847,7 @@ const routes = {
 
   /* ---------- oauth/spotify/callback (GET) ---------- */
    "oauth/spotify/callback": async (req, res) => {
-     // Redirect-Helfer für Fehler
+     // Helfer für Redirects mit Fehlercode (inkl. kurzer PostgREST-Fehlermeldung)
      const backWithError = (return_to, code) => {
        const base = return_to || "/";
        const sep = base.includes("?") ? "&" : "?";
@@ -1855,7 +1855,7 @@ const routes = {
      };
    
      try {
-       // --- Env prüfen
+       // --- Env-Guards (werfen Error, wenn etwas fehlt)
        const assertEnv = (n) => need(n);
        assertEnv("SPOTIFY_CLIENT_ID");
        assertEnv("SPOTIFY_CLIENT_SECRET");
@@ -1864,7 +1864,7 @@ const routes = {
        assertEnv("SUPABASE_SERVICE_ROLE_KEY");
        assertEnv("ENC_SECRET");
    
-       // --- Query-Params
+       // --- Query
        const code  = req.query.code;
        const state = req.query.state;
        if (!code || !state) return backWithError("/", "missing_code_or_state");
@@ -1887,10 +1887,7 @@ const routes = {
          headers: {
            "Content-Type": "application/x-www-form-urlencoded",
            Authorization:
-             "Basic " +
-             Buffer.from(
-               `${process.env.SPOTIFY_CLIENT_ID}:${process.env.SPOTIFY_CLIENT_SECRET}`
-             ).toString("base64"),
+             "Basic " + Buffer.from(`${process.env.SPOTIFY_CLIENT_ID}:${process.env.SPOTIFY_CLIENT_SECRET}`).toString("base64"),
          },
          body: new URLSearchParams({
            grant_type: "authorization_code",
@@ -1903,7 +1900,7 @@ const routes = {
          return backWithError(return_to, "token_exchange_failed");
        }
    
-       // --- /me ziehen
+       // --- /me
        const meResp = await fetch("https://api.spotify.com/v1/me", {
          headers: { Authorization: `Bearer ${tokenRes.access_token}` },
        });
@@ -1927,14 +1924,13 @@ const routes = {
          body: JSON.stringify({ bubble_user_id }),
        }).catch(() => {});
    
-       // --- Seats-Gate (nur aktive)
+       // --- Seats/Sub Gate (sanft, blockiert kein Debug)
        let seats_limit = 1;
        let seats_used  = 0;
        let sub_status  = "active";
        let sub_expires = null;
-   
        try {
-         // 1) aus app_users lesen
+         // 1) app_users lesen
          const uR = await sb(
            `/rest/v1/app_users?select=seats_limit,seats_used,subscription_status,subscription_expires_at` +
            `&limit=1&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}`
@@ -1946,8 +1942,7 @@ const routes = {
            sub_status  = String(u.subscription_status || "active");
            sub_expires = u.subscription_expires_at || null;
          }
-   
-         // 2) Fallback: live zählen, falls seats_used fehlt
+         // 2) Fallback zählen
          if (!Number.isFinite(seats_used)) {
            const cR = await sb(
              `/rest/v1/spotify_connections?select=id` +
@@ -1957,25 +1952,16 @@ const routes = {
            const arr = cR.ok ? await cR.json() : [];
            seats_used = Array.isArray(arr) ? arr.length : 0;
          }
-       } catch {
-         // bei Fehlern nicht blocken
-       }
+       } catch { /* nicht blockend */ }
    
-       // Subscription-Validierung (optional – wie zuvor)
-       const subActive =
-         sub_status !== "canceled" &&
-         (!sub_expires || new Date(sub_expires) > new Date());
-       if (!subActive) {
-         return backWithError(return_to, "subscription_required");
-       }
-       if (seats_used >= seats_limit) {
-         return backWithError(return_to, "seat_limit_reached");
-       }
+       const subActive = sub_status !== "canceled" && (!sub_expires || new Date(sub_expires) > new Date());
+       if (!subActive) return backWithError(return_to, "subscription_required");
+       if (seats_used >= seats_limit) return backWithError(return_to, "seat_limit_reached");
    
-       // --- vorhandene Verbindung suchen (neueste zuerst, falls Dubletten)
+       // --- vorhandene Verbindung suchen (neueste zuerst)
        const existing = await fetch(
          `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?` +
-           `select=id,refresh_token_enc,cron_bucket,is_active,disabled_at,created_at&` +
+           `select=id,refresh_token_enc,cron_bucket,is_active,disabled_at,disconnected_at,created_at&` +
            `bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&` +
            `spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}&` +
            `order=created_at.desc&limit=1`,
@@ -1990,7 +1976,7 @@ const routes = {
          .then((a) => (Array.isArray(a) && a[0] ? a[0] : null))
          .catch(() => null);
    
-       // --- Tokens verschlüsseln
+       // --- Tokens verschlüsseln (Refresh kann bei Re-Consent fehlen -> existing reuse)
        let refresh_token_enc = null;
        if (tokenRes.refresh_token) {
          refresh_token_enc = encToken(tokenRes.refresh_token);
@@ -2001,9 +1987,7 @@ const routes = {
        }
    
        const access_token_enc = encToken(tokenRes.access_token);
-       const access_expires_at = new Date(
-         Date.now() + (tokenRes.expires_in || 3600) * 1000
-       ).toISOString();
+       const access_expires_at = new Date(Date.now() + (tokenRes.expires_in || 3600) * 1000).toISOString();
    
        // stabiler Cron-Bucket
        const cron_bucket = Number.isInteger(existing?.cron_bucket)
@@ -2022,8 +2006,9 @@ const routes = {
          cron_bucket,
        };
    
-       // ---- Upsert: wenn vorhanden → PATCH per id; sonst INSERT
+       // ---- Upsert-Pfade
        if (existing) {
+         // Re-Enable bestehender Datensatz
          const up = await fetch(
            `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?id=eq.${encodeURIComponent(existing.id)}`,
            {
@@ -2036,27 +2021,31 @@ const routes = {
              },
              body: JSON.stringify({
                ...payload,
-               is_active: true,      // Re-Enable
-               disabled_at: null,    // Soft-Delete zurücksetzen
+               is_active: true,
+               disabled_at: null,
+               disconnected_at: null, // <— wichtig bei Re-Aktivierung
                updated_at: new Date().toISOString(),
              }),
            }
          );
          if (!up.ok) {
-           return backWithError(return_to, `supabase_patch_failed_${up.status}`);
+           const errTxt = (await up.text().catch(() => "")) || "";
+           const msg = `supabase_patch_failed_${up.status}:${encodeURIComponent(errTxt.slice(0, 280))}`;
+           return backWithError(return_to, msg);
          }
    
-         // Sicherheits-Update (breit) – falls Dublett/andere Zeile die aktive ist
+         // Sicherheits-Update (breit) – falls es Dubletten gibt
          await sb(
            `/rest/v1/spotify_connections?bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
            `&spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}`,
            {
              method: "PATCH",
              headers: { Prefer: "return=minimal" },
-             body: JSON.stringify({ is_active: true, disabled_at: null, updated_at: new Date().toISOString() })
+             body: JSON.stringify({ is_active: true, disabled_at: null, disconnected_at: null, updated_at: new Date().toISOString() })
            }
-         ).catch(()=>{});
+         ).catch(() => {});
        } else {
+         // Neuer Datensatz
          const ins = await fetch(
            `${process.env.SUPABASE_URL}/rest/v1/spotify_connections`,
            {
@@ -2069,23 +2058,26 @@ const routes = {
              },
              body: JSON.stringify({
                ...payload,
-               is_active: true,
+               is_active: true,               // hat zwar Default, aber explizit ist okay
                disabled_at: null,
-               created_at: new Date().toISOString(),
+               disconnected_at: null,
+               created_at: new Date().toISOString(), // hat Default – schadet nicht
                updated_at: new Date().toISOString(),
              }),
            }
          );
          if (!ins.ok) {
-           return backWithError(return_to, `supabase_insert_failed_${ins.status}`);
+           const errTxt = (await ins.text().catch(() => "")) || "";
+           const msg = `supabase_insert_failed_${ins.status}:${encodeURIComponent(errTxt.slice(0, 280))}`;
+           return backWithError(return_to, msg);
          }
        }
    
-       // --- Verifizieren: ist jetzt aktiv?
+       // --- Verifizieren: ist aktiv?
        try {
          const vr = await fetch(
            `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?` +
-             `select=id,is_active,disabled_at&limit=1&` +
+             `select=id,is_active,disabled_at,disconnected_at&limit=1&` +
              `bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&` +
              `spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}`,
            {
@@ -2099,11 +2091,9 @@ const routes = {
          if (!vj?.[0]?.is_active) {
            return backWithError(return_to, "is_active_update_failed");
          }
-       } catch {
-         // ignorierbar
-       }
+       } catch { /* ignorable */ }
    
-       // --- seats_used sofort neu berechnen & in app_users schreiben
+       // --- seats_used neu berechnen
        try {
          const cR = await sb(
            `/rest/v1/spotify_connections?select=id&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&is_active=is.true`
@@ -2115,8 +2105,8 @@ const routes = {
            method: "PATCH",
            headers: { Prefer: "return=minimal" },
            body: JSON.stringify({ seats_used: used, updated_at: new Date().toISOString() })
-         }).catch(()=>{});
-       } catch {/* no-op */}
+         }).catch(() => {});
+       } catch { /* no-op */ }
    
        // --- zurück ins UI
        const qs = `?spotify_linked=1&spotify_user=${encodeURIComponent(spotify_user_id)}`;
@@ -2127,6 +2117,7 @@ const routes = {
        return backWithError("/", `callback_exception_${encodeURIComponent(msg)}`);
      }
    },
+
 
 
 
