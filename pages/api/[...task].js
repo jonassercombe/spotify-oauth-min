@@ -1816,61 +1816,93 @@ const routes = {
     });
   },
 
-  /* ---------- oauth/spotify/start (GET) ---------- */
-  "oauth/spotify/start": async (req, res) => {
-    if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
-    if (!process.env.SPOTIFY_CLIENT_ID || !process.env.SPOTIFY_REDIRECT_URI) {
-      return res.status(500).send("Server misconfigured: missing SPOTIFY_CLIENT_ID or SPOTIFY_REDIRECT_URI");
-    }
-    const { bubble_user_id, label = "", return_to = "" } = req.query;
-    if (!bubble_user_id) return res.status(400).send("Missing query param: bubble_user_id");
-
-    const stateObj = { bubble_user_id, label, return_to, nonce: Math.random().toString(36).slice(2) };
-    const state = Buffer.from(JSON.stringify(stateObj)).toString("base64url");
-
-    const scope = [
-      "playlist-read-private",
-      "playlist-modify-private",
-      "playlist-modify-public"
-    ].join(" ");
-
-    const url =
-      "https://accounts.spotify.com/authorize" +
-      `?client_id=${encodeURIComponent(process.env.SPOTIFY_CLIENT_ID)}` +
-      `&response_type=code` +
-      `&redirect_uri=${encodeURIComponent(process.env.SPOTIFY_REDIRECT_URI)}` +
-      `&scope=${encodeURIComponent(scope)}` +
-      `&state=${encodeURIComponent(state)}` +
-      `&show_dialog=true`;
-
-    return res.redirect(url);
-  },
-
-  /* ---------- oauth/spotify/callback (GET) ---------- */
+   
+  /* ===========================
+      oauth/spotify/start (GET)
+      =========================== */
+   "oauth/spotify/start": async (req, res) => {
+     try {
+       const needEnv = (n) => need(n);
+       const CLIENT_ID     = needEnv("SPOTIFY_CLIENT_ID");
+       const REDIRECT_URI  = needEnv("SPOTIFY_REDIRECT_URI");
+   
+       // Eingaben
+       const bubble_user_id = String(req.query.bubble_user_id || "").trim();
+       const return_to      = String(req.query.return_to || "/").trim();
+       const label          = String(req.query.label || "").trim();
+   
+       if (!bubble_user_id) {
+         const base = return_to || "/";
+         const sep  = base.includes("?") ? "&" : "?";
+         return res.redirect(`${base}${sep}spotify_error=missing_bubble_user_id`);
+       }
+   
+       // Scopes – je nach Feature erweitern
+       const SCOPES = [
+         "playlist-read-private",
+         "playlist-modify-private",
+         "playlist-modify-public",
+       ];
+   
+       // state sicher verpacken (base64url, ohne Padding)
+       const stateObj = {
+         bubble_user_id,
+         return_to,
+         label,
+         nonce: Math.random().toString(36).slice(2),
+         issued_at: Date.now()
+       };
+       const state = Buffer.from(JSON.stringify(stateObj)).toString("base64url");
+   
+       // WICHTIG: show_dialog=true erzwingt den Consent-Dialog,
+       // prompt=consent ist ein zusätzliches Hint (von vielen Libs verwendet)
+       const params = new URLSearchParams({
+         response_type: "code",
+         client_id: CLIENT_ID,
+         redirect_uri: REDIRECT_URI,
+         scope: SCOPES.join(" "),
+         state,
+         show_dialog: "true",
+         prompt: "consent"
+       });
+   
+       const url = `https://accounts.spotify.com/authorize?${params.toString()}`;
+       return res.redirect(url);
+     } catch (e) {
+       const msg = encodeURIComponent(e?.message || String(e));
+       const back = String(req.query.return_to || "/");
+       const sep = back.includes("?") ? "&" : "?";
+       return res.redirect(`${back}${sep}spotify_error=start_exception_${msg}`);
+     }
+   },
+   
+   /* ===============================
+      oauth/spotify/callback (GET)
+      =============================== */
    "oauth/spotify/callback": async (req, res) => {
-     // Helfer für Redirects mit Fehlercode (inkl. kurzer PostgREST-Fehlermeldung)
+     // Redirect-Helfer
      const backWithError = (return_to, code) => {
        const base = return_to || "/";
-       const sep = base.includes("?") ? "&" : "?";
+       const sep  = base.includes("?") ? "&" : "?";
        return res.redirect(`${base}${sep}spotify_error=${encodeURIComponent(code)}`);
      };
    
      try {
-       // --- Env-Guards (werfen Error, wenn etwas fehlt)
+       // Env prüfen
        const assertEnv = (n) => need(n);
-       assertEnv("SPOTIFY_CLIENT_ID");
-       assertEnv("SPOTIFY_CLIENT_SECRET");
-       assertEnv("SPOTIFY_REDIRECT_URI");
-       assertEnv("SUPABASE_URL");
-       assertEnv("SUPABASE_SERVICE_ROLE_KEY");
+       const CLIENT_ID     = assertEnv("SPOTIFY_CLIENT_ID");
+       const CLIENT_SECRET = assertEnv("SPOTIFY_CLIENT_SECRET");
+       const REDIRECT_URI  = assertEnv("SPOTIFY_REDIRECT_URI");
+       const SB_URL        = assertEnv("SUPABASE_URL");
+       const SB_KEY        = assertEnv("SUPABASE_SERVICE_ROLE_KEY");
        assertEnv("ENC_SECRET");
    
-       // --- Query
+       // Query
        const code  = req.query.code;
        const state = req.query.state;
        if (!code || !state) return backWithError("/", "missing_code_or_state");
    
-       // --- state decodieren
+       // state decodieren
        let parsed;
        try {
          parsed = JSON.parse(Buffer.from(state, "base64url").toString("utf8"));
@@ -1878,22 +1910,21 @@ const routes = {
          return backWithError("/", "invalid_state");
        }
        const bubble_user_id = parsed.bubble_user_id;
-       const label     = parsed.label || "";
-       const return_to = parsed.return_to || "/";
+       const label          = parsed.label || "";
+       const return_to      = parsed.return_to || "/";
        if (!bubble_user_id) return backWithError(return_to, "missing_user_in_state");
    
-       // --- Token-Exchange
+       // Token-Exchange
        const tokenRes = await fetch("https://accounts.spotify.com/api/token", {
          method: "POST",
          headers: {
            "Content-Type": "application/x-www-form-urlencoded",
-           Authorization:
-             "Basic " + Buffer.from(`${process.env.SPOTIFY_CLIENT_ID}:${process.env.SPOTIFY_CLIENT_SECRET}`).toString("base64"),
+           Authorization: "Basic " + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64"),
          },
          body: new URLSearchParams({
            grant_type: "authorization_code",
            code,
-           redirect_uri: process.env.SPOTIFY_REDIRECT_URI,
+           redirect_uri: REDIRECT_URI,
          }),
        }).then((r) => r.json());
    
@@ -1901,7 +1932,7 @@ const routes = {
          return backWithError(return_to, "token_exchange_failed");
        }
    
-       // --- /me
+       // /me holen
        const meResp = await fetch("https://api.spotify.com/v1/me", {
          headers: { Authorization: `Bearer ${tokenRes.access_token}` },
        });
@@ -1910,28 +1941,27 @@ const routes = {
        }
        const me = await meResp.json();
        const spotify_user_id = me.id;
-       const display_name = me.display_name || label || "";
-       const avatar_url = (me.images && me.images[0]?.url) || null;
+       const display_name    = me.display_name || label || "";
+       const avatar_url      = (me.images && me.images[0]?.url) || null;
    
-       // --- app_user idempotent anlegen
-       await fetch(`${process.env.SUPABASE_URL}/rest/v1/app_users?on_conflict=bubble_user_id`, {
+       // app_user idempotent anlegen
+       await fetch(`${SB_URL}/rest/v1/app_users?on_conflict=bubble_user_id`, {
          method: "POST",
          headers: {
-           apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-           Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+           apikey: SB_KEY,
+           Authorization: `Bearer ${SB_KEY}`,
            "Content-Type": "application/json",
            Prefer: "resolution=ignore-duplicates,return=minimal",
          },
          body: JSON.stringify({ bubble_user_id }),
        }).catch(() => {});
    
-       // --- Seats/Sub Gate (sanft, blockiert kein Debug)
+       // Seats/Sub-Gate (wie gehabt, nicht knallhart blockend implementiert – aber hier weiter genutzt)
        let seats_limit = 1;
        let seats_used  = 0;
        let sub_status  = "active";
        let sub_expires = null;
        try {
-         // 1) app_users lesen
          const uR = await sb(
            `/rest/v1/app_users?select=seats_limit,seats_used,subscription_status,subscription_expires_at` +
            `&limit=1&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}`
@@ -1943,7 +1973,6 @@ const routes = {
            sub_status  = String(u.subscription_status || "active");
            sub_expires = u.subscription_expires_at || null;
          }
-         // 2) Fallback zählen
          if (!Number.isFinite(seats_used)) {
            const cR = await sb(
              `/rest/v1/spotify_connections?select=id` +
@@ -1959,35 +1988,34 @@ const routes = {
        if (!subActive) return backWithError(return_to, "subscription_required");
        if (seats_used >= seats_limit) return backWithError(return_to, "seat_limit_reached");
    
-       // --- vorhandene Verbindung suchen (neueste zuerst)
+       // Vorhandene Verbindung suchen
        const existing = await fetch(
-         `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?` +
+         `${SB_URL}/rest/v1/spotify_connections?` +
            `select=id,refresh_token_enc,cron_bucket,is_active,disabled_at,disconnected_at,created_at&` +
            `bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&` +
            `spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}&` +
            `order=created_at.desc&limit=1`,
          {
-           headers: {
-             apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-             Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-           },
+           headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` },
          }
        )
          .then((r) => r.json())
          .then((a) => (Array.isArray(a) && a[0] ? a[0] : null))
          .catch(() => null);
    
-       // --- Tokens verschlüsseln (Refresh kann bei Re-Consent fehlen -> existing reuse)
+       // Tokens verschlüsseln (Refresh darf bei echtem Neu-Connect nicht fehlen)
        let refresh_token_enc = null;
        if (tokenRes.refresh_token) {
          refresh_token_enc = encToken(tokenRes.refresh_token);
        } else if (existing?.refresh_token_enc) {
+         // Reuse bei Re-Consent gleicher Spotify-User
          refresh_token_enc = existing.refresh_token_enc;
        } else {
+         // WICHTIG: Das passiert v. a. wenn der Consent nicht erzwungen wurde
          return backWithError(return_to, "no_refresh_token_consent_required");
        }
    
-       const access_token_enc = encToken(tokenRes.access_token);
+       const access_token_enc  = encToken(tokenRes.access_token);
        const access_expires_at = new Date(Date.now() + (tokenRes.expires_in || 3600) * 1000).toISOString();
    
        // stabiler Cron-Bucket
@@ -2007,16 +2035,15 @@ const routes = {
          cron_bucket,
        };
    
-       // ---- Upsert-Pfade
+       // Upsert
        if (existing) {
-         // Re-Enable bestehender Datensatz
          const up = await fetch(
-           `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?id=eq.${encodeURIComponent(existing.id)}`,
+           `${SB_URL}/rest/v1/spotify_connections?id=eq.${encodeURIComponent(existing.id)}`,
            {
              method: "PATCH",
              headers: {
-               apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-               Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+               apikey: SB_KEY,
+               Authorization: `Bearer ${SB_KEY}`,
                "Content-Type": "application/json",
                Prefer: "return=representation",
              },
@@ -2024,7 +2051,7 @@ const routes = {
                ...payload,
                is_active: true,
                disabled_at: null,
-               disconnected_at: null, // <— wichtig bei Re-Aktivierung
+               disconnected_at: null,
                updated_at: new Date().toISOString(),
              }),
            }
@@ -2035,38 +2062,39 @@ const routes = {
            return backWithError(return_to, msg);
          }
    
-         // Sicherheits-Update (breit) – falls es Dubletten gibt
+         // Sicherheits-Reenable falls Dubletten
          await sb(
            `/rest/v1/spotify_connections?bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
            `&spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}`,
            {
              method: "PATCH",
              headers: { Prefer: "return=minimal" },
-             body: JSON.stringify({ is_active: true, disabled_at: null, disconnected_at: null, updated_at: new Date().toISOString() })
+             body: JSON.stringify({
+               is_active: true,
+               disabled_at: null,
+               disconnected_at: null,
+               updated_at: new Date().toISOString()
+             })
            }
          ).catch(() => {});
        } else {
-         // Neuer Datensatz
-         const ins = await fetch(
-           `${process.env.SUPABASE_URL}/rest/v1/spotify_connections`,
-           {
-             method: "POST",
-             headers: {
-               apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-               Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-               "Content-Type": "application/json",
-               Prefer: "return=representation",
-             },
-             body: JSON.stringify({
-               ...payload,
-               is_active: true,               // hat zwar Default, aber explizit ist okay
-               disabled_at: null,
-               disconnected_at: null,
-               created_at: new Date().toISOString(), // hat Default – schadet nicht
-               updated_at: new Date().toISOString(),
-             }),
-           }
-         );
+         const ins = await fetch(`${SB_URL}/rest/v1/spotify_connections`, {
+           method: "POST",
+           headers: {
+             apikey: SB_KEY,
+             Authorization: `Bearer ${SB_KEY}`,
+             "Content-Type": "application/json",
+             Prefer: "return=representation",
+           },
+           body: JSON.stringify({
+             ...payload,
+             is_active: true,
+             disabled_at: null,
+             disconnected_at: null,
+             created_at: new Date().toISOString(),
+             updated_at: new Date().toISOString(),
+           }),
+         });
          if (!ins.ok) {
            const errTxt = (await ins.text().catch(() => "")) || "";
            const msg = `supabase_insert_failed_${ins.status}:${encodeURIComponent(errTxt.slice(0, 280))}`;
@@ -2074,19 +2102,14 @@ const routes = {
          }
        }
    
-       // --- Verifizieren: ist aktiv?
+       // Verifizieren
        try {
          const vr = await fetch(
-           `${process.env.SUPABASE_URL}/rest/v1/spotify_connections?` +
+           `${SB_URL}/rest/v1/spotify_connections?` +
              `select=id,is_active,disabled_at,disconnected_at&limit=1&` +
              `bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&` +
              `spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}`,
-           {
-             headers: {
-               apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-               Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-             },
-           }
+           { headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` } }
          );
          const vj = vr.ok ? await vr.json() : [];
          if (!vj?.[0]?.is_active) {
@@ -2094,12 +2117,12 @@ const routes = {
          }
        } catch { /* ignorable */ }
    
-       // --- seats_used neu berechnen
+       // seats_used refreshen
        try {
          const cR = await sb(
            `/rest/v1/spotify_connections?select=id&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&is_active=is.true`
          );
-         const arr = cR.ok ? await cR.json() : [];
+         const arr  = cR.ok ? await cR.json() : [];
          const used = Array.isArray(arr) ? arr.length : 0;
    
          await sb(`/rest/v1/app_users?bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}`, {
@@ -2109,8 +2132,8 @@ const routes = {
          }).catch(() => {});
        } catch { /* no-op */ }
    
-       // --- zurück ins UI
-       const qs = `?spotify_linked=1&spotify_user=${encodeURIComponent(spotify_user_id)}`;
+       // zurück ins UI
+       const qs   = `?spotify_linked=1&spotify_user=${encodeURIComponent(spotify_user_id)}`;
        const back = (return_to || "/") + qs;
        return res.redirect(back);
      } catch (e) {
@@ -2118,6 +2141,7 @@ const routes = {
        return backWithError("/", `callback_exception_${encodeURIComponent(msg)}`);
      }
    },
+
 
 
 
