@@ -64,6 +64,7 @@ function checkCronAuth(req) {
   return !want;  // falls ohne Secret explizit offen gewünscht
 }
 
+// ich hab katzi lieb
 
 function checkAppSecret(req) {
   const want = process.env.APP_WEBHOOK_SECRET;
