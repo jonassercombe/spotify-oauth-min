@@ -1,35 +1,68 @@
 # .github/workflows/ping-every-5m.yml
 name: Ping Vercel endpoints (every 5m)
+
 on:
-  schedule: [ { cron: "*/5 * * * *" } ]
+  schedule:
+    - cron: "*/5 * * * *"
   workflow_dispatch:
+
 jobs:
   ping:
+    # wenn du ein Environment-Secret benutzt, füge die nächste Zeile ein:
+    # environment: production
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    concurrency:
+      group: ext-crons-5m
+      cancel-in-progress: false
     env:
       BASE_URL: "https://spotify-oauth-min-jonas-sercombes-projects.vercel.app"
       CRON_SECRET: ${{ secrets.CRON_SECRET }}
     steps:
+      - name: Show context (UTC time) & secret presence
+        run: |
+          echo "Now (UTC): $(date -u +'%Y-%m-%d %H:%M:%S')"
+          if [ -z "$CRON_SECRET" ]; then
+            echo "CRON_SECRET is EMPTY (check repo vs environment secrets!)"
+            exit 1
+          else
+            echo "CRON_SECRET is set (masked)."
+          fi
+
       - name: Ping /api/followers/cron-refresh-all
         run: |
           URL="$BASE_URL/api/followers/cron-refresh-all?token=$CRON_SECRET"
           for i in {1..5}; do
+            echo "Attempt $i → $URL"
             RESP=$(curl -sSL -w "\n%{http_code}" "$URL")
-            CODE="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"
-            echo "HTTP $CODE"; echo "$BODY"
-            [[ "$CODE" =~ ^(200|202|204)$ ]] && exit 0
+            CODE="${RESP##*$'\n'}"
+            BODY="${RESP%$'\n'*}"
+            echo "HTTP $CODE"
+            echo "Body:"
+            echo "$BODY"
+            if [[ "$CODE" =~ ^(200|202|204)$ ]]; then
+              echo "Success."
+              exit 0
+            fi
             sleep 10
           done
-          exit 1
+          echo "Endpoint returned non-2xx after retries"; exit 1
+
       - name: Ping /api/watch/cron-all
         run: |
           URL="$BASE_URL/api/watch/cron-all?token=$CRON_SECRET"
           for i in {1..5}; do
+            echo "Attempt $i → $URL"
             RESP=$(curl -sSL -w "\n%{http_code}" "$URL")
-            CODE="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"
-            echo "HTTP $CODE"; echo "$BODY"
-            [[ "$CODE" =~ ^(200|202|204)$ ]] && exit 0
+            CODE="${RESP##*$'\n'}"
+            BODY="${RESP%$'\n'*}"
+            echo "HTTP $CODE"
+            echo "Body:"
+            echo "$BODY"
+            if [[ "$CODE" =~ ^(200|202|204)$ ]]; then
+              echo "Success."
+              exit 0
+            fi
             sleep 10
           done
-          exit 1
+          echo "Endpoint returned non-2xx after retries"; exit 1
