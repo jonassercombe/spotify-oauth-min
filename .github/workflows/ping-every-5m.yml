@@ -3,7 +3,7 @@ name: Ping Vercel endpoints (every 5m, all 60 buckets)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # alle 5 Minuten (UTC)
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -20,79 +20,41 @@ jobs:
     steps:
       - name: Check secret
         run: |
-          if [ -z "$CRON_SECRET" ]; then
-            echo "CRON_SECRET is EMPTY (repo vs environment secrets?)"
-            exit 1
-          fi
-          echo "CRON_SECRET is set (masked). Now: $(date -u +'%Y-%m-%d %H:%M:%S')"
+          test -n "$CRON_SECRET" || (echo "CRON_SECRET missing" && exit 1)
+          echo "OK $(date -u +'%Y-%m-%d %H:%M:%S')"
 
       - name: Ping all 60 buckets (followers + watch)
         shell: bash
         run: |
           set -euo pipefail
-
-          # kleine Helfer zum hübschen Loggen
-          h2(){ echo ""; echo "## $*"; }
-          h3(){ echo "-- $*"; }
-
-          # Curl-Helfer mit 2 Retries (insg. 3 Versuche)
           hit () {
-            local url="$1"
-            local tries=0
-            local max=3
-            local code=""
-            local body=""
-
+            local url="$1" tries=0 max=3 code body
             while (( tries < max )); do
               tries=$((tries+1))
-              h3 "Attempt ${tries}/${max} → ${url}"
-              # -m timeout 25s, folgt Redirects, zeigt HTTP-Code in letzter Zeile
               resp="$(curl -sSL -m 25 -H "Authorization: Bearer ${CRON_SECRET}" -w '\n%{http_code}' "${url}")" || true
-              code="${resp##*$'\n'}"
-              body="${resp%$'\n'*}"
-              echo "HTTP ${code}"
-              # Erfolg?
-              if [[ "${code}" =~ ^(200|201|202|204)$ ]]; then
-                # Body auf eine Zeile kürzen (nur für Log-Lesbarkeit)
-                echo "${body}" | tr -d '\n' | cut -c1-300
-                echo
-                return 0
-              fi
-              # kurz warten und nochmal
+              code="${resp##*$'\n'}"; body="${resp%$'\n'*}"
+              echo "HTTP ${code} ${url}"
+              [[ "${code}" =~ ^(200|201|202|204)$ ]] && { echo "${body}" | tr -d '\n' | cut -c1-300; echo; return 0; }
               sleep 2
             done
-
-            echo "FAILED after ${max} tries → ${url}"
-            echo "Last body: ${body}" | tr -d '\n' | cut -c1-500
-            echo
-            return 1
+            echo "FAILED → ${url}"; echo "${body}" | tr -d '\n' | cut -c1-500; echo; return 1
           }
 
           failures=0
 
-          h2 "Followers cron (all buckets 0–59)"
+          # followers
           for b in $(seq 0 59); do
-            url="${BASE_URL}/api/followers/cron-refresh?bucket=${b}"
-            if ! hit "${url}"; then
-              failures=$((failures+1))
-            fi
-            # sanftes Throttling, damit wir den Upstream nicht fluten
+            url="${BASE_URL}/api/followers/cron-refresh-all?bucket=${b}"
+            hit "${url}" || failures=$((failures+1))
             sleep 0.2
           done
 
-          h2 "Watch cron (all buckets 0–59)"
+          # watch
           for b in $(seq 0 59); do
-            url="${BASE_URL}/api/watch/cron?bucket=${b}"
-            if ! hit "${url}"; then
-              failures=$((failures+1))
-            fi
+            url="${BASE_URL}/api/watch/cron-all?bucket=${b}"
+            hit "${url}" || failures=$((failures+1))
             sleep 0.2
           done
 
-          h2 "Summary"
-          if [ "${failures}" -gt 0 ]; then
-            echo "Completed with ${failures} failed calls."
-            exit 1
-          else
-            echo "All calls succeeded."
-          fi
+          [[ "${failures}" -eq 0 ]] || { echo "Completed with ${failures} failed calls."; exit 1; }
+          echo "All calls succeeded."
