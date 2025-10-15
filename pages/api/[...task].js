@@ -2184,6 +2184,258 @@ const routes = {
    },
    
 
+
+   /* ---------- cron/spotify/snapshot-daily (GET) ----------
+      Snapshot der Followerzahlen für alle Playlists je aktiver Connection
+      im angegebenen cron_bucket; schreibt in playlist_followers_daily (Upsert).
+      Abhängigkeiten: need(), sb(), encToken(), decToken(), fetch, process.env.*
+   -------------------------------------------------------- */
+   "cron/spotify/snapshot-daily": async (req, res) => {
+     try {
+       // --- Env-Guards
+       const assertEnv = (n) => need(n);
+       assertEnv("SUPABASE_URL");
+       assertEnv("SUPABASE_SERVICE_ROLE_KEY");
+       assertEnv("ENC_SECRET");
+       assertEnv("SPOTIFY_CLIENT_ID");
+       assertEnv("SPOTIFY_CLIENT_SECRET");
+   
+       // --- Input
+       const bucket = Number(req.query.bucket ?? "");
+       if (!Number.isInteger(bucket) || bucket < 0 || bucket > 59) {
+         return res.status(400).json({ ok:false, error:"invalid_bucket", hint:"use ?bucket=0..59" });
+       }
+   
+       // --- Aktive Connections für den Bucket ziehen
+       const conResp = await sb(
+         `/rest/v1/spotify_connections?` +
+         [
+           `select=id,bubble_user_id,spotify_user_id,refresh_token_enc,access_token_enc,access_expires_at,cron_bucket,is_active,disabled_at`,
+           `cron_bucket=eq.${encodeURIComponent(bucket)}`,
+           `is_active=is.true`,
+           `disabled_at=is.null`
+         ].join("&")
+       );
+       if (!conResp.ok) {
+         const t = await conResp.text().catch(()=> "");
+         return res.status(502).json({ ok:false, error:"supabase_connections_failed", detail:t });
+       }
+       const connections = await conResp.json();
+       if (!Array.isArray(connections) || connections.length === 0) {
+         return res.json({ ok:true, bucket, processed:0, note:"no active connections in this bucket" });
+       }
+   
+       // --- Helper: Token sicherstellen (refresh bei Bedarf)
+       async function ensureAccessToken(conn) {
+         const now = Date.now();
+         const expMs = conn.access_expires_at ? new Date(conn.access_expires_at).getTime() : 0;
+         const stillValid = expMs - now > 5 * 60 * 1000; // ≥5 Min Puffer
+   
+         if (stillValid && conn.access_token_enc) {
+           try { return { token: decToken(conn.access_token_enc), refreshed:false }; }
+           catch { /* fallthrough to refresh */ }
+         }
+         // Refresh
+         if (!conn.refresh_token_enc) throw new Error("missing_refresh_token");
+         const refresh_token = decToken(conn.refresh_token_enc);
+   
+         const body = new URLSearchParams({
+           grant_type: "refresh_token",
+           refresh_token,
+           client_id: process.env.SPOTIFY_CLIENT_ID,
+           client_secret: process.env.SPOTIFY_CLIENT_SECRET,
+         });
+   
+         const r = await fetch("https://accounts.spotify.com/api/token", {
+           method: "POST",
+           headers: { "Content-Type":"application/x-www-form-urlencoded" },
+           body
+         });
+         if (!r.ok) {
+           const tt = await r.text().catch(()=> "");
+           throw new Error(`token_refresh_failed_${r.status}:${tt.slice(0,200)}`);
+         }
+         const j = await r.json();
+         const newAccess = j.access_token;
+         const newExpiresAt = new Date(Date.now() + (j.expires_in || 3600) * 1000).toISOString();
+         const newAccessEnc = encToken(newAccess);
+   
+         // ggf. neues Refresh-Token von Spotify (selten) – dann persistieren
+         const newRefreshEnc = j.refresh_token ? encToken(j.refresh_token) : conn.refresh_token_enc;
+   
+         // Connection updaten
+         await sb(`/rest/v1/spotify_connections?id=eq.${encodeURIComponent(conn.id)}`, {
+           method: "PATCH",
+           headers: { Prefer: "return=minimal" },
+           body: JSON.stringify({
+             access_token_enc: newAccessEnc,
+             access_expires_at: newExpiresAt,
+             // nur ersetzen, wenn Spotify eins liefert:
+             ...(j.refresh_token ? { refresh_token_enc: newRefreshEnc } : {}),
+             updated_at: new Date().toISOString()
+           })
+         });
+   
+         return { token:newAccess, refreshed:true };
+       }
+   
+       // --- Helper: Spotify /me/playlists paginiert lesen
+       async function* iterateUserPlaylists(accessToken) {
+         let url = "https://api.spotify.com/v1/me/playlists?limit=50";
+         while (url) {
+           const r = await fetch(url, { headers: { Authorization:`Bearer ${accessToken}` } });
+           if (!r.ok) throw new Error(`spotify_me_playlists_${r.status}`);
+           const j = await r.json();
+           const items = Array.isArray(j.items) ? j.items : [];
+           for (const p of items) yield p;
+           url = j.next || null;
+         }
+       }
+   
+       // --- Helper: lokale Playlist-Zeile sichern/holen (UUID) für (connection_id + spotify_playlist_id)
+       // Erwartetes Schema (typisch):
+       //   playlists(id uuid pk, connection_id uuid, bubble_user_id text, spotify_playlist_id text unique per connection, name text, owner_spotify_id text, ...)
+       async function ensureLocalPlaylistRow(conn, spPlaylist, accessToken) {
+         const spotify_playlist_id = spPlaylist.id;
+         const name = spPlaylist.name || null;
+         const owner_spotify_id = spPlaylist.owner?.id || null;
+   
+         // Versuche „on_conflict“ (falls Unique-Index existiert: e.g. (connection_id, spotify_playlist_id))
+         const resp = await fetch(
+           `${process.env.SUPABASE_URL}/rest/v1/playlists?on_conflict=connection_id,spotify_playlist_id`,
+           {
+             method: "POST",
+             headers: {
+               apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+               Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+               "Content-Type": "application/json",
+               Prefer: "resolution=merge-duplicates,return=representation",
+             },
+             body: JSON.stringify({
+               connection_id: conn.id,
+               bubble_user_id: conn.bubble_user_id,
+               spotify_playlist_id,
+               name,
+               owner_spotify_id,
+               updated_at: new Date().toISOString(),
+             }),
+           }
+         );
+   
+         if (!resp.ok) {
+           // Fallback: lesen (falls es die Tabelle/Unique-Constraint anders heißt)
+           const alt = await sb(
+             `/rest/v1/playlists?select=id&connection_id=eq.${encodeURIComponent(conn.id)}&spotify_playlist_id=eq.${encodeURIComponent(spotify_playlist_id)}&limit=1`
+           );
+           if (!alt.ok) throw new Error(`ensureLocalPlaylistRow_failed_${resp.status}`);
+           const jj = await alt.json();
+           const row = Array.isArray(jj) && jj[0];
+           if (!row?.id) throw new Error("playlist_row_missing");
+           return row.id;
+         } else {
+           const jj = await resp.json().catch(()=> []);
+           const row = Array.isArray(jj) && jj[0];
+           if (!row?.id) {
+             // Manche PostgRESTs geben bei merge-duplicates nichts zurück, dann per SELECT holen
+             const alt = await sb(
+               `/rest/v1/playlists?select=id&connection_id=eq.${encodeURIComponent(conn.id)}&spotify_playlist_id=eq.${encodeURIComponent(spotify_playlist_id)}&limit=1`
+             );
+             const a = alt.ok ? await alt.json() : [];
+             if (!a?.[0]?.id) throw new Error("playlist_row_missing_after_upsert");
+             return a[0].id;
+           }
+           return row.id;
+         }
+       }
+   
+       // --- Helper: Follower-Snapshot (UPSERT) schreiben
+       async function upsertFollowersDaily(localPlaylistUUID, conn, followersInt) {
+         const day = new Date().toISOString().slice(0,10); // YYYY-MM-DD
+         const payload = {
+           playlist_id: localPlaylistUUID,      // uuid in deiner Tabelle!
+           bubble_user_id: conn.bubble_user_id, // text
+           connection_id: conn.id,              // uuid, nullable – wir füllen sie
+           day,
+           followers: Number.isFinite(+followersInt) ? +followersInt : 0
+         };
+         const r = await fetch(`${process.env.SUPABASE_URL}/rest/v1/playlist_followers_daily`, {
+           method: "POST",
+           headers: {
+             apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+             Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+             "Content-Type": "application/json",
+             // funktioniert mit deinem Unique-Index (playlist_id, day)
+             Prefer: "resolution=merge-duplicates,return=minimal",
+           },
+           body: JSON.stringify(payload)
+         });
+         if (!r.ok) {
+           const t = await r.text().catch(()=> "");
+           throw new Error(`followers_upsert_failed_${r.status}:${t.slice(0,200)}`);
+         }
+       }
+   
+       // --- Verarbeitung
+       const results = [];
+       for (const conn of connections) {
+         const out = { connection_id: conn.id, bubble_user_id: conn.bubble_user_id, refreshed:false, playlists:0, snapshots:0, errors:[] };
+         try {
+           // Token sichern
+           const { token, refreshed } = await ensureAccessToken(conn);
+           out.refreshed = refreshed;
+   
+           // Eigene Playlists iterieren (du kannst hier filtern, z.B. nur owner==me)
+           for await (const sp of iterateUserPlaylists(token)) {
+             out.playlists += 1;
+   
+             // Followers.total zuverlässig holen (manche /me/playlists liefern es nicht konsistent → ggf. Detail-Call)
+             let followers = sp.followers?.total;
+             if (typeof followers !== "number") {
+               const pr = await fetch(`https://api.spotify.com/v1/playlists/${encodeURIComponent(sp.id)}?fields=followers.total`, {
+                 headers: { Authorization:`Bearer ${token}` }
+               });
+               if (pr.ok) {
+                 const pj = await pr.json();
+                 followers = pj?.followers?.total ?? 0;
+               } else {
+                 followers = 0;
+               }
+             }
+   
+             // Lokale Playlist-UUID sicherstellen
+             let localUUID;
+             try {
+               localUUID = await ensureLocalPlaylistRow(conn, sp, token);
+             } catch (e) {
+               out.errors.push(`ensureLocalPlaylistRow:${sp.id}:${e.message}`);
+               continue;
+             }
+   
+             // followers_daily upserten
+             try {
+               await upsertFollowersDaily(localUUID, conn, followers);
+               out.snapshots += 1;
+             } catch (e) {
+               out.errors.push(`upsert_daily:${sp.id}:${e.message}`);
+             }
+           }
+         } catch (e) {
+           out.errors.push(e.message || String(e));
+         }
+         results.push(out);
+       }
+   
+       return res.json({ ok:true, bucket, processed: results.length, results });
+     } catch (e) {
+       return res.status(500).json({ ok:false, error:"snapshot_exception", message: e?.message || String(e) });
+     }
+   },
+
+
+
+
+
+   
    /* ---------- playlists/maintenance (POST, Bubble ODER Cron) ---------- */
    "playlists/maintenance": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
