@@ -1,4 +1,5 @@
-name: Ping Vercel endpoints (every 5m)
+# .github/workflows/ping-every-5m.yml
+name: Ping Vercel endpoints (every 5m, all 60 buckets)
 
 on:
   schedule:
@@ -7,16 +8,15 @@ on:
 
 jobs:
   ping:
-    # falls du ein Environment-Secret (nicht Repo-Secret) nutzt, kommentiere die nächste Zeile ein:
-    # environment: production
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     concurrency:
       group: ext-crons-5m
       cancel-in-progress: false
     env:
       BASE_URL: "https://spotify-oauth-min-jonas-sercombes-projects.vercel.app"
       CRON_SECRET: ${{ secrets.CRON_SECRET }}
+
     steps:
       - name: Check secret
         run: |
@@ -26,28 +26,73 @@ jobs:
           fi
           echo "CRON_SECRET is set (masked). Now: $(date -u +'%Y-%m-%d %H:%M:%S')"
 
-      - name: Ping /api/followers/cron-refresh-all (Bearer)
+      - name: Ping all 60 buckets (followers + watch)
+        shell: bash
         run: |
-          URL="$BASE_URL/api/followers/cron-refresh-all"
-          for i in {1..5}; do
-            echo "Attempt $i → $URL"
-            RESP=$(curl -sSL -H "Authorization: Bearer $CRON_SECRET" -w "\n%{http_code}" "$URL")
-            CODE="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"
-            echo "HTTP $CODE"; echo "$BODY"
-            [[ "$CODE" =~ ^(200|202|204)$ ]] && exit 0
-            sleep 10
-          done
-          echo "Endpoint returned non-2xx after retries"; exit 1
+          set -euo pipefail
 
-      - name: Ping /api/watch/cron-all (Bearer)
-        run: |
-          URL="$BASE_URL/api/watch/cron-all"
-          for i in {1..5}; do
-            echo "Attempt $i → $URL"
-            RESP=$(curl -sSL -H "Authorization: Bearer $CRON_SECRET" -w "\n%{http_code}" "$URL")
-            CODE="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"
-            echo "HTTP $CODE"; echo "$BODY"
-            [[ "$CODE" =~ ^(200|202|204)$ ]] && exit 0
-            sleep 10
+          # kleine Helfer zum hübschen Loggen
+          h2(){ echo ""; echo "## $*"; }
+          h3(){ echo "-- $*"; }
+
+          # Curl-Helfer mit 2 Retries (insg. 3 Versuche)
+          hit () {
+            local url="$1"
+            local tries=0
+            local max=3
+            local code=""
+            local body=""
+
+            while (( tries < max )); do
+              tries=$((tries+1))
+              h3 "Attempt ${tries}/${max} → ${url}"
+              # -m timeout 25s, folgt Redirects, zeigt HTTP-Code in letzter Zeile
+              resp="$(curl -sSL -m 25 -H "Authorization: Bearer ${CRON_SECRET}" -w '\n%{http_code}' "${url}")" || true
+              code="${resp##*$'\n'}"
+              body="${resp%$'\n'*}"
+              echo "HTTP ${code}"
+              # Erfolg?
+              if [[ "${code}" =~ ^(200|201|202|204)$ ]]; then
+                # Body auf eine Zeile kürzen (nur für Log-Lesbarkeit)
+                echo "${body}" | tr -d '\n' | cut -c1-300
+                echo
+                return 0
+              fi
+              # kurz warten und nochmal
+              sleep 2
+            done
+
+            echo "FAILED after ${max} tries → ${url}"
+            echo "Last body: ${body}" | tr -d '\n' | cut -c1-500
+            echo
+            return 1
+          }
+
+          failures=0
+
+          h2 "Followers cron (all buckets 0–59)"
+          for b in $(seq 0 59); do
+            url="${BASE_URL}/api/followers/cron-refresh?bucket=${b}"
+            if ! hit "${url}"; then
+              failures=$((failures+1))
+            fi
+            # sanftes Throttling, damit wir den Upstream nicht fluten
+            sleep 0.2
           done
-          echo "Endpoint returned non-2xx after retries"; exit 1
+
+          h2 "Watch cron (all buckets 0–59)"
+          for b in $(seq 0 59); do
+            url="${BASE_URL}/api/watch/cron?bucket=${b}"
+            if ! hit "${url}"; then
+              failures=$((failures+1))
+            fi
+            sleep 0.2
+          done
+
+          h2 "Summary"
+          if [ "${failures}" -gt 0 ]; then
+            echo "Completed with ${failures} failed calls."
+            exit 1
+          else
+            echo "All calls succeeded."
+          fi
