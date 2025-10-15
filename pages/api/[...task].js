@@ -1575,21 +1575,31 @@ const routes = {
      }
    },
 
-  /* ---------- resolve (GET) ---------- */
-   
+  /* ---------- tracks/resolve (GET|POST) ---------- */
    "tracks/resolve": async (req, res) => {
-     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+     // GET → Body spiegeln, damit die bestehende Logik weiter unten unverändert greifen kann
+     if (req.method === "GET") {
+       req.body = {
+         input: req.query.input || req.query.q || "",
+         connection_id: req.query.connection_id || "",
+         candidates: req.query.candidates || undefined,
+       };
+     } else if (req.method !== "POST") {
+       return bad(res, 405, "method_not_allowed");
+     }
+   
      const body = await readBody(req);
      const input = body.input || "";
      const connection_id = body.connection_id || "";
-     const wantCandidates = Math.max(0, Math.min(25, Number(body.candidates ?? req.query.candidates ?? 8)));
+     const wantCandidates = Math.max(0, Math.min(25, Number(body.candidates ?? req.query?.candidates ?? 8)));
    
      let id = parseTrackId(input);
    
      try {
-       // Wenn id erkennbar: hol Meta (wenn connection da) + parallele Kandidaten-Suche optional
+       // Fall A: Eine gültige Track-ID/URI/URL wurde erkannt
        if (id) {
          let meta = null, candidates = [];
+   
          if (connection_id) {
            const token = await getAccessTokenFromConnection(connection_id);
    
@@ -1600,7 +1610,7 @@ const routes = {
              20000
            );
    
-           // Kandidaten (freie Suche nach demselben Input) – optional
+           // Kandidaten (frei nach dem Original-Input suchen)
            let candReq = null;
            if (wantCandidates > 0) {
              candReq = fetchJSON(
@@ -1641,7 +1651,7 @@ const routes = {
          });
        }
    
-       // Keine ID => Fallback Suche (liefert best + candidates)
+       // Fall B: Keine ID erkannt → suche (verlangt connection_id)
        if (!connection_id) return bad(res, 400, "unrecognized_input_and_no_connection");
    
        const token = await getAccessTokenFromConnection(connection_id);
@@ -4174,6 +4184,10 @@ const routes = {
   "watch/ping": async (_req, res) => json(res, 200, { ok: true }),
 };
 
+// ---- Alias, damit /api/resolve ebenfalls funktioniert:
+   
+// nach dem routes = { ... } Block, aber noch vor export default:
+routes["resolve"] = routes["tracks/resolve"];
 
 
 
