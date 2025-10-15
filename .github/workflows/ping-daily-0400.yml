@@ -1,0 +1,41 @@
+# .github/workflows/ping-daily-0400.yml
+name: Ping Vercel maintenance (daily 04:00 UTC)
+
+on:
+  schedule:
+    - cron: "0 4 * * *"     # täglich 04:00 UTC
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: ext-crons-daily
+      cancel-in-progress: false
+    env:
+      BASE_URL: "https://spotify-oauth-min-jonas-sercombes-projects.vercel.app"
+    steps:
+      - name: Show context
+        run: |
+          echo "Now (UTC): $(date -u +'%Y-%m-%d %H:%M:%S')"
+          echo "BASE_URL=$BASE_URL"
+
+      - name: Ping /api/watch/cron-maintenance-all
+        run: |
+          URL="$BASE_URL/api/watch/cron-maintenance-all"
+          for i in {1..5}; do
+            echo "Attempt $i → $URL"
+            RESP=$(curl -sSL -w "\n%{http_code}" "$URL")
+            CODE="${RESP##*$'\n'}"
+            BODY="${RESP%$'\n'*}"
+            echo "HTTP $CODE"
+            echo "Body:"
+            echo "$BODY"
+            if [[ "$CODE" =~ ^(200|202|204)$ ]]; then
+              echo "Success."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Endpoint returned non-2xx after retries"; exit 1
