@@ -1,14 +1,13 @@
-# .github/workflows/ping-every-5m.yml
 name: Ping Vercel endpoints (every 5m)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/5 * * * *"   # alle 5 Minuten (UTC)
   workflow_dispatch:
 
 jobs:
   ping:
-    # wenn du ein Environment-Secret benutzt, füge die nächste Zeile ein:
+    # falls du ein Environment-Secret nutzt, UNKOMMENTIEREN:
     # environment: production
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -19,7 +18,7 @@ jobs:
       BASE_URL: "https://spotify-oauth-min-jonas-sercombes-projects.vercel.app"
       CRON_SECRET: ${{ secrets.CRON_SECRET }}
     steps:
-      - name: Show context (UTC time) & secret presence
+      - name: Show context (UTC) & secret presence
         run: |
           echo "Now (UTC): $(date -u +'%Y-%m-%d %H:%M:%S')"
           if [ -z "$CRON_SECRET" ]; then
@@ -29,12 +28,12 @@ jobs:
             echo "CRON_SECRET is set (masked)."
           fi
 
-      - name: Ping /api/followers/cron-refresh-all
+      - name: Ping /api/followers/cron-refresh-all (x-service-key)
         run: |
-          URL="$BASE_URL/api/followers/cron-refresh-all?token=$CRON_SECRET"
+          URL="$BASE_URL/api/followers/cron-refresh-all"
           for i in {1..5}; do
             echo "Attempt $i → $URL"
-            RESP=$(curl -sSL -w "\n%{http_code}" "$URL")
+            RESP=$(curl -sSL -H "x-service-key: $CRON_SECRET" -w "\n%{http_code}" "$URL")
             CODE="${RESP##*$'\n'}"
             BODY="${RESP%$'\n'*}"
             echo "HTTP $CODE"
@@ -48,12 +47,12 @@ jobs:
           done
           echo "Endpoint returned non-2xx after retries"; exit 1
 
-      - name: Ping /api/watch/cron-all
+      - name: Ping /api/watch/cron-all (x-service-key)
         run: |
-          URL="$BASE_URL/api/watch/cron-all?token=$CRON_SECRET"
+          URL="$BASE_URL/api/watch/cron-all"
           for i in {1..5}; do
             echo "Attempt $i → $URL"
-            RESP=$(curl -sSL -w "\n%{http_code}" "$URL")
+            RESP=$(curl -sSL -H "x-service-key: $CRON_SECRET" -w "\n%{http_code}" "$URL")
             CODE="${RESP##*$'\n'}"
             BODY="${RESP%$'\n'*}"
             echo "HTTP $CODE"
