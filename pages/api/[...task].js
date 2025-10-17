@@ -583,9 +583,38 @@ const routes = {
        return { ok: v?.verification_status === "SUCCESS", env, token: tok.access_token, base, webhook_id };
      };
    
-     let ver = await tryVerify("live");
-     if (!ver.ok) ver = await tryVerify("sandbox");
-     if (!ver.ok) return bad(res, 400, "webhook_verify_failed");
+let ver = null;
+try {
+  ver = await tryVerify("live");
+  if (!ver?.ok) {
+    const haveSandbox =
+      !!process.env.PAYPAL_CLIENT_ID_SANDBOX &&
+      !!process.env.PAYPAL_CLIENT_SECRET_SANDBOX &&
+      !!process.env.PAYPAL_WEBHOOK_ID_SANDBOX;
+    if (haveSandbox) {
+      ver = await tryVerify("sandbox");
+    }
+  }
+} catch (e) {
+  console.error("PP verify threw", e?.message || e);
+}
+
+if (!ver?.ok) {
+  console.error("PP webhook verify failed", {
+    live_tried: true,
+    sandbox_tried: !!(process.env.PAYPAL_CLIENT_ID_SANDBOX && process.env.PAYPAL_CLIENT_SECRET_SANDBOX && process.env.PAYPAL_WEBHOOK_ID_SANDBOX),
+    event_type: event?.event_type,
+    sub: event?.resource?.id || event?.resource?.subscription_id || null
+  });
+  return bad(res, 400, "webhook_verify_failed");
+}
+
+console.log("PP webhook verify OK", {
+  env: ver.env,
+  event_type: event?.event_type,
+  sub: event?.resource?.id || event?.resource?.subscription_id || null
+});
+
    
      // Event → Upsert
      const env = ver.env;
@@ -610,7 +639,17 @@ const routes = {
            current_period_end: nextBilling ? new Date(nextBilling).toISOString() : null,
            updated_at: new Date().toISOString()
          }])
-       }).catch(()=>{});
+       }).then(() => {
+  console.log("PP webhook upsert OK", {
+    env, event_type: name, subId, status, plan_id, nextBilling
+  });
+}).catch(async (e) => {
+  // Try to read error body if any
+  try {
+    console.error("PP webhook upsert FAILED", e?.message || e);
+  } catch {}
+});
+
      }
    
      // optional: Event-Log (falls Tabelle vorhanden)
