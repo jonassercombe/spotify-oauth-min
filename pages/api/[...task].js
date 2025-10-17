@@ -540,22 +540,26 @@ const routes = {
    },
 
    // POST paypal/webhook
-      "paypal/webhook": async (req, res) => {
+   "paypal/webhook": async (req, res) => {
      if (req.method === "OPTIONS") return res.status(204).end();
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
    
+     // Body (PayPal sendet JSON)
+     const event = await readBody(req);
      const headers = req.headers;
-     const body = await readBody(req); // bereits JSON
-     const event = body || {};
+   
+     // Signatur-Header prüfen
      const transmission_id   = headers["paypal-transmission-id"];
      const transmission_time = headers["paypal-transmission-time"];
      const cert_url          = headers["paypal-cert-url"];
      const auth_algo         = headers["paypal-auth-algo"];
      const transmission_sig  = headers["paypal-transmission-sig"];
      if (!transmission_id || !transmission_time || !cert_url || !auth_algo || !transmission_sig) {
+       console.error("PP webhook missing signature headers");
        return bad(res, 400, "missing_signature_headers");
      }
    
+     // Helper: Verifikation gegen Live/Sandbox
      const tryVerify = async (env) => {
        const isLive = env === "live";
        const base   = isLive ? "https://api.paypal.com" : "https://api.sandbox.paypal.com";
@@ -565,58 +569,40 @@ const routes = {
    
        const tokRes = await fetch(`${base}/v1/oauth2/token`, {
          method: "POST",
-         headers: { "Authorization":"Basic "+Buffer.from(`${cid}:${secret}`).toString("base64"), "Content-Type":"application/x-www-form-urlencoded" },
+         headers: {
+           "Authorization":"Basic "+Buffer.from(`${cid}:${secret}`).toString("base64"),
+           "Content-Type":"application/x-www-form-urlencoded"
+         },
          body: "grant_type=client_credentials"
        });
        const tok = await tokRes.json().catch(()=> ({}));
-       if (!tokRes.ok || !tok?.access_token) return { ok:false, status:502 };
+       if (!tokRes.ok || !tok?.access_token) return { ok:false, status:tokRes.status, env };
    
        const vRes = await fetch(`${base}/v1/notifications/verify-webhook-signature`, {
          method: "POST",
          headers: { "Authorization": `Bearer ${tok.access_token}`, "Content-Type":"application/json" },
          body: JSON.stringify({
            transmission_id, transmission_time, cert_url, auth_algo, transmission_sig,
-           webhook_id, webhook_event: event
+           webhook_id,
+           webhook_event: event
          })
        });
        const v = await vRes.json().catch(()=> ({}));
-       return { ok: v?.verification_status === "SUCCESS", env, token: tok.access_token, base, webhook_id };
+       return {
+         ok: v?.verification_status === "SUCCESS",
+         env, base, token: tok.access_token, webhook_id,
+         raw: v
+       };
      };
    
-let ver = null;
-try {
-  ver = await tryVerify("live");
-  if (!ver?.ok) {
-    const haveSandbox =
-      !!process.env.PAYPAL_CLIENT_ID_SANDBOX &&
-      !!process.env.PAYPAL_CLIENT_SECRET_SANDBOX &&
-      !!process.env.PAYPAL_WEBHOOK_ID_SANDBOX;
-    if (haveSandbox) {
-      ver = await tryVerify("sandbox");
-    }
-  }
-} catch (e) {
-  console.error("PP verify threw", e?.message || e);
-}
-
-if (!ver?.ok) {
-  console.error("PP webhook verify failed", {
-    live_tried: true,
-    sandbox_tried: !!(process.env.PAYPAL_CLIENT_ID_SANDBOX && process.env.PAYPAL_CLIENT_SECRET_SANDBOX && process.env.PAYPAL_WEBHOOK_ID_SANDBOX),
-    event_type: event?.event_type,
-    sub: event?.resource?.id || event?.resource?.subscription_id || null
-  });
-  return bad(res, 400, "webhook_verify_failed");
-}
-
-console.log("PP webhook verify OK", {
-  env: ver.env,
-  event_type: event?.event_type,
-  sub: event?.resource?.id || event?.resource?.subscription_id || null
-});
-
+     // Verifizieren (erst live, dann sandbox)
+     let ver = await tryVerify("live");
+     if (!ver.ok) ver = await tryVerify("sandbox");
+     if (!ver.ok) {
+       console.error("PP webhook verify FAILED", { event_type: event?.event_type, raw: ver?.raw || null });
+       return bad(res, 400, "webhook_verify_failed");
+     }
    
-     // Event → Upsert
      const env = ver.env;
      const name = String(event?.event_type || "");
      const subId = event?.resource?.id || event?.resource?.subscription_id || null;
@@ -624,36 +610,65 @@ console.log("PP webhook verify OK", {
      const plan_id = event?.resource?.plan_id || null;
      const nextBilling = event?.resource?.billing_info?.next_billing_time || null;
    
-     if (subId) {
-       await sb(`/rest/v1/subscriptions?on_conflict=provider,provider_subscription_id`, {
-         method: "POST",
-         headers: { Prefer: "resolution=merge-duplicates,return=minimal", "Content-Type":"application/json" },
-         body: JSON.stringify([{
-           bubble_user_id: null, // bleibt unverändert beim Merge
-           provider: "paypal",
-           provider_subscription_id: subId,
-           paypal_subscription_id: subId,
-           environment: env,
-           plan_id,
-           status: status || "UNKNOWN",
-           current_period_end: nextBilling ? new Date(nextBilling).toISOString() : null,
-           updated_at: new Date().toISOString()
-         }])
-       }).then(() => {
-  console.log("PP webhook upsert OK", {
-    env, event_type: name, subId, status, plan_id, nextBilling
-  });
-}).catch(async (e) => {
-  // Try to read error body if any
-  try {
-    console.error("PP webhook upsert FAILED", e?.message || e);
-  } catch {}
-});
-
+     console.info("PP webhook verify OK", { env, event_type: name, sub: subId });
+   
+     // Ohne Sub-ID können wir nichts upserten
+     if (!subId) {
+       console.warn("PP webhook without subscription id", { env, event_type: name });
+       return json(res, 200, { ok:true, ignored:true, reason:"no_subscription_id" });
      }
    
-     // optional: Event-Log (falls Tabelle vorhanden)
-     // await sb(`/rest/v1/billing_events`, { method:"POST", headers:{ Prefer:"return=minimal" }, body: JSON.stringify([{ provider:"paypal", provider_event_id: event?.id, provider_subscription_id: subId, event_type: name, payload: event }]) }).catch(()=>{});
+     // Upsert in subscriptions (RLS wird via Service-Role-Key umgangen, siehe sb())
+     const resp = await sb(`/rest/v1/subscriptions?on_conflict=provider,provider_subscription_id`, {
+       method: "POST",
+       headers: {
+         Prefer: "resolution=merge-duplicates,return=representation",
+         "Content-Type":"application/json"
+       },
+       body: JSON.stringify([{
+         bubble_user_id: null,                // unverändert beim Merge
+         provider: "paypal",
+         provider_subscription_id: subId,
+         paypal_subscription_id: subId,       // Legacy-Kompatibilität
+         environment: env,                    // "live" | "sandbox"
+         plan_id,
+         status: status || "UNKNOWN",
+         current_period_end: nextBilling ? new Date(nextBilling).toISOString() : null,
+         updated_at: new Date().toISOString()
+       }])
+     });
+   
+     const txt = await resp.text().catch(()=> "");
+     if (!resp.ok) {
+       console.error("PP webhook upsert FAILED", { status: resp.status, body: txt });
+       // Hinweise:
+       // - Prüfe UNIQUE-Constraint: (provider, provider_subscription_id[, environment])
+       // - Prüfe Spaltennamen in subscriptions
+       return bad(res, 500, "supabase_upsert_failed");
+     }
+   
+     // Optional: Body aus Performancegründen nur truncaten
+     console.info("PP webhook upsert OK", {
+       env, event_type: name, subId, status: status || "UNKNOWN", plan_id, nextBilling
+     });
+   
+     // Optionales Event-Log (nur entkommentieren, wenn Tabelle existiert)
+     // try {
+     //   await sb(`/rest/v1/billing_events`, {
+     //     method:"POST",
+     //     headers:{ Prefer:"return=minimal", "Content-Type":"application/json" },
+     //     body: JSON.stringify([{
+     //       provider:"paypal",
+     //       provider_event_id: event?.id || null,
+     //       provider_subscription_id: subId,
+     //       event_type: name,
+     //       payload: event,
+     //       received_at: new Date().toISOString()
+     //     }])
+     //   });
+     // } catch (e) {
+     //   console.warn("PP webhook event-log skipped", e?.message || e);
+     // }
    
      return json(res, 200, { ok: true });
    },
