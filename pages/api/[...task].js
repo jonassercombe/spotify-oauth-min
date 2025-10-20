@@ -1946,7 +1946,7 @@ const routes = {
    },
    
    /* ===============================
-      oauth/spotify/callback (GET)
+         oauth/spotify/callback (GET)
       =============================== */
    "oauth/spotify/callback": async (req, res) => {
      // Redirect-Helfer
@@ -1984,7 +1984,7 @@ const routes = {
        if (!bubble_user_id) return backWithError(return_to, "missing_user_in_state");
    
        // Token-Exchange
-       const tokenRes = await fetch("https://accounts.spotify.com/api/token", {
+       const tokenResRaw = await fetch("https://accounts.spotify.com/api/token", {
          method: "POST",
          headers: {
            "Content-Type": "application/x-www-form-urlencoded",
@@ -1995,9 +1995,14 @@ const routes = {
            code,
            redirect_uri: REDIRECT_URI,
          }),
-       }).then((r) => r.json());
+       });
    
+       const tokenRes = await tokenResRaw.json().catch(() => ({}));
        if (!tokenRes || !tokenRes.access_token) {
+         console.error("oauth/spotify/callback: token exchange failed", {
+           status: tokenResRaw.status,
+           body: tokenRes
+         });
          return backWithError(return_to, "token_exchange_failed");
        }
    
@@ -2006,6 +2011,8 @@ const routes = {
          headers: { Authorization: `Bearer ${tokenRes.access_token}` },
        });
        if (!meResp.ok) {
+         const t = await meResp.text().catch(() => "");
+         console.error("oauth/spotify/callback: GET /v1/me failed", { status: meResp.status, body: t.slice(0,1000) });
          return backWithError(return_to, `spotify_me_failed_${meResp.status}`);
        }
        const me = await meResp.json();
@@ -2025,7 +2032,7 @@ const routes = {
          body: JSON.stringify({ bubble_user_id }),
        }).catch(() => {});
    
-       // Seats/Sub-Gate (wie gehabt, nicht knallhart blockend implementiert – aber hier weiter genutzt)
+       // Seats/Sub-Gate (nicht blockend falls DB-Reads fehlschlagen)
        let seats_limit = 1;
        let seats_used  = 0;
        let sub_status  = "active";
@@ -2051,7 +2058,9 @@ const routes = {
            const arr = cR.ok ? await cR.json() : [];
            seats_used = Array.isArray(arr) ? arr.length : 0;
          }
-       } catch { /* nicht blockend */ }
+       } catch (e) {
+         console.error("oauth/spotify/callback: seats/sub fetch failed", { error: String(e) });
+       }
    
        const subActive = sub_status !== "canceled" && (!sub_expires || new Date(sub_expires) > new Date());
        if (!subActive) return backWithError(return_to, "subscription_required");
@@ -2064,15 +2073,16 @@ const routes = {
            `bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}&` +
            `spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}&` +
            `order=created_at.desc&limit=1`,
-         {
-           headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` },
-         }
+         { headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` } }
        )
          .then((r) => r.json())
          .then((a) => (Array.isArray(a) && a[0] ? a[0] : null))
-         .catch(() => null);
+         .catch((e) => {
+           console.error("oauth/spotify/callback: existing lookup failed", { error: String(e) });
+           return null;
+         });
    
-       // Tokens verschlüsseln (Refresh darf bei echtem Neu-Connect nicht fehlen)
+       // Tokens verschlüsseln
        let refresh_token_enc = null;
        if (tokenRes.refresh_token) {
          refresh_token_enc = encToken(tokenRes.refresh_token);
@@ -2080,7 +2090,7 @@ const routes = {
          // Reuse bei Re-Consent gleicher Spotify-User
          refresh_token_enc = existing.refresh_token_enc;
        } else {
-         // WICHTIG: Das passiert v. a. wenn der Consent nicht erzwungen wurde
+         // Kein Refresh-Token – Consent fehlt
          return backWithError(return_to, "no_refresh_token_consent_required");
        }
    
@@ -2127,6 +2137,10 @@ const routes = {
          );
          if (!up.ok) {
            const errTxt = (await up.text().catch(() => "")) || "";
+           console.error("oauth/spotify/callback: spotify_connections PATCH failed", {
+             status: up.status,
+             body: errTxt.slice(0, 1000)
+           });
            const msg = `supabase_patch_failed_${up.status}:${encodeURIComponent(errTxt.slice(0, 280))}`;
            return backWithError(return_to, msg);
          }
@@ -2145,27 +2159,38 @@ const routes = {
                updated_at: new Date().toISOString()
              })
            }
-         ).catch(() => {});
-       } else {
-         const ins = await fetch(`${SB_URL}/rest/v1/spotify_connections`, {
-           method: "POST",
-           headers: {
-             apikey: SB_KEY,
-             Authorization: `Bearer ${SB_KEY}`,
-             "Content-Type": "application/json",
-             Prefer: "return=representation",
-           },
-           body: JSON.stringify({
-             ...payload,
-             is_active: true,
-             disabled_at: null,
-             disconnected_at: null,
-             created_at: new Date().toISOString(),
-             updated_at: new Date().toISOString(),
-           }),
+         ).catch((e) => {
+           console.error("oauth/spotify/callback: re-enable duplicates failed", { error: String(e) });
          });
+       } else {
+         // INSERT mit on_conflict (merge-duplicates)
+         const ins = await fetch(
+           `${SB_URL}/rest/v1/spotify_connections?on_conflict=bubble_user_id,spotify_user_id`,
+           {
+             method: "POST",
+             headers: {
+               apikey: SB_KEY,
+               Authorization: `Bearer ${SB_KEY}`,
+               "Content-Type": "application/json",
+               Prefer: "resolution=merge-duplicates,return=representation",
+             },
+             body: JSON.stringify({
+               ...payload,
+               is_active: true,
+               disabled_at: null,
+               disconnected_at: null,
+               created_at: new Date().toISOString(),
+               updated_at: new Date().toISOString(),
+             }),
+           }
+         );
+   
          if (!ins.ok) {
            const errTxt = (await ins.text().catch(() => "")) || "";
+           console.error("oauth/spotify/callback: spotify_connections INSERT failed", {
+             status: ins.status,
+             body: errTxt.slice(0, 1000)
+           });
            const msg = `supabase_insert_failed_${ins.status}:${encodeURIComponent(errTxt.slice(0, 280))}`;
            return backWithError(return_to, msg);
          }
@@ -2182,9 +2207,13 @@ const routes = {
          );
          const vj = vr.ok ? await vr.json() : [];
          if (!vj?.[0]?.is_active) {
+           console.error("oauth/spotify/callback: verify is_active failed", { got: vj });
            return backWithError(return_to, "is_active_update_failed");
          }
-       } catch { /* ignorable */ }
+       } catch (e) {
+         console.error("oauth/spotify/callback: verify fetch failed", { error: String(e) });
+         // nicht blockend
+       }
    
        // seats_used refreshen
        try {
@@ -2198,8 +2227,12 @@ const routes = {
            method: "PATCH",
            headers: { Prefer: "return=minimal" },
            body: JSON.stringify({ seats_used: used, updated_at: new Date().toISOString() })
-         }).catch(() => {});
-       } catch { /* no-op */ }
+         }).catch((e) => {
+           console.error("oauth/spotify/callback: seats_used patch failed", { error: String(e) });
+         });
+       } catch (e) {
+         console.error("oauth/spotify/callback: seats_used refresh failed", { error: String(e) });
+       }
    
        // zurück ins UI
        const qs   = `?spotify_linked=1&spotify_user=${encodeURIComponent(spotify_user_id)}`;
@@ -2207,9 +2240,11 @@ const routes = {
        return res.redirect(back);
      } catch (e) {
        const msg = e?.message || String(e);
+       console.error("oauth/spotify/callback: exception", { error: msg });
        return backWithError("/", `callback_exception_${encodeURIComponent(msg)}`);
      }
    },
+
 
 
 
