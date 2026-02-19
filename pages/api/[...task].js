@@ -1751,10 +1751,13 @@ const routes = {
      if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
    
      try {
-       const { playlist_id, link_or_uri, position } = await readBody(req);
+       const { playlist_id, link_or_uri, position, expiry_weeks, exp_weeks } = await readBody(req);
        if (!playlist_id || !link_or_uri) {
          return bad(res, 400, "missing_playlist_id_or_link");
        }
+       
+       // Unterstütze sowohl expiry_weeks als auch exp_weeks (exp_weeks hat Priorität)
+       const expiryWeeksParam = exp_weeks !== undefined ? exp_weeks : expiry_weeks;
    
        // Playlist holen + Ownership prüfen
        const pr = await sb(
@@ -1769,6 +1772,7 @@ const routes = {
        const parsed = parseSpotifyTrack(link_or_uri);
        if (!parsed) return bad(res, 400, "invalid_spotify_track_link_or_uri");
        const trackUri = parsed.uri;
+       const trackId = parsed.id;
    
        // Access Token für die Connection ziehen
        const access_token = await getAccessTokenFromConnection(row.connection_id);
@@ -1829,14 +1833,36 @@ const routes = {
          headers: { Prefer: "return=minimal" },
          body: JSON.stringify({ needs_sync: true })
        }).catch(() => {});
-   
+
+       // Wenn expiry_weeks angegeben wurde, in playlist_item_locks speichern
+       if (expiryWeeksParam !== undefined && expiryWeeksParam !== null && String(expiryWeeksParam).trim() !== "") {
+         const expiryWeeksNum = Number(expiryWeeksParam);
+         if (Number.isFinite(expiryWeeksNum) && expiryWeeksNum > 0) {
+           const finalPosition = wantPosition !== null && wantPosition !== undefined ? wantPosition : 0;
+           await sb(`/rest/v1/playlist_item_locks?on_conflict=playlist_id,track_id`, {
+             method: "POST",
+             headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+             body: JSON.stringify([{
+               playlist_id: row.id,
+               track_id: trackId,
+               locked_position: finalPosition,
+               is_locked: false, // Nicht gelockt, nur Expiry gesetzt
+               expiry_weeks: expiryWeeksNum,
+               locked_at: new Date().toISOString()
+             }])
+           }).catch((err) => {
+             console.warn("Failed to save expiry_weeks for track", { playlist_id: row.id, track_id: trackId, error: err });
+           });
+         }
+       }
+
        const base = process.env.PUBLIC_BASE_URL || `https://${process.env.VERCEL_URL}`;
        await fetch(`${base}/api/playlists/dispatch-sync`, {
          method: "POST",
          headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
          body: JSON.stringify({ playlist_id: row.id })
        }).catch(() => {});
-   
+
        return json(res, 200, {
          ok: true,
          added: trackUri,
@@ -3004,10 +3030,17 @@ const routes = {
          if (meta.r.ok) snapshot_id = meta.json?.snapshot_id || null;
        }
    
-       // Locks laden
-       const locksR = await sb(`/rest/v1/playlist_item_locks?select=track_id,is_locked,locked_position&playlist_id=eq.${encodeURIComponent(p.id)}`);
+       // Locks laden (inkl. expiry_weeks für per-Song Expiry)
+       const locksR = await sb(`/rest/v1/playlist_item_locks?select=track_id,is_locked,locked_position,expiry_weeks&playlist_id=eq.${encodeURIComponent(p.id)}`);
        const locksArr = locksR.ok ? await locksR.json() : [];
        const lockedSet = new Set(locksArr.filter(x => x.is_locked).map(x => x.track_id));
+       // Map für per-Song Expiry: track_id -> expiry_weeks (nur wenn gesetzt)
+       const expiryWeeksMap = new Map();
+       for (const lock of locksArr) {
+         if (lock.track_id && lock.expiry_weeks !== null && lock.expiry_weeks !== undefined && Number(lock.expiry_weeks) > 0) {
+           expiryWeeksMap.set(lock.track_id, Number(lock.expiry_weeks));
+         }
+       }
    
        // Spotify Tracks robust holen
        const items = [];
@@ -3154,7 +3187,8 @@ const routes = {
        /* === (A) Expiry: alte, UNGElOCKTE Items löschen (positionsgenau) === */
        let removedPositionsSet = new Set();
        if (USER_ALLOW_AUTO && p.auto_remove_enabled && Number(p.auto_remove_weeks) > 0) {
-         const cutoffMs = Date.now() - Number(p.auto_remove_weeks) * 7 * 24 * 3600 * 1000;
+         const masterExpiryWeeks = Number(p.auto_remove_weeks);
+         const masterCutoffMs = Date.now() - masterExpiryWeeks * 7 * 24 * 3600 * 1000;
          const toRemoveMap = new Map(); // uri -> positions[]
    
          for (let i = 0; i < items.length; i++) {
@@ -3164,6 +3198,15 @@ const routes = {
            if (lockedSet.has(t.id)) continue; // gelockte nie löschen
            const addedAt = it.added_at ? Date.parse(it.added_at) : NaN;
            if (!Number.isFinite(addedAt)) continue;
+           
+           // Prüfe per-Song Expiry (falls vorhanden), sonst Master Expiry
+           const songExpiryWeeks = expiryWeeksMap.get(t.id);
+           let cutoffMs = masterCutoffMs;
+           if (songExpiryWeeks && songExpiryWeeks > 0) {
+             // Per-Song Expiry: kann länger sein als Master Expiry
+             cutoffMs = Date.now() - songExpiryWeeks * 7 * 24 * 3600 * 1000;
+           }
+           
            if (addedAt <= cutoffMs) {
              if (!toRemoveMap.has(t.uri)) toRemoveMap.set(t.uri, []);
              toRemoveMap.get(t.uri).push(i);
@@ -4125,7 +4168,10 @@ const routes = {
      const usr = await sb(`/rest/v1/app_users?select=bubble_user_id&limit=1&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r=>r.json());
      if (!usr?.[0]) return bad(res, 401, "Unknown bubble_user_id");
    
-     const { playlist_id, track_id, locked_position, is_locked = true } = await readBody(req);
+     const { playlist_id, track_id, locked_position, is_locked = true, expiry_weeks, exp_weeks } = await readBody(req);
+     
+     // Unterstütze sowohl expiry_weeks als auch exp_weeks (exp_weeks hat Priorität)
+     const expiryWeeksParam = exp_weeks !== undefined ? exp_weeks : expiry_weeks;
    
      // Wichtig: 0 ist ein gültiger Wert → nicht mit !locked_position prüfen
      if (!playlist_id || !track_id || locked_position === undefined || locked_position === null) {
@@ -4141,17 +4187,39 @@ const routes = {
      if (!Number.isFinite(rawPos)) return bad(res, 400, "invalid locked_position");
      const lockedPosZero = rawPos >= 1 ? rawPos - 1 : Math.max(0, rawPos);
    
-     // upsert lock (jetzt 0-basiert speichern)
+     // expiry_weeks validieren und normalisieren
+     // Wenn expiry_weeks explizit auf null gesetzt wird, soll es entfernt werden
+     // Wenn es nicht gesetzt ist (undefined), bleibt der alte Wert erhalten
+     let expiryWeeksValue = undefined;
+     if (expiryWeeksParam !== undefined) {
+       if (expiryWeeksParam === null || expiryWeeksParam === "") {
+         expiryWeeksValue = null; // Explizit entfernen
+       } else {
+         const expiryWeeksNum = Number(expiryWeeksParam);
+         if (Number.isFinite(expiryWeeksNum) && expiryWeeksNum > 0) {
+           expiryWeeksValue = expiryWeeksNum;
+         } else {
+           expiryWeeksValue = null; // Ungültiger Wert -> entfernen
+         }
+       }
+     }
+   
+     // upsert lock (jetzt 0-basiert speichern, mit optionalem expiry_weeks)
+     const lockData = {
+       playlist_id,
+       track_id,
+       locked_position: lockedPosZero,
+       is_locked: !!is_locked,
+       locked_at: new Date().toISOString()
+     };
+     if (expiryWeeksValue !== undefined) {
+       lockData.expiry_weeks = expiryWeeksValue;
+     }
+     
      const up = await sb(`/rest/v1/playlist_item_locks?on_conflict=playlist_id,track_id`, {
        method: "POST",
        headers: { Prefer: "resolution=merge-duplicates,return=representation" },
-       body: JSON.stringify([{
-         playlist_id,
-         track_id,
-         locked_position: lockedPosZero,
-         is_locked: !!is_locked,
-         locked_at: new Date().toISOString()
-       }]),
+       body: JSON.stringify([lockData]),
      });
      if (!up.ok) return bad(res, 500, `supabase_upsert_failed: ${await up.text()}`);
      const data = await up.json();
