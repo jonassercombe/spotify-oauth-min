@@ -4,6 +4,8 @@ export const config = { api: { bodyParser: false } };
 /* ==============================
    Shared Utils (Server-only)
 ============================== */
+// hi!
+
 const json = (res, code, payload) => res.status(code).json(payload);
 const bad  = (res, code, msg) => json(res, code, { error: msg });
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
