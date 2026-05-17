@@ -35,6 +35,44 @@ function Field({ label, children }) {
   );
 }
 
+function normalizeSpotifyImageUrl(url) {
+  if (!url) return "";
+  const value = String(url).trim();
+  const match = value.match(/^https:\/\/image-cdn-[^.]+\.spotifycdn\.com\/image\/([^/?#]+)/i);
+  if (match?.[1]) return `https://i.scdn.co/image/${match[1]}`;
+  return value;
+}
+
+function Artwork({ src, alt = "", size = "md" }) {
+  const normalized = normalizeSpotifyImageUrl(src);
+  const [currentSrc, setCurrentSrc] = useState(normalized);
+  const [failed, setFailed] = useState(!normalized);
+
+  useEffect(() => {
+    const next = normalizeSpotifyImageUrl(src);
+    setCurrentSrc(next);
+    setFailed(!next);
+  }, [src]);
+
+  if (failed || !currentSrc) {
+    return <div className={`coverFallback ${size}`} aria-hidden="true" />;
+  }
+
+  return (
+    <img
+      className={`artwork ${size}`}
+      src={currentSrc}
+      alt={alt}
+      referrerPolicy="no-referrer"
+      loading="lazy"
+      onError={() => {
+        if (currentSrc !== src && src) setCurrentSrc(src);
+        else setFailed(true);
+      }}
+    />
+  );
+}
+
 export default function PlaylistManager() {
   const [supabase, setSupabase] = useState(null);
   const [session, setSession] = useState(null);
@@ -418,7 +456,7 @@ export default function PlaylistManager() {
                 key={p.id}
                 onClick={() => setPlaylistId(p.id)}
               >
-                {p.image ? <img src={p.image} alt="" /> : <div className="coverFallback" />}
+                <Artwork src={p.image} alt="" size="lg" />
                 <span>
                   <strong>{p.name}</strong>
                   <small>
@@ -437,6 +475,7 @@ export default function PlaylistManager() {
           </div>
 
           <div className="playlistHeader">
+            <Artwork src={playlist?.image} alt="" size="xl" />
             <div>
               <h2>Selected Playlist</h2>
               <h3>{playlist?.name || "No playlist selected"}</h3>
@@ -494,32 +533,36 @@ export default function PlaylistManager() {
               {filteredTracks.map((track) => (
                 <article key={`${track.position}-${track.track_id}`} className="trackRow">
                   <div className="pos">{Number(track.position) + 1}</div>
-                  <div className="age">{track.age_label || "age unknown"}</div>
-                  {track.cover_url ? <img src={track.cover_url} alt="" /> : <div className="coverFallback" />}
+                  <Artwork src={track.cover_url} alt="" size="sm" />
                   <div className="trackMeta">
                     <strong>{track.track_name || track.track_id}</strong>
                     <span>{track.artist_names || "Unknown artist"} · {track.album_name || "Unknown album"}</span>
+                    <small>
+                      {track.age_label || "age unknown"}
+                      {track.duration_formatted ? ` · ${track.duration_formatted}` : ""}
+                    </small>
                   </div>
-                  <div className="duration">{track.duration_formatted || ""}</div>
                   <div className="badges">
                     {track.is_locked ? <span className="locked">Locked</span> : null}
                     {track.expiry_weeks ? <span className="expiry">{track.expiry_weeks}w</span> : null}
                   </div>
-                  <button disabled={busy} onClick={() => toggleLock(track)}>
-                    {track.is_locked ? "Unlock" : "Set Lock"}
-                  </button>
-                  <button disabled={busy} onClick={() => setSongExpiry(track)}>
-                    Exp
-                  </button>
-                  <button disabled={busy || track.position <= 0} onClick={() => moveTrack(track, "up")}>
-                    ↑
-                  </button>
-                  <button disabled={busy} onClick={() => moveTrack(track, "down")}>
-                    ↓
-                  </button>
-                  <button className="danger" disabled={busy} onClick={() => removeTrack(track)}>
-                    Remove
-                  </button>
+                  <div className="rowActions">
+                    <button className="compact" disabled={busy} onClick={() => toggleLock(track)}>
+                      {track.is_locked ? "Unlock" : "Set Lock"}
+                    </button>
+                    <button className="compact" disabled={busy} onClick={() => setSongExpiry(track)}>
+                      Exp
+                    </button>
+                    <button className="iconButton" aria-label="Move up" disabled={busy || track.position <= 0} onClick={() => moveTrack(track, "up")}>
+                      ↑
+                    </button>
+                    <button className="iconButton" aria-label="Move down" disabled={busy} onClick={() => moveTrack(track, "down")}>
+                      ↓
+                    </button>
+                    <button className="compact danger" disabled={busy} onClick={() => removeTrack(track)}>
+                      Remove
+                    </button>
+                  </div>
                 </article>
               ))}
             </div>
@@ -563,15 +606,21 @@ export default function PlaylistManager() {
         input:focus, select:focus {
           border-color: #18e06f;
         }
+        * {
+          box-sizing: border-box;
+        }
         main {
           min-height: 100vh;
+          width: 100%;
+          overflow-x: hidden;
         }
         .topbar {
           display: flex;
           justify-content: space-between;
           align-items: center;
-          padding: 28px 40px;
+          padding: 22px clamp(20px, 3vw, 40px);
           gap: 24px;
+          min-height: 116px;
         }
         .brand {
           display: flex;
@@ -592,18 +641,18 @@ export default function PlaylistManager() {
           margin: 0;
         }
         h1 {
-          font-size: 34px;
+          font-size: 30px;
           line-height: 1;
         }
-        .brand p, .playlistHeader p, small, .trackMeta span, .age, .duration {
+        .brand p, .playlistHeader p, small, .trackMeta span {
           color: #a6adba;
         }
         nav {
           display: flex;
           align-items: center;
-          gap: 32px;
+          gap: 18px;
           color: #18e06f;
-          font-size: 18px;
+          font-size: 16px;
         }
         nav button {
           min-width: 112px;
@@ -646,13 +695,15 @@ export default function PlaylistManager() {
         nav .active {
           border: 1px solid #18e06f;
           border-radius: 8px;
-          padding: 16px 22px;
+          padding: 12px 16px;
         }
         .workspace {
           display: grid;
-          grid-template-columns: minmax(340px, 30vw) 1fr;
-          gap: 34px;
-          padding: 36px 40px 52px;
+          grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
+          gap: clamp(18px, 2vw, 28px);
+          height: calc(100vh - 116px);
+          padding: 18px clamp(20px, 3vw, 40px) 28px;
+          overflow: hidden;
         }
         .sidebar, .content {
           min-width: 0;
@@ -670,7 +721,9 @@ export default function PlaylistManager() {
         .sidebar {
           display: grid;
           align-content: start;
-          gap: 20px;
+          grid-template-rows: auto auto auto auto auto minmax(0, 1fr);
+          gap: 14px;
+          min-height: 0;
         }
         .sectionTitle, .trackPanelHeader, .playlistHeader, .addTrack, .statusLine {
           display: flex;
@@ -680,19 +733,20 @@ export default function PlaylistManager() {
         }
         .playlistList {
           display: grid;
-          gap: 18px;
-          max-height: 72vh;
+          align-content: start;
+          gap: 12px;
+          min-height: 0;
           overflow: auto;
           padding-right: 6px;
         }
         .playlistCard {
           display: grid;
-          grid-template-columns: 76px 1fr;
+          grid-template-columns: 64px minmax(0, 1fr);
           align-items: center;
-          gap: 18px;
+          gap: 14px;
           width: 100%;
-          min-height: 116px;
-          padding: 20px;
+          min-height: 88px;
+          padding: 12px;
           border-color: #2a303b;
           color: #f4f6fb;
           text-align: left;
@@ -700,24 +754,52 @@ export default function PlaylistManager() {
         .playlistCard.selected {
           border-color: #18e06f;
         }
-        .playlistCard img, .coverFallback {
-          width: 76px;
-          height: 76px;
+        .artwork, .coverFallback {
+          display: block;
           border-radius: 4px;
           object-fit: cover;
           background: #303743;
+          flex: 0 0 auto;
+        }
+        .sm {
+          width: 52px;
+          height: 52px;
+        }
+        .lg {
+          width: 64px;
+          height: 64px;
+        }
+        .xl {
+          width: 112px;
+          height: 112px;
+          border-radius: 6px;
+        }
+        .coverFallback {
+          background:
+            linear-gradient(135deg, rgba(24, 224, 111, 0.2), transparent 44%),
+            #303743;
         }
         .playlistCard span {
           display: grid;
           gap: 8px;
+          min-width: 0;
+        }
+        .playlistCard strong,
+        .playlistCard small {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
         }
         .playlistCard strong {
-          font-size: 18px;
+          font-size: 16px;
         }
         .content {
           display: grid;
           align-content: start;
-          gap: 28px;
+          grid-template-rows: auto auto auto minmax(0, 1fr);
+          gap: 18px;
+          min-height: 0;
+          overflow: hidden;
         }
         .statusLine {
           min-height: 24px;
@@ -728,18 +810,23 @@ export default function PlaylistManager() {
           font-weight: 700;
         }
         .playlistHeader {
+          display: grid;
+          grid-template-columns: auto minmax(0, 1fr) auto;
           align-items: end;
+          padding-bottom: 2px;
         }
         .playlistHeader h2 {
-          font-size: 32px;
+          font-size: 20px;
+          color: #a6adba;
         }
         .playlistHeader h3 {
-          margin-top: 26px;
-          font-size: 28px;
+          margin-top: 8px;
+          font-size: clamp(24px, 3vw, 34px);
+          line-height: 1.08;
         }
         .playlistHeader p {
-          margin-top: 18px;
-          font-size: 18px;
+          margin-top: 10px;
+          font-size: 16px;
         }
         .headerActions {
           display: flex;
@@ -753,11 +840,12 @@ export default function PlaylistManager() {
         }
         .addTrack {
           display: grid;
-          grid-template-columns: auto minmax(220px, 1fr) auto auto 56px;
+          grid-template-columns: auto minmax(180px, 1fr) auto auto 52px;
           align-items: end;
+          gap: 12px;
         }
         .addTrack strong {
-          font-size: 24px;
+          font-size: 18px;
           padding-bottom: 11px;
         }
         .addTrack button {
@@ -769,32 +857,35 @@ export default function PlaylistManager() {
         .trackPanel {
           border: 1px solid #2a303b;
           background: #181c23;
+          min-height: 0;
+          overflow: hidden;
+          display: grid;
+          grid-template-rows: auto minmax(0, 1fr);
         }
         .trackPanelHeader {
           background: #222831;
-          padding: 22px 26px;
+          padding: 16px 18px;
         }
         .trackPanelHeader h2 {
-          font-size: 24px;
+          font-size: 22px;
         }
         .trackPanelHeader input {
           width: min(360px, 45%);
         }
         .trackList {
           display: grid;
+          align-content: start;
+          min-height: 0;
+          overflow: auto;
         }
         .trackRow {
           display: grid;
-          grid-template-columns: 52px 160px 52px minmax(220px, 1fr) 54px 110px auto auto 48px 48px auto;
+          grid-template-columns: 44px 52px minmax(180px, 1fr) minmax(74px, auto) minmax(330px, auto);
           align-items: center;
-          gap: 14px;
-          min-height: 92px;
-          padding: 16px 24px;
+          gap: 12px;
+          min-height: 76px;
+          padding: 12px 16px;
           border-top: 1px solid #202630;
-        }
-        .trackRow img, .trackRow .coverFallback {
-          width: 52px;
-          height: 52px;
         }
         .trackMeta {
           display: grid;
@@ -806,15 +897,19 @@ export default function PlaylistManager() {
           text-overflow: ellipsis;
           white-space: nowrap;
         }
+        .trackMeta small {
+          display: none;
+        }
         .pos {
           color: #a6adba;
-          font-size: 18px;
+          font-size: 16px;
           text-align: center;
         }
         .badges {
           display: flex;
           gap: 6px;
           min-height: 24px;
+          justify-content: flex-end;
         }
         .badges span {
           border-radius: 999px;
@@ -835,6 +930,47 @@ export default function PlaylistManager() {
           background: #ef4242;
           color: white;
         }
+        .rowActions {
+          display: grid;
+          grid-template-columns: minmax(82px, auto) 48px 42px 42px minmax(82px, auto);
+          align-items: center;
+          gap: 8px;
+          justify-content: end;
+        }
+        .compact,
+        .iconButton {
+          min-height: 38px;
+          padding: 7px 10px;
+          white-space: nowrap;
+        }
+        .iconButton {
+          width: 42px;
+          padding: 7px 0;
+          font-size: 18px;
+          line-height: 1;
+        }
+        @media (max-width: 1320px) {
+          .workspace {
+            grid-template-columns: minmax(280px, 330px) minmax(0, 1fr);
+          }
+          .trackRow {
+            grid-template-columns: 42px 52px minmax(160px, 1fr) minmax(70px, auto);
+          }
+          .rowActions {
+            grid-column: 3 / -1;
+            grid-row: 2;
+            justify-content: start;
+          }
+          .badges {
+            justify-content: flex-end;
+          }
+          .trackMeta small {
+            display: block;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+          }
+        }
         @media (max-width: 1100px) {
           .topbar, nav, .playlistHeader, .sectionTitle {
             align-items: flex-start;
@@ -848,16 +984,29 @@ export default function PlaylistManager() {
           }
           .workspace {
             grid-template-columns: 1fr;
+            height: auto;
+            overflow: visible;
             padding: 24px;
           }
+          .content {
+            overflow: visible;
+          }
+          .playlistList {
+            max-height: 42vh;
+          }
+          .playlistHeader {
+            grid-template-columns: auto minmax(0, 1fr);
+          }
+          .headerActions {
+            grid-column: 1 / -1;
+            justify-content: flex-start;
+          }
           .trackRow {
-            grid-template-columns: 42px 1fr auto auto;
+            grid-template-columns: 42px 52px minmax(0, 1fr);
           }
-          .age, .duration, .badges {
-            display: none;
-          }
-          .trackRow img, .trackRow .coverFallback {
-            display: none;
+          .badges {
+            grid-column: 3;
+            justify-content: flex-start;
           }
         }
         @media (max-width: 720px) {
@@ -890,7 +1039,12 @@ export default function PlaylistManager() {
             align-items: center;
           }
           .playlistHeader {
-            align-items: stretch;
+            grid-template-columns: 72px minmax(0, 1fr);
+            align-items: center;
+          }
+          .playlistHeader .xl {
+            width: 72px;
+            height: 72px;
           }
           .headerActions {
             display: grid;
@@ -919,10 +1073,44 @@ export default function PlaylistManager() {
             box-sizing: border-box;
           }
           .playlistHeader h2 {
-            font-size: 26px;
+            font-size: 14px;
           }
           .playlistHeader h3 {
-            font-size: 22px;
+            font-size: 21px;
+            overflow-wrap: anywhere;
+          }
+          .trackPanelHeader {
+            display: grid;
+            align-items: stretch;
+          }
+          .trackPanelHeader input {
+            width: 100%;
+          }
+          .trackRow {
+            grid-template-columns: 34px minmax(0, 1fr);
+            gap: 10px;
+            padding: 12px;
+          }
+          .trackRow .sm {
+            display: none;
+          }
+          .trackMeta {
+            grid-column: 2;
+          }
+          .badges {
+            grid-column: 2;
+          }
+          .rowActions {
+            grid-column: 2;
+            grid-template-columns: repeat(2, minmax(0, 1fr)) 40px 40px;
+            justify-content: stretch;
+          }
+          .rowActions .danger {
+            grid-column: 1 / -1;
+          }
+          .compact,
+          .iconButton {
+            width: 100%;
           }
         }
       `}</style>
