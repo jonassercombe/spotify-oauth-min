@@ -1053,9 +1053,9 @@ export default function PlaylistManager() {
           display: grid;
           grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
           gap: clamp(18px, 2vw, 28px);
-          height: calc(100vh - 116px);
+          min-height: calc(100vh - 116px);
           padding: 18px clamp(20px, 3vw, 40px) 28px;
-          overflow: hidden;
+          align-items: start;
         }
         .sidebar, .content {
           min-width: 0;
@@ -1088,7 +1088,6 @@ export default function PlaylistManager() {
           align-content: start;
           gap: 12px;
           min-height: 0;
-          overflow: auto;
           padding-right: 6px;
         }
         .playlistCard {
@@ -1106,27 +1105,28 @@ export default function PlaylistManager() {
         .playlistCard.selected {
           border-color: #18e06f;
         }
-        .artwork, .coverFallback {
+        :global(.artwork), :global(.coverFallback) {
           display: block;
           border-radius: 4px;
           object-fit: cover;
           background: #303743;
           flex: 0 0 auto;
+          max-width: 100%;
         }
-        .artwork--sm {
+        :global(.artwork--sm) {
           width: 52px;
           height: 52px;
         }
-        .artwork--lg {
+        :global(.artwork--lg) {
           width: 64px;
           height: 64px;
         }
-        .artwork--xl {
+        :global(.artwork--xl) {
           width: 92px;
           height: 92px;
           border-radius: 6px;
         }
-        .coverFallback {
+        :global(.coverFallback) {
           background:
             linear-gradient(135deg, rgba(24, 224, 111, 0.2), transparent 44%),
             #303743;
@@ -1148,10 +1148,8 @@ export default function PlaylistManager() {
         .content {
           display: grid;
           align-content: start;
-          grid-template-rows: auto auto auto auto minmax(0, 1fr);
           gap: 18px;
           min-height: 0;
-          overflow: hidden;
         }
         .statusLine {
           min-height: 24px;
@@ -1268,9 +1266,7 @@ export default function PlaylistManager() {
           border: 1px solid #2a303b;
           background: #181c23;
           min-height: 0;
-          overflow: hidden;
           display: grid;
-          grid-template-rows: auto minmax(0, 1fr);
         }
         .trackPanelHeader {
           background: #222831;
@@ -1286,7 +1282,6 @@ export default function PlaylistManager() {
           display: grid;
           align-content: start;
           min-height: 0;
-          overflow: auto;
         }
         .trackRow {
           display: grid;
@@ -1461,7 +1456,7 @@ export default function PlaylistManager() {
             grid-template-columns: 72px minmax(0, 1fr);
             align-items: center;
           }
-          .playlistHeader .artwork--xl {
+          .playlistHeader :global(.artwork--xl) {
             width: 72px;
             height: 72px;
           }
@@ -1519,7 +1514,7 @@ export default function PlaylistManager() {
             gap: 10px;
             padding: 12px;
           }
-          .trackRow .artwork--sm {
+          .trackRow :global(.artwork--sm) {
             display: none;
           }
           .trackMeta {
