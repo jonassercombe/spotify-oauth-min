@@ -75,6 +75,81 @@ function checkAppSecret(req) {
   return true;
 }
 
+function getBearerToken(req) {
+  const auth = req.headers?.authorization || "";
+  const match = String(auth).match(/^Bearer\s+(.+)$/i);
+  return match ? match[1] : "";
+}
+
+function getPublicSupabaseKey() {
+  return process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY || "";
+}
+
+async function getSupabaseAuthUser(req) {
+  const token = getBearerToken(req);
+  const publicKey = getPublicSupabaseKey();
+  if (!token || !publicKey) return null;
+
+  const r = await fetch(`${need("SUPABASE_URL")}/auth/v1/user`, {
+    headers: {
+      apikey: publicKey,
+      Authorization: `Bearer ${token}`,
+    },
+    cache: "no-store",
+  });
+
+  if (!r.ok) return null;
+  return await r.json().catch(() => null);
+}
+
+async function getUserContext(req) {
+  const authUser = await getSupabaseAuthUser(req);
+  if (!authUser?.id || !authUser?.email) return null;
+
+  const email = String(authUser.email).trim().toLowerCase();
+  const byAuth = await sb(
+    `/rest/v1/user_identity_links?select=auth_user_id,email,bubble_user_id,role&limit=1&auth_user_id=eq.${encodeURIComponent(authUser.id)}`
+  );
+  const authRows = byAuth.ok ? await byAuth.json().catch(() => []) : [];
+  let link = authRows?.[0] || null;
+
+  if (!link) {
+    const byEmail = await sb(
+      `/rest/v1/user_identity_links?select=id,auth_user_id,email,bubble_user_id,role&limit=1&email=eq.${encodeURIComponent(email)}`
+    );
+    const emailRows = byEmail.ok ? await byEmail.json().catch(() => []) : [];
+    link = emailRows?.[0] || null;
+
+    if (link && !link.auth_user_id) {
+      await sb(`/rest/v1/user_identity_links?id=eq.${encodeURIComponent(link.id)}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({ auth_user_id: authUser.id, updated_at: new Date().toISOString() }),
+      }).catch(() => {});
+      link.auth_user_id = authUser.id;
+    }
+  }
+
+  if (!link?.bubble_user_id) return { authUser, email, linked: false };
+  return {
+    authUser,
+    email,
+    linked: true,
+    bubble_user_id: link.bubble_user_id,
+    role: link.role || "user",
+  };
+}
+
+async function bubbleUserIdFromRequest(req, explicitValue = "") {
+  const fromHeader = String(req.headers?.["x-bubble-user-id"] || "").trim();
+  if (fromHeader) return fromHeader;
+
+  const ctx = await getUserContext(req);
+  if (ctx?.bubble_user_id) return ctx.bubble_user_id;
+
+  return String(explicitValue || "").trim();
+}
+
 /* ==============================
    Spotify helpers
 ============================== */
@@ -345,12 +420,35 @@ function normalizePaypalSubscription(json) {
 const routes = {
 
 
+  /* ---------- auth/me (GET) ---------- */
+  "auth/me": async (req, res) => {
+    if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+    const ctx = await getUserContext(req);
+    if (!ctx?.authUser) return bad(res, 401, "not_authenticated");
+    if (!ctx.linked) {
+      return json(res, 403, {
+        ok: false,
+        linked: false,
+        email: ctx.email,
+        error: "user_not_linked",
+      });
+    }
+
+    return json(res, 200, {
+      ok: true,
+      linked: true,
+      email: ctx.email,
+      bubble_user_id: ctx.bubble_user_id,
+      role: ctx.role,
+    });
+  },
+
 
 
    /* ---------- users/settings/get (GET) ---------- */
    "users/settings/get": async (req, res) => {
      if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
-     const bubbleUserId = req.headers["x-bubble-user-id"];
+     const bubbleUserId = await bubbleUserIdFromRequest(req);
      if (!bubbleUserId) return bad(res, 401, "missing_x_bubble_user_id");
    
      // HINWEIS: Wenn du die View-Variante nutzt, ersetze /app_users durch /app_users_with_seats
@@ -410,7 +508,7 @@ const routes = {
    /* ---------- users/settings/save (POST) ---------- */
    "users/settings/save": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
-     const bubbleUserId = req.headers["x-bubble-user-id"];
+     const bubbleUserId = await bubbleUserIdFromRequest(req);
      if (!bubbleUserId) return bad(res, 401, "missing_x_bubble_user_id");
    
      const b = await readBody(req);
@@ -727,7 +825,7 @@ const routes = {
    // GET subscriptions/status
    "subscriptions/status": async (req, res) => {
      if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
-     const bubble_user_id = String(req.query.bubble_user_id || "").trim();
+     const bubble_user_id = await bubbleUserIdFromRequest(req, req.query.bubble_user_id);
      if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
    
      const r = await sb(
@@ -883,7 +981,7 @@ const routes = {
      }
      if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
    
-     const bubble_user_id = String(req.query.bubble_user_id || "").trim();
+     const bubble_user_id = await bubbleUserIdFromRequest(req, req.query.bubble_user_id);
      if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
    
      // Default: nur aktive. Mit ?include_inactive=1 bekommst du alle.
@@ -923,7 +1021,7 @@ const routes = {
    */
    "connections/activate": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
-     const bubbleUserId = req.headers["x-bubble-user-id"];
+     const bubbleUserId = await bubbleUserIdFromRequest(req);
      if (!bubbleUserId) return bad(res, 401, "missing_x_bubble_user_id");
    
      const b = await readBody(req);
@@ -978,7 +1076,7 @@ const routes = {
    "connections/disconnect": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
    
-     const bubbleUserId = req.headers["x-bubble-user-id"];
+     const bubbleUserId = await bubbleUserIdFromRequest(req);
      if (!bubbleUserId) return bad(res, 401, "missing_x_bubble_user_id");
    
      const body = await readBody(req);
@@ -1037,7 +1135,7 @@ const routes = {
      const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK } = process.env;
      if (!SUPABASE_URL || !SRK) return bad(res, 500, "missing_env");
    
-     const bubble_user_id = req.query.bubble_user_id;
+     const bubble_user_id = await bubbleUserIdFromRequest(req, req.query.bubble_user_id);
      if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
    
      const limit = Math.max(1, Math.min(100, Number(req.query.limit || "10")));
@@ -1343,7 +1441,7 @@ const routes = {
    */
    "dashboard/growth/note/save": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
-     const bubbleUserId = req.headers["x-bubble-user-id"];
+     const bubbleUserId = await bubbleUserIdFromRequest(req);
      if (!bubbleUserId) return bad(res, 401, "missing_x_bubble_user_id");
    
      const body = await readBody(req);
@@ -1414,7 +1512,7 @@ const routes = {
      const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK } = process.env;
      if (!SUPABASE_URL || !SRK) return bad(res, 500, "missing_env");
    
-     const bubble_user_id = req.query.bubble_user_id;
+     const bubble_user_id = await bubbleUserIdFromRequest(req, req.query.bubble_user_id);
      if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
    
      const days = Math.max(1, Math.min(365, Number(req.query.days || "30")));
@@ -1522,7 +1620,7 @@ const routes = {
   const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK } = process.env;
   if (!SUPABASE_URL || !SRK) return bad(res, 500, "missing_env");
 
-  const bubble_user_id = req.query.bubble_user_id;
+  const bubble_user_id = await bubbleUserIdFromRequest(req, req.query.bubble_user_id);
   if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
 
   const days = Math.max(1, Math.min(365, Number(req.query.days || "7")));
@@ -1749,7 +1847,7 @@ const routes = {
    "playlist-items/add": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
    
-     const bubbleUserId = req.headers["x-bubble-user-id"];
+     const bubbleUserId = await bubbleUserIdFromRequest(req);
      if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
    
      try {
@@ -2283,7 +2381,7 @@ const routes = {
    /* ---------- playlists/settings/save (POST, Bubble) ---------- */
    "playlists/settings/save": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
-     const bubbleUserId = req.headers["x-bubble-user-id"];
+     const bubbleUserId = await bubbleUserIdFromRequest(req);
      if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
    
      const { playlist_id, auto_remove_enabled, auto_remove_weeks } = await readBody(req);
@@ -2312,6 +2410,16 @@ const routes = {
      });
      if (!r.ok) return bad(res, 500, `supabase_patch_failed: ${await r.text()}`);
      const data = await r.json();
+
+     const base = process.env.PUBLIC_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
+     if (base) {
+       fetch(`${base}/api/playlists/dispatch-sync`, {
+         method: "POST",
+         headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+         body: JSON.stringify({ playlist_id })
+       }).catch(() => {});
+     }
+
      return json(res, 200, { ok:true, playlist: Array.isArray(data) ? data[0] : data });
    },
    
@@ -2577,7 +2685,7 @@ const routes = {
      if (!playlist_id) return bad(res, 400, "missing_playlist_id");
    
      // Entweder Bubble-User prüft Ownership ODER interner Secret-Call:
-     const bubbleUserId = req.headers["x-bubble-user-id"];
+     const bubbleUserId = await bubbleUserIdFromRequest(req);
      const isInternal = checkAppSecret(req) || checkCronAuth(req);
    
      if (!isInternal) {
@@ -2630,7 +2738,7 @@ const routes = {
      const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK } = process.env;
      if (!SUPABASE_URL || !SRK) return bad(res, 500, "missing_env");
    
-     const bubble_user_id = req.query.bubble_user_id;
+     const bubble_user_id = await bubbleUserIdFromRequest(req, req.query.bubble_user_id);
      if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
    
      // optionales Filter fürs Dropdown (nur Playlists einer Connection anzeigen)
@@ -3451,10 +3559,6 @@ const routes = {
   /* ---------- playlists/sync (POST, secret) ---------- */
   "playlists/sync": async (req, res) => {
     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
-    if (process.env.APP_WEBHOOK_SECRET) {
-      const got = req.headers["x-app-secret"];
-      if (got !== process.env.APP_WEBHOOK_SECRET) return bad(res, 401, "unauthorized");
-    }
     const body = await readBody(req);
     const connection_id = body.connection_id;
     if (!connection_id) return bad(res, 400, "missing_connection_id");
@@ -3464,6 +3568,13 @@ const routes = {
     if (!cr.ok) return bad(res, 500, `supabase select connection failed: ${await cr.text()}`);
     const conn = (await cr.json())[0];
     if (!conn) return bad(res, 404, "connection_not_found");
+
+    if (process.env.APP_WEBHOOK_SECRET) {
+      const got = req.headers["x-app-secret"];
+      const bubbleUserId = await bubbleUserIdFromRequest(req);
+      const isOwner = bubbleUserId && bubbleUserId === conn.bubble_user_id;
+      if (got !== process.env.APP_WEBHOOK_SECRET && !isOwner) return bad(res, 401, "unauthorized");
+    }
 
     const refresh_token = decryptToken(conn.refresh_token_enc);
     const token = await refreshAccessToken(refresh_token);
@@ -3943,7 +4054,7 @@ const routes = {
    /* ---------- playlist-items/move (POST) ---------- */
    "playlist-items/move": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
-     const bubbleUserId = req.headers["x-bubble-user-id"];
+     const bubbleUserId = await bubbleUserIdFromRequest(req);
      if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
    
      const { playlist_id, track_id, dir, steps = 1 } = await readBody(req);
@@ -3967,8 +4078,14 @@ const routes = {
      let j = null; try { j = txt ? JSON.parse(txt) : null; } catch {}
      if (!r.ok) return bad(res, r.status, `rpc_move_failed: ${txt}`);
    
-     // optional: Spotify Enforce anstoßen (asynchron)
-     // await routes["playlists/dispatch-sync"]({ ...req, body: { playlist_id } }, { status: ()=>({ json: ()=>{} }) });
+     const base = process.env.PUBLIC_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
+     if (base) {
+       fetch(`${base}/api/playlists/dispatch-sync`, {
+         method: "POST",
+         headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+         body: JSON.stringify({ playlist_id })
+       }).catch(() => {});
+     }
    
      return json(res, 200, { ok: true, result: j?.[0] || null });
    },
@@ -3978,7 +4095,7 @@ const routes = {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
    
      // Auth per Bubble
-     const bubbleUserId = req.headers["x-bubble-user-id"];
+     const bubbleUserId = await bubbleUserIdFromRequest(req);
      if (!bubbleUserId) return bad(res, 401, "missing_x_bubble_user_id");
    
      const body = await readBody(req);
@@ -4163,7 +4280,7 @@ const routes = {
   /* ---------- locks/set (POST, Bubble) ---------- */
   "locks/set": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "Method not allowed");
-     const bubbleUserId = req.headers["x-bubble-user-id"];
+     const bubbleUserId = await bubbleUserIdFromRequest(req);
      if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
    
      // user exists?
@@ -4225,6 +4342,16 @@ const routes = {
      });
      if (!up.ok) return bad(res, 500, `supabase_upsert_failed: ${await up.text()}`);
      const data = await up.json();
+
+     const base = process.env.PUBLIC_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
+     if (base) {
+       fetch(`${base}/api/playlists/dispatch-sync`, {
+         method: "POST",
+         headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+         body: JSON.stringify({ playlist_id })
+       }).catch(() => {});
+     }
+
      return json(res, 200, { ok:true, lock: Array.isArray(data) ? data[0] : data });
    },
 
@@ -4232,7 +4359,7 @@ const routes = {
   /* ---------- locks/unset (POST, Bubble) ---------- */
   "locks/unset": async (req, res) => {
     if (req.method !== "POST") return bad(res, 405, "Method not allowed");
-    const bubbleUserId = req.headers["x-bubble-user-id"];
+    const bubbleUserId = await bubbleUserIdFromRequest(req);
     if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
 
     const usr = await sb(`/rest/v1/app_users?select=bubble_user_id&limit=1&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r=>r.json());
@@ -4248,6 +4375,16 @@ const routes = {
       method: "DELETE", headers: { Prefer: "return=minimal" }
     });
     if (!del.ok) return bad(res, 500, `supabase_delete_failed: ${await del.text()}`);
+
+    const base = process.env.PUBLIC_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
+    if (base) {
+      fetch(`${base}/api/playlists/dispatch-sync`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+        body: JSON.stringify({ playlist_id })
+      }).catch(() => {});
+    }
+
     return json(res, 200, { ok:true });
   },
 
