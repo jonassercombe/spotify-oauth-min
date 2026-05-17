@@ -104,7 +104,7 @@ function IconButton({ children, className = "", tooltip, label, ...props }) {
   return (
     <button
       {...props}
-      className={`iconButton tooltipButton ${className}`.trim()}
+      className={`actionButton tooltipButton ${className}`.trim()}
       aria-label={label || tooltip}
       title={tooltip}
       data-tooltip={tooltip}
@@ -980,14 +980,14 @@ export default function PlaylistManager() {
                     </div>
                     <div className="rowActions">
                       <button
-                        className="compact tooltipButton"
+                        className="actionButton tooltipButton"
+                        aria-label={track.is_locked ? "Unlock song" : "Lock song"}
                         title={track.is_locked ? "Unlock this song so automation can move or remove it again." : "Lock this song to its current playlist position."}
                         data-tooltip={track.is_locked ? "Unlock this song so automation can move or remove it again." : "Lock this song to its current playlist position."}
                         disabled={busy}
                         onClick={() => toggleLock(track)}
                       >
                         <IconLock locked={track.is_locked} />
-                        {track.is_locked ? "Unlock" : "Lock"}
                       </button>
                       <IconButton
                         tooltip="Set or clear a custom expiry timer for this song."
@@ -1666,32 +1666,51 @@ export default function PlaylistManager() {
         }
         .rowActions {
           display: grid;
-          grid-template-columns: minmax(86px, auto) repeat(5, 42px);
+          grid-template-columns: repeat(6, 38px);
           align-items: center;
-          gap: 8px;
+          gap: 6px;
           justify-content: end;
         }
-        .compact,
-        .iconButton {
+        .actionButton {
           position: relative;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 38px;
+          height: 38px;
           min-height: 38px;
-          padding: 7px 10px;
-          white-space: nowrap;
-        }
-        .compact {
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          gap: 7px;
-        }
-        .iconButton {
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          width: 42px;
-          padding: 7px 0;
-          font-size: 18px;
+          padding: 0;
+          border-color: #2fdc7c;
+          background: rgba(24, 224, 111, 0.06);
+          color: #2fe881;
+          border-radius: 7px;
           line-height: 1;
+          box-shadow: inset 0 0 0 1px rgba(24, 224, 111, 0.08);
+          transition: background 120ms ease, border-color 120ms ease, color 120ms ease, transform 120ms ease;
+        }
+        .actionButton:hover:not(:disabled),
+        .actionButton:focus-visible:not(:disabled) {
+          background: rgba(24, 224, 111, 0.15);
+          border-color: #18e06f;
+          color: #f4fff8;
+          transform: translateY(-1px);
+        }
+        .actionButton svg {
+          width: 17px;
+          height: 17px;
+          stroke-width: 2.15;
+        }
+        .actionButton.danger {
+          border-color: rgba(255, 77, 77, 0.7);
+          background: rgba(255, 77, 77, 0.08);
+          color: #ff6b6b;
+          box-shadow: inset 0 0 0 1px rgba(255, 77, 77, 0.08);
+        }
+        .actionButton.danger:hover:not(:disabled),
+        .actionButton.danger:focus-visible:not(:disabled) {
+          background: rgba(255, 77, 77, 0.18);
+          border-color: #ff4d4d;
+          color: #fff4f4;
         }
         .tooltipButton {
           position: relative;
@@ -1921,15 +1940,12 @@ export default function PlaylistManager() {
           }
           .rowActions {
             grid-column: 2;
-            grid-template-columns: repeat(6, minmax(0, 1fr));
+            grid-template-columns: repeat(6, 40px);
             justify-content: stretch;
           }
-          .rowActions .compact {
-            grid-column: 1 / 3;
-          }
-          .compact,
-          .iconButton {
-            width: 100%;
+          .actionButton {
+            width: 40px;
+            height: 40px;
           }
         }
       `}</style>
