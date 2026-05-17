@@ -73,6 +73,28 @@ function Artwork({ src, alt = "", size = "md" }) {
   );
 }
 
+function selectionStorageKey(userContext) {
+  const id = userContext?.bubble_user_id || userContext?.email;
+  return id ? `playlistpilot:selected:${id}` : "";
+}
+
+function readStoredSelection(userContext) {
+  const key = selectionStorageKey(userContext);
+  if (!key || typeof window === "undefined") return {};
+  try {
+    return JSON.parse(window.localStorage.getItem(key) || "{}") || {};
+  } catch {
+    return {};
+  }
+}
+
+function writeStoredSelection(userContext, nextSelection) {
+  const key = selectionStorageKey(userContext);
+  if (!key || typeof window === "undefined") return;
+  const current = readStoredSelection(userContext);
+  window.localStorage.setItem(key, JSON.stringify({ ...current, ...nextSelection }));
+}
+
 export default function PlaylistManager() {
   const [supabase, setSupabase] = useState(null);
   const [session, setSession] = useState(null);
@@ -105,6 +127,7 @@ export default function PlaylistManager() {
       setSession(nextSession || null);
       setUserContext(null);
       setConnections([]);
+      setConnectionId("");
       setPlaylists([]);
       setPlaylistId("");
       setPlaylist(null);
@@ -125,7 +148,8 @@ export default function PlaylistManager() {
   }, [userContext?.linked]);
 
   useEffect(() => {
-    if (!userContext?.linked) return;
+    if (!userContext?.linked || !connectionId) return;
+    writeStoredSelection(userContext, { connectionId });
     loadPlaylists();
   }, [userContext?.linked, connectionId]);
 
@@ -135,6 +159,7 @@ export default function PlaylistManager() {
       setTracks([]);
       return;
     }
+    if (userContext?.linked) writeStoredSelection(userContext, { playlistId });
     loadSelectedPlaylist();
   }, [playlistId]);
 
@@ -206,7 +231,12 @@ export default function PlaylistManager() {
     return run("Connections loaded", async () => {
       const data = await api("/api/connections/list", { accessToken: accessToken() });
       setConnections(data);
-      if (!connectionId && data[0]?.id) setConnectionId(data[0].id);
+      const stored = readStoredSelection(userContext);
+      const storedConnectionId = stored.connectionId && data.some((c) => c.id === stored.connectionId)
+        ? stored.connectionId
+        : "";
+      const nextConnectionId = storedConnectionId || data[0]?.id || "";
+      if (connectionId !== nextConnectionId) setConnectionId(nextConnectionId);
       return data;
     });
   }
@@ -218,9 +248,13 @@ export default function PlaylistManager() {
       const query = qs.toString();
       const data = await api(`/api/playlists/list${query ? `?${query}` : ""}`, { accessToken: accessToken() });
       setPlaylists(data);
-      if (!data.some((p) => p.id === playlistId)) {
-        setPlaylistId(data[0]?.id || "");
-      }
+      const stored = readStoredSelection(userContext);
+      const storedPlaylistId = stored.playlistId && data.some((p) => p.id === stored.playlistId)
+        ? stored.playlistId
+        : "";
+      const currentPlaylistIsValid = playlistId && data.some((p) => p.id === playlistId);
+      const nextPlaylistId = currentPlaylistIsValid ? playlistId : (storedPlaylistId || data[0]?.id || "");
+      if (playlistId !== nextPlaylistId) setPlaylistId(nextPlaylistId);
       return data;
     });
   }
