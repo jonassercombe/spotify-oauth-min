@@ -26,6 +26,19 @@ function formatNumber(value) {
   return new Intl.NumberFormat("en-US").format(value);
 }
 
+function formatDelta(value) {
+  const n = Number(value) || 0;
+  if (n > 0) return `+${formatNumber(n)}`;
+  return formatNumber(n);
+}
+
+function formatShortDate(value) {
+  if (!value) return "";
+  const d = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(d.getTime())) return value;
+  return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(d);
+}
+
 function Field({ label, children }) {
   return (
     <label className="field">
@@ -110,6 +123,32 @@ function Sparkline({ values = [] }) {
     <svg className="sparkline" viewBox="0 0 100 60" preserveAspectRatio="none" aria-hidden="true">
       <path d={d} />
     </svg>
+  );
+}
+
+function GrowthBars({ items = [] }) {
+  const max = Math.max(1, ...items.map((item) => Math.abs(Number(item.delta) || 0)));
+  return (
+    <div className="growthBars">
+      {items.map((item) => {
+        const delta = Number(item.delta) || 0;
+        const width = Math.max(4, Math.round((Math.abs(delta) / max) * 100));
+        return (
+          <div className="growthBar" key={item.playlist_id}>
+            <Artwork src={item.image} alt="" size="sm" />
+            <div>
+              <strong>{item.name || "Untitled playlist"}</strong>
+              <span>{formatNumber(item.followers_now)} followers</span>
+            </div>
+            <div className={delta < 0 ? "barTrack negative" : "barTrack"}>
+              <i style={{ width: `${width}%` }} />
+            </div>
+            <b>{formatDelta(delta)}</b>
+          </div>
+        );
+      })}
+      {!items.length ? <p>No growth data yet.</p> : null}
+    </div>
   );
 }
 
@@ -551,7 +590,7 @@ export default function PlaylistManager() {
         <div className="dashboardHero">
           <div>
             <h2>Dashboard</h2>
-            <p>{dashboardSummary?.totals?.playlists_count || 0} playlists · {formatNumber(dashboardSummary?.totals?.total_followers)} followers</p>
+            <p>{dashboardSummary?.totals?.playlists_count || 0} playlists · {formatNumber(dashboardSummary?.totals?.total_followers)} followers · {formatNumber(dashboardSummary?.totals?.total_tracks)} tracks</p>
           </div>
           <button disabled={busy} onClick={loadDashboard}>Refresh</button>
         </div>
@@ -570,7 +609,23 @@ export default function PlaylistManager() {
           </article>
           <article>
             <span>Upcoming Removals</span>
-            <strong>{formatNumber(dashboardSummary?.next_day_removals?.length)}</strong>
+            <strong>{formatNumber(dashboardSummary?.upcoming_removals?.length)}</strong>
+            <small>next 14 days</small>
+          </article>
+          <article>
+            <span>Auto-Remove Active</span>
+            <strong>{formatNumber(dashboardSummary?.totals?.automation_enabled_count)}</strong>
+            <small>{formatNumber(dashboardSummary?.totals?.cooldown_count)} on cooldown</small>
+          </article>
+          <article>
+            <span>Flex Rotation</span>
+            <strong>{formatNumber(dashboardSummary?.totals?.flex_enabled_count)}</strong>
+            <small>{formatNumber(dashboardSummary?.totals?.flex_due_count)} due soon</small>
+          </article>
+          <article>
+            <span>Needs Fresh Check</span>
+            <strong>{formatNumber(dashboardSummary?.totals?.stale_count)}</strong>
+            <small>older than 24h</small>
           </article>
         </div>
         <div className="dashboardGrid">
@@ -580,6 +635,10 @@ export default function PlaylistManager() {
               <p>Daily follower delta over the last 30 days</p>
             </div>
             <Sparkline values={dashboardSeries?.growth || []} />
+            <div className="sparkLabels">
+              <span>{dashboardSeries?.labels?.[0] ? formatShortDate(dashboardSeries.labels[0]) : ""}</span>
+              <span>{dashboardSeries?.labels?.at?.(-1) ? formatShortDate(dashboardSeries.labels.at(-1)) : ""}</span>
+            </div>
           </section>
           <section className="dashboardPanel">
             <h2>Top Growing</h2>
@@ -593,16 +652,45 @@ export default function PlaylistManager() {
               </div>
             ) : <p>No growth data yet.</p>}
           </section>
-          <section className="dashboardPanel removalsPanel">
-            <h2>Upcoming Auto-Removals</h2>
-            <div className="removalList">
-              {(dashboardSummary?.next_day_removals || []).map((item, index) => (
-                <div key={`${item.playlist_id || index}-${item.track_id || index}`}>
-                  <strong>{item.track_name || item.track_id || "Unknown track"}</strong>
-                  <span>{item.playlist_name || "Playlist"} · {item.age_label || ""}</span>
+          <section className="dashboardPanel rankPanel">
+            <div>
+              <h2>Growth Ranking</h2>
+              <p>Best movers in the selected 30-day window</p>
+            </div>
+            <GrowthBars items={dashboardSummary?.growth_rank || []} />
+          </section>
+          <section className="dashboardPanel topPlaylistsPanel">
+            <div>
+              <h2>Playlist Portfolio</h2>
+              <p>Largest playlists by current follower count</p>
+            </div>
+            <div className="playlistTable">
+              {(dashboardSummary?.top_playlists || []).map((item) => (
+                <div key={item.playlist_id}>
+                  <Artwork src={item.image} alt="" size="sm" />
+                  <strong>{item.name || "Untitled playlist"}</strong>
+                  <span>{formatNumber(item.followers)} followers</span>
+                  <span>{formatNumber(item.tracks_total)} tracks</span>
+                  <b>{item.auto_remove_enabled ? `${item.auto_remove_weeks || "?"}w expiry` : "manual"}</b>
                 </div>
               ))}
-              {!dashboardSummary?.next_day_removals?.length ? <p>No upcoming removals.</p> : null}
+              {!dashboardSummary?.top_playlists?.length ? <p>No playlists yet.</p> : null}
+            </div>
+          </section>
+          <section className="dashboardPanel removalsPanel">
+            <div>
+              <h2>Upcoming Auto-Removals</h2>
+              <p>Unlocked tracks scheduled to age out in the next 14 days</p>
+            </div>
+            <div className="removalList">
+              {(dashboardSummary?.upcoming_removals || []).map((item, index) => (
+                <div key={`${item.playlist_id || index}-${item.track_id || index}`}>
+                  <strong>{item.track_name || item.track_id || "Unknown track"}</strong>
+                  <span>{item.artist_names || "Unknown artist"}</span>
+                  <small>{item.playlist_name || "Playlist"} · {formatShortDate(item.removes_on)} · pos {Number(item.position) + 1}</small>
+                </div>
+              ))}
+              {!dashboardSummary?.upcoming_removals?.length ? <p>No upcoming removals.</p> : null}
             </div>
           </section>
         </div>
@@ -967,7 +1055,7 @@ export default function PlaylistManager() {
         }
         .metricGrid {
           display: grid;
-          grid-template-columns: repeat(4, minmax(0, 1fr));
+          grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
           gap: 14px;
         }
         .metricGrid article,
@@ -979,6 +1067,8 @@ export default function PlaylistManager() {
         .metricGrid article {
           display: grid;
           gap: 10px;
+          min-height: 128px;
+          align-content: space-between;
         }
         .metricGrid span {
           color: #a6adba;
@@ -986,6 +1076,9 @@ export default function PlaylistManager() {
         }
         .metricGrid strong {
           font-size: 30px;
+        }
+        .metricGrid small {
+          font-size: 13px;
         }
         .dashboardGrid {
           display: grid;
@@ -1009,6 +1102,13 @@ export default function PlaylistManager() {
         .sparkline.empty {
           background: #222731;
         }
+        .sparkLabels {
+          display: flex;
+          justify-content: space-between;
+          color: #a6adba;
+          font-size: 13px;
+          margin-top: 8px;
+        }
         .topGrowing {
           display: grid;
           grid-template-columns: 64px minmax(0, 1fr);
@@ -1027,6 +1127,78 @@ export default function PlaylistManager() {
           text-overflow: ellipsis;
           white-space: nowrap;
         }
+        .rankPanel,
+        .topPlaylistsPanel {
+          min-height: 360px;
+        }
+        .growthBars {
+          display: grid;
+          gap: 12px;
+          margin-top: 18px;
+        }
+        .growthBar {
+          display: grid;
+          grid-template-columns: 52px minmax(140px, 1fr) minmax(90px, 0.7fr) 70px;
+          align-items: center;
+          gap: 12px;
+          min-width: 0;
+        }
+        .growthBar div {
+          min-width: 0;
+        }
+        .growthBar strong,
+        .growthBar span {
+          display: block;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .growthBar b {
+          text-align: right;
+          color: #18e06f;
+        }
+        .barTrack {
+          height: 8px;
+          border-radius: 999px;
+          background: #222731;
+          overflow: hidden;
+        }
+        .barTrack i {
+          display: block;
+          height: 100%;
+          border-radius: inherit;
+          background: #18e06f;
+        }
+        .barTrack.negative i {
+          background: #ff4d4d;
+        }
+        .playlistTable {
+          display: grid;
+          gap: 2px;
+          margin-top: 18px;
+        }
+        .playlistTable div {
+          display: grid;
+          grid-template-columns: 52px minmax(140px, 1fr) 116px 88px 92px;
+          align-items: center;
+          gap: 12px;
+          min-height: 64px;
+          padding: 6px 0;
+          border-top: 1px solid #202630;
+          min-width: 0;
+        }
+        .playlistTable strong,
+        .playlistTable span,
+        .playlistTable b {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .playlistTable b {
+          color: #18e06f;
+          font-size: 13px;
+          text-align: right;
+        }
         .removalsPanel {
           grid-column: 1 / -1;
         }
@@ -1044,7 +1216,8 @@ export default function PlaylistManager() {
           min-width: 0;
         }
         .removalList strong,
-        .removalList span {
+        .removalList span,
+        .removalList small {
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
@@ -1392,6 +1565,13 @@ export default function PlaylistManager() {
           .removalList {
             grid-template-columns: 1fr;
           }
+          .playlistTable div {
+            grid-template-columns: 52px minmax(0, 1fr) 100px;
+          }
+          .playlistTable span:nth-of-type(2),
+          .playlistTable b {
+            display: none;
+          }
           .workspace {
             grid-template-columns: 1fr;
             height: auto;
@@ -1439,6 +1619,18 @@ export default function PlaylistManager() {
           .dashboardHero {
             display: grid;
             align-items: stretch;
+          }
+          .growthBar {
+            grid-template-columns: 42px minmax(0, 1fr) 58px;
+          }
+          .growthBar .barTrack {
+            grid-column: 2 / -1;
+          }
+          .playlistTable div {
+            grid-template-columns: 42px minmax(0, 1fr);
+          }
+          .playlistTable span {
+            grid-column: 2;
           }
           nav .active {
             width: fit-content;

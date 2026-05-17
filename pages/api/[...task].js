@@ -1800,7 +1800,7 @@ const routes = {
 
   // 1) aktuelle Playlists ziehen (für total followers + Namen)
   const plistPath =
-    `/rest/v1/playlists?select=id,name,followers,image,tracks_total,connection_id` +
+    `/rest/v1/playlists?select=id,name,followers,image,tracks_total,connection_id,auto_remove_enabled,auto_remove_weeks,updated_at,last_checked_at,next_check_at` +
     `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
     `&is_owner=is.true&is_public=is.true`;
   const pResp = await fetch(SUPABASE_URL + plistPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
@@ -1830,6 +1830,7 @@ const routes = {
 
   let top_growing = null;
   let net_growth = 0;
+  const growth_rank = [];
   for (const p of playlists) {
     const s = snapMap.get(p.id);
     const delta = s ? (s.last - s.first) : 0;
@@ -1837,29 +1838,84 @@ const routes = {
     if (!top_growing || delta > top_growing.delta) {
       top_growing = { playlist_id: p.id, name: p.name, image: p.image, delta, followers_now: p.followers || 0 };
     }
+    growth_rank.push({
+      playlist_id: p.id,
+      name: p.name,
+      image: p.image,
+      delta,
+      followers_now: p.followers || 0,
+      tracks_total: p.tracks_total || 0,
+    });
+  }
+  growth_rank.sort((a, b) => b.delta - a.delta || b.followers_now - a.followers_now);
+  const top_playlists = [...playlists]
+    .sort((a, b) => (b.followers || 0) - (a.followers || 0))
+    .slice(0, 8)
+    .map((p) => ({
+      playlist_id: p.id,
+      name: p.name,
+      image: p.image,
+      followers: p.followers || 0,
+      tracks_total: p.tracks_total || 0,
+      auto_remove_enabled: !!p.auto_remove_enabled,
+      auto_remove_weeks: p.auto_remove_weeks ?? null,
+    }));
+
+  // 3) kommende Auto-Removals
+  const playlistIds = playlists.map((p) => p.id).filter(Boolean);
+  const todayStr = new Date().toISOString().slice(0,10);
+  const horizonStr = new Date(Date.now() + 14*24*3600*1000).toISOString().slice(0,10);
+  let upcoming_removals = [];
+  if (playlistIds.length) {
+    const upcPath =
+      `/rest/v1/upcoming_removals_ui` +
+      `?select=playlist_id,playlist_name,position,track_id,track_name,artist_names,added_at,auto_remove_weeks,removes_on` +
+      `&removes_on=gte.${encodeURIComponent(todayStr)}` +
+      `&removes_on=lte.${encodeURIComponent(horizonStr)}` +
+      `&playlist_id=in.(${playlistIds.map((id) => `"${id}"`).join(",")})` +
+      `&order=removes_on.asc,playlist_name.asc,position.asc` +
+      `&limit=${removals_limit}`;
+    const uResp = await fetch(SUPABASE_URL + upcPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
+    upcoming_removals = uResp.ok ? JSON.parse(await uResp.text() || "[]") : [];
   }
 
-  // 3) Morgen entfernte Tracks (UTC)
-  const tomorrow = new Date(Date.now() + 24*3600*1000);
-  const tomStr = tomorrow.toISOString().slice(0,10);
-  const upcPath =
-    `/rest/v1/upcoming_removals_ui` +
-    `?select=playlist_id,playlist_name,position,track_id,track_name,artist_names,added_at,auto_remove_weeks,removes_on` +
-    `&removes_on=eq.${encodeURIComponent(tomStr)}` +
-    `&playlist_id=in.(${playlists.map(p => `"${p.id}"`).join(",")})` +
-    `&limit=${removals_limit}`;
-  const uResp = await fetch(SUPABASE_URL + upcPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
-  const next_day_removals = uResp.ok ? JSON.parse(await uResp.text() || "[]") : [];
+  let flex_enabled_count = 0;
+  let flex_due_count = 0;
+  if (playlistIds.length) {
+    const flexPath =
+      `/rest/v1/playlist_flex_settings?select=playlist_id,enabled,next_rotation_at` +
+      `&playlist_id=in.(${playlistIds.map((id) => `"${id}"`).join(",")})`;
+    const fResp = await fetch(SUPABASE_URL + flexPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
+    const flexRows = fResp.ok ? JSON.parse(await fResp.text() || "[]") : [];
+    flex_enabled_count = flexRows.filter((r) => r.enabled).length;
+    flex_due_count = flexRows.filter((r) => r.enabled && r.next_rotation_at && new Date(r.next_rotation_at) <= new Date(Date.now() + 24*3600*1000)).length;
+  }
+
+  const automation_enabled_count = playlists.filter((p) => p.auto_remove_enabled && Number(p.auto_remove_weeks) > 0).length;
+  const cooldown_count = playlists.filter((p) => p.next_check_at && new Date(p.next_check_at) > new Date()).length;
+  const stale_count = playlists.filter((p) => {
+    const checked = p.last_checked_at || p.updated_at;
+    return !checked || new Date(checked) < new Date(Date.now() - 24*3600*1000);
+  }).length;
 
   return json(res, 200, {
     ok: true,
     totals: {
       playlists_count: playlists.length,
       total_followers,
-      net_growth_last_days: net_growth
+      total_tracks: playlists.reduce((a, p) => a + (p.tracks_total || 0), 0),
+      net_growth_last_days: net_growth,
+      automation_enabled_count,
+      flex_enabled_count,
+      flex_due_count,
+      cooldown_count,
+      stale_count,
     },
     top_growing: top_growing || null,
-    next_day_removals: next_day_removals
+    top_playlists,
+    growth_rank: growth_rank.slice(0, 8),
+    upcoming_removals,
+    next_day_removals: upcoming_removals.filter((r) => r.removes_on === new Date(Date.now() + 24*3600*1000).toISOString().slice(0,10))
   });
 },
 
