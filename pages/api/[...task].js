@@ -4813,7 +4813,6 @@ const routes = {
       `&limit=1&playlist_id=eq.${encodeURIComponent(playlist_id)}&track_id=eq.${encodeURIComponent(track_id)}`
     ).then(r => r.json()).catch(() => []);
     const lock = lockRows?.[0];
-    if (!lock?.is_locked) return bad(res, 409, "track_must_be_locked_first");
 
     const itemRows = await sb(
       `/rest/v1/playlist_items?select=track_name,position` +
@@ -4821,6 +4820,21 @@ const routes = {
     ).then(r => r.json()).catch(() => []);
     const item = itemRows?.[0] || {};
     const position = Number.isFinite(Number(lock.locked_position)) ? Number(lock.locked_position) : Number(item.position || 0);
+
+    if (!lock?.is_locked) {
+      const lockUp = await sb(`/rest/v1/playlist_item_locks?on_conflict=playlist_id,track_id`, {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify([{
+          playlist_id,
+          track_id,
+          locked_position: Math.max(0, position),
+          is_locked: true,
+          locked_at: new Date().toISOString()
+        }])
+      });
+      if (!lockUp.ok) return bad(res, 500, `flex_auto_lock_failed: ${await lockUp.text()}`);
+    }
 
     const payload = {
       playlist_id,

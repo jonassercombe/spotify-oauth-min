@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { ArrowDown, ArrowUp, Lock, Shuffle, TimerReset, Trash2, Unlock } from "lucide-react";
 import { getSupabaseBrowserClient } from "../lib/supabaseBrowser";
 
 async function api(path, { method = "GET", accessToken, body } = {}) {
@@ -45,58 +46,6 @@ function Field({ label, children }) {
       <span>{label}</span>
       {children}
     </label>
-  );
-}
-
-function IconStopwatch() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M10 2h4" />
-      <path d="M12 14l3-3" />
-      <path d="M12 6a8 8 0 1 0 0 16 8 8 0 0 0 0-16Z" />
-      <path d="M17.5 6.5 19 5" />
-    </svg>
-  );
-}
-
-function IconShuffle() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M3 7h3c4 0 5 10 9 10h2" />
-      <path d="M3 17h3c2.5 0 4-3.5 5.5-6" />
-      <path d="M17 3l4 4-4 4" />
-      <path d="M17 13l4 4-4 4" />
-    </svg>
-  );
-}
-
-function IconLock({ locked = false }) {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <rect x="5" y="10" width="14" height="10" rx="2" />
-      {locked ? <path d="M8 10V7a4 4 0 0 1 8 0v3" /> : <path d="M8 10V7a4 4 0 0 1 7.5-2" />}
-    </svg>
-  );
-}
-
-function IconArrow({ direction = "up" }) {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      {direction === "up" ? <path d="M12 19V5" /> : <path d="M12 5v14" />}
-      {direction === "up" ? <path d="M5 12l7-7 7 7" /> : <path d="M5 12l7 7 7-7" />}
-    </svg>
-  );
-}
-
-function IconTrash() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M4 7h16" />
-      <path d="M10 11v6" />
-      <path d="M14 11v6" />
-      <path d="M6 7l1 14h10l1-14" />
-      <path d="M9 7V4h6v3" />
-    </svg>
   );
 }
 
@@ -994,7 +943,7 @@ export default function PlaylistManager() {
                       </small>
                     </div>
                     <div className="badges">
-                      {isFlexTrack ? <span className="flexBadge"><IconShuffle /> Flex</span> : null}
+                      {isFlexTrack ? <span className="flexBadge"><Shuffle aria-hidden="true" /> Flex</span> : null}
                       {track.is_locked ? <span className="locked">Locked</span> : null}
                       {track.expiry_weeks ? <span className="expiry">{track.expiry_weeks}w</span> : null}
                     </div>
@@ -1007,30 +956,30 @@ export default function PlaylistManager() {
                         disabled={busy}
                         onClick={() => toggleLock(track)}
                       >
-                        <IconLock locked={track.is_locked} />
+                        {track.is_locked ? <Unlock aria-hidden="true" /> : <Lock aria-hidden="true" />}
                       </button>
                       <IconButton
                         tooltip="Set or clear a custom expiry timer for this song."
                         disabled={busy}
                         onClick={() => setSongExpiry(track)}
                       >
-                        <IconStopwatch />
+                        <TimerReset aria-hidden="true" />
                       </IconButton>
                       <IconButton
-                        tooltip={isFlexTrack ? "This song is already an active flex slot." : "Turn this locked song into a flex slot that rotates from the reference playlist."}
-                        disabled={busy || !track.is_locked || isFlexTrack}
+                        tooltip={isFlexTrack ? "This song is already an active flex slot." : "Turn this song into a locked flex slot that rotates from the reference playlist."}
+                        disabled={busy || isFlexTrack}
                         onClick={() => addFlexSlot(track)}
                       >
-                        <IconShuffle />
+                        <Shuffle aria-hidden="true" />
                       </IconButton>
                       <IconButton tooltip="Move this song one position up." disabled={busy || track.position <= 0} onClick={() => moveTrack(track, "up")}>
-                        <IconArrow direction="up" />
+                        <ArrowUp aria-hidden="true" />
                       </IconButton>
                       <IconButton tooltip="Move this song one position down." disabled={busy} onClick={() => moveTrack(track, "down")}>
-                        <IconArrow direction="down" />
+                        <ArrowDown aria-hidden="true" />
                       </IconButton>
                       <IconButton className="danger" tooltip="Remove this song from the playlist." disabled={busy} onClick={() => removeTrack(track)}>
-                        <IconTrash />
+                        <Trash2 aria-hidden="true" />
                       </IconButton>
                     </div>
                   </article>
