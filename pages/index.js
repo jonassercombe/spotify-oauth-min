@@ -313,6 +313,11 @@ export default function PlaylistManager() {
     );
   }, [tracks, trackSearch]);
 
+  const activeFlexTrackIds = useMemo(
+    () => new Set(flexSlots.map((slot) => slot.current_track_id).filter(Boolean)),
+    [flexSlots]
+  );
+
   async function run(label, fn) {
     setBusy(true);
     setError("");
@@ -954,59 +959,63 @@ export default function PlaylistManager() {
               />
             </div>
             <div className="trackList">
-              {filteredTracks.map((track) => (
-                <article key={`${track.position}-${track.track_id}`} className="trackRow">
-                  <div className="pos">{Number(track.position) + 1}</div>
-                  <Artwork src={track.cover_url} alt="" size="sm" />
-                  <div className="trackMeta">
-                    <strong>{track.track_name || track.track_id}</strong>
-                    <span>{track.artist_names || "Unknown artist"} · {track.album_name || "Unknown album"}</span>
-                    <small>
-                      {track.age_label || "age unknown"}
-                      {track.duration_formatted ? ` · ${track.duration_formatted}` : ""}
-                    </small>
-                  </div>
-                  <div className="badges">
-                    {track.is_locked ? <span className="locked">Locked</span> : null}
-                    {track.expiry_weeks ? <span className="expiry">{track.expiry_weeks}w</span> : null}
-                  </div>
-                  <div className="rowActions">
-                    <button
-                      className="compact tooltipButton"
-                      title={track.is_locked ? "Unlock this song so automation can move or remove it again." : "Lock this song to its current playlist position."}
-                      data-tooltip={track.is_locked ? "Unlock this song so automation can move or remove it again." : "Lock this song to its current playlist position."}
-                      disabled={busy}
-                      onClick={() => toggleLock(track)}
-                    >
-                      <IconLock locked={track.is_locked} />
-                      {track.is_locked ? "Unlock" : "Lock"}
-                    </button>
-                    <IconButton
-                      tooltip="Set or clear a custom expiry timer for this song."
-                      disabled={busy}
-                      onClick={() => setSongExpiry(track)}
-                    >
-                      <IconStopwatch />
-                    </IconButton>
-                    <IconButton
-                      tooltip="Turn this locked song into a flex slot that rotates from the reference playlist."
-                      disabled={busy || !track.is_locked || flexSlots.some((slot) => slot.current_track_id === track.track_id)}
-                      onClick={() => addFlexSlot(track)}
-                    >
-                      <IconShuffle />
-                    </IconButton>
-                    <IconButton tooltip="Move this song one position up." disabled={busy || track.position <= 0} onClick={() => moveTrack(track, "up")}>
-                      <IconArrow direction="up" />
-                    </IconButton>
-                    <IconButton tooltip="Move this song one position down." disabled={busy} onClick={() => moveTrack(track, "down")}>
-                      <IconArrow direction="down" />
-                    </IconButton>
-                    <IconButton className="danger" tooltip="Remove this song from the playlist." disabled={busy} onClick={() => removeTrack(track)}>
-                      <IconTrash />
-                    </IconButton>
-                  </div>
-                </article>
-              ))}
+              {filteredTracks.map((track) => {
+                const isFlexTrack = activeFlexTrackIds.has(track.track_id);
+                return (
+                  <article key={`${track.position}-${track.track_id}`} className={`trackRow ${isFlexTrack ? "trackRow--flex" : ""}`}>
+                    <div className="pos">{Number(track.position) + 1}</div>
+                    <Artwork src={track.cover_url} alt="" size="sm" />
+                    <div className="trackMeta">
+                      <strong>{track.track_name || track.track_id}</strong>
+                      <span>{track.artist_names || "Unknown artist"} · {track.album_name || "Unknown album"}</span>
+                      <small>
+                        {track.age_label || "age unknown"}
+                        {track.duration_formatted ? ` · ${track.duration_formatted}` : ""}
+                      </small>
+                    </div>
+                    <div className="badges">
+                      {isFlexTrack ? <span className="flexBadge"><IconShuffle /> Flex</span> : null}
+                      {track.is_locked ? <span className="locked">Locked</span> : null}
+                      {track.expiry_weeks ? <span className="expiry">{track.expiry_weeks}w</span> : null}
+                    </div>
+                    <div className="rowActions">
+                      <button
+                        className="compact tooltipButton"
+                        title={track.is_locked ? "Unlock this song so automation can move or remove it again." : "Lock this song to its current playlist position."}
+                        data-tooltip={track.is_locked ? "Unlock this song so automation can move or remove it again." : "Lock this song to its current playlist position."}
+                        disabled={busy}
+                        onClick={() => toggleLock(track)}
+                      >
+                        <IconLock locked={track.is_locked} />
+                        {track.is_locked ? "Unlock" : "Lock"}
+                      </button>
+                      <IconButton
+                        tooltip="Set or clear a custom expiry timer for this song."
+                        disabled={busy}
+                        onClick={() => setSongExpiry(track)}
+                      >
+                        <IconStopwatch />
+                      </IconButton>
+                      <IconButton
+                        tooltip={isFlexTrack ? "This song is already an active flex slot." : "Turn this locked song into a flex slot that rotates from the reference playlist."}
+                        disabled={busy || !track.is_locked || isFlexTrack}
+                        onClick={() => addFlexSlot(track)}
+                      >
+                        <IconShuffle />
+                      </IconButton>
+                      <IconButton tooltip="Move this song one position up." disabled={busy || track.position <= 0} onClick={() => moveTrack(track, "up")}>
+                        <IconArrow direction="up" />
+                      </IconButton>
+                      <IconButton tooltip="Move this song one position down." disabled={busy} onClick={() => moveTrack(track, "down")}>
+                        <IconArrow direction="down" />
+                      </IconButton>
+                      <IconButton className="danger" tooltip="Remove this song from the playlist." disabled={busy} onClick={() => removeTrack(track)}>
+                        <IconTrash />
+                      </IconButton>
+                    </div>
+                  </article>
+                );
+              })}
             </div>
           </div>
         </section>
@@ -1584,6 +1593,17 @@ export default function PlaylistManager() {
           padding: 12px 16px;
           border-top: 1px solid #202630;
         }
+        .trackRow--flex {
+          border-left: 3px solid #18e06f;
+          background:
+            linear-gradient(90deg, rgba(24, 224, 111, 0.14), rgba(24, 224, 111, 0.035) 34%, transparent 72%),
+            #181c23;
+          box-shadow: inset 0 0 0 1px rgba(24, 224, 111, 0.12);
+        }
+        .trackRow--flex .pos {
+          color: #18e06f;
+          font-weight: 800;
+        }
         .trackMeta {
           display: grid;
           min-width: 0;
@@ -1621,6 +1641,23 @@ export default function PlaylistManager() {
         .expiry {
           color: #ffbd4a;
           background: rgba(255, 189, 74, 0.12);
+        }
+        .flexBadge {
+          display: inline-flex;
+          align-items: center;
+          gap: 5px;
+          color: #18e06f;
+          background: rgba(24, 224, 111, 0.18);
+          border: 1px solid rgba(24, 224, 111, 0.35);
+        }
+        .flexBadge svg {
+          width: 13px;
+          height: 13px;
+          stroke: currentColor;
+          stroke-width: 2;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+          fill: none;
         }
         .danger {
           border-color: #ff4d4d;

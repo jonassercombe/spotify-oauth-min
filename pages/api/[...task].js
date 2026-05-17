@@ -4809,7 +4809,10 @@ const routes = {
     const body = await readBody(req);
     const slot_id = String(body.slot_id || "").trim();
     if (!slot_id) return bad(res, 400, "missing_slot_id");
-    const slotRows = await sb(`/rest/v1/playlist_flex_slots?select=id,playlist_id&limit=1&id=eq.${encodeURIComponent(slot_id)}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r => r.json()).catch(() => []);
+    const slotRows = await sb(
+      `/rest/v1/playlist_flex_slots?select=id,playlist_id,current_track_id,position` +
+      `&limit=1&id=eq.${encodeURIComponent(slot_id)}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`
+    ).then(r => r.json()).catch(() => []);
     const slot = slotRows?.[0];
     if (!slot) return bad(res, 404, "slot_not_found");
     const r = await sb(`/rest/v1/playlist_flex_slots?id=eq.${encodeURIComponent(slot_id)}`, {
@@ -4817,6 +4820,22 @@ const routes = {
       headers: { Prefer: "return=minimal" }
     });
     if (!r.ok) return bad(res, 500, `flex_slot_delete_failed: ${await r.text()}`);
+    if (slot.current_track_id) {
+      await sb(
+        `/rest/v1/playlist_item_locks?playlist_id=eq.${encodeURIComponent(slot.playlist_id)}` +
+        `&track_id=eq.${encodeURIComponent(slot.current_track_id)}`,
+        {
+          method: "PATCH",
+          headers: { Prefer: "return=minimal" },
+          body: JSON.stringify({
+            is_locked: true,
+            locked_position: Math.max(0, Number(slot.position) || 0),
+            lock_source: null,
+            locked_at: new Date().toISOString()
+          })
+        }
+      ).catch(() => {});
+    }
     await setPlaylistUpdateCooldown(slot.playlist_id, 300);
     return json(res, 200, { ok: true });
   },
