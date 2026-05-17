@@ -223,6 +223,32 @@ function parseTrackId(input) {
 }
 const trackUri = (id) => `spotify:track:${id}`;
 
+function parseSpotifyPlaylistId(input) {
+  const s = String(input || "").trim();
+  if (!s) return null;
+  let m;
+  if ((m = s.match(/spotify:playlist:([A-Za-z0-9]{22})/))) return m[1];
+  if ((m = s.match(/open\.spotify\.com\/(?:intl-[a-z-]+\/)?playlist\/([A-Za-z0-9]{22})/))) return m[1];
+  if (/^[A-Za-z0-9]{22}$/.test(s)) return s;
+  try {
+    const u = new URL(s.startsWith("http") ? s : `https://${s}`);
+    if (!/(^|\.)spotify\.com$/i.test(u.hostname)) return null;
+    const parts = u.pathname.split("/").filter(Boolean);
+    if (parts[0] && /^intl-/i.test(parts[0])) parts.shift();
+    if (parts[0] === "playlist" && /^[A-Za-z0-9]{22}$/.test(parts[1])) return parts[1];
+  } catch {}
+  return null;
+}
+
+function nextFlexRotationAt(interval, from = new Date()) {
+  const d = new Date(from);
+  const mode = String(interval || "weekly").toLowerCase();
+  if (mode === "daily") d.setUTCDate(d.getUTCDate() + 1);
+  else if (mode === "monthly") d.setUTCMonth(d.getUTCMonth() + 1);
+  else d.setUTCDate(d.getUTCDate() + 7);
+  return d.toISOString();
+}
+
 function encToken(plain) {
   const hex = need("ENC_SECRET");
   if (hex.length < 64) throw new Error("ENC_SECRET must be 32-byte hex (64 chars)");
@@ -308,6 +334,142 @@ async function setPlaylistUpdateCooldown(playlist_id, seconds = 300) {
     body: JSON.stringify({ next_check_at: until })
   }).catch(() => {});
   return until;
+}
+
+async function getOwnedPlaylist(playlist_id, bubble_user_id) {
+  const r = await sb(
+    `/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id,name,image,tracks_total` +
+    `&limit=1&id=eq.${encodeURIComponent(String(playlist_id))}` +
+    `&bubble_user_id=eq.${encodeURIComponent(String(bubble_user_id))}`
+  );
+  const rows = r.ok ? await r.json().catch(() => []) : [];
+  return rows?.[0] || null;
+}
+
+async function fetchReferencePlaylistTracks(reference_playlist_id, access_token) {
+  const tracks = [];
+  let url = `https://api.spotify.com/v1/playlists/${encodeURIComponent(reference_playlist_id)}/tracks?limit=100&offset=0&fields=items(track(id,uri,name,is_local,type)),next`;
+  let guard = 0;
+  while (url && guard++ < 20) {
+    const { r, json, text } = await fetchJSON(url, { headers: { Authorization: `Bearer ${access_token}` } }, 20000);
+    if (!r.ok) throw new Error(`reference_playlist_fetch_failed:${r.status}:${text || JSON.stringify(json)}`);
+    for (const item of (json?.items || [])) {
+      const t = item?.track;
+      if (t?.id && t?.uri && t.type === "track" && !t.is_local) tracks.push(t);
+    }
+    url = json?.next || "";
+  }
+  return tracks;
+}
+
+async function rotateFlexSlot(slot, settings) {
+  const access_token = await getAccessTokenFromConnection(slot.connection_id);
+  const playlistRows = await sb(`/rest/v1/playlists?select=id,playlist_id&limit=1&id=eq.${encodeURIComponent(slot.playlist_id)}`).then(r => r.json());
+  const playlist = playlistRows?.[0];
+  if (!playlist?.playlist_id) throw new Error("playlist_not_found");
+
+  const refPlaylistId = settings?.reference_playlist_id || slot.source_playlist_id;
+  if (!refPlaylistId) throw new Error("missing_reference_playlist");
+
+  const candidates = await fetchReferencePlaylistTracks(refPlaylistId, access_token);
+  const usable = candidates.filter(t => t.id !== slot.current_track_id);
+  if (!usable.length) throw new Error("reference_playlist_has_no_usable_tracks");
+  const picked = usable[Math.floor(Math.random() * usable.length)];
+  const desired = Math.max(0, Number(slot.position) || 0);
+
+  const metaR = await fetch(`https://api.spotify.com/v1/playlists/${encodeURIComponent(playlist.playlist_id)}?fields=snapshot_id`, {
+    headers: { Authorization: `Bearer ${access_token}` }
+  });
+  const meta = await metaR.json().catch(() => ({}));
+  if (!metaR.ok || !meta?.snapshot_id) throw new Error("spotify_snapshot_failed");
+
+  const probePositions = Array.from(new Set([desired, desired - 1, desired + 1, desired - 2, desired + 2].filter(n => n >= 0)));
+  let removePosition = desired;
+  for (const pos of probePositions) {
+    const probe = await fetchJSON(
+      `https://api.spotify.com/v1/playlists/${encodeURIComponent(playlist.playlist_id)}/tracks?fields=items(track(id,uri)),total&limit=1&offset=${pos}`,
+      { headers: { Authorization: `Bearer ${access_token}` } },
+      20000
+    );
+    if (probe.r.ok && probe.json?.items?.[0]?.track?.id === slot.current_track_id) {
+      removePosition = pos;
+      break;
+    }
+  }
+
+  const delR = await fetch(`https://api.spotify.com/v1/playlists/${encodeURIComponent(playlist.playlist_id)}/tracks`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      tracks: [{ uri: trackUri(slot.current_track_id), positions: [removePosition] }],
+      snapshot_id: meta.snapshot_id
+    })
+  });
+  if (!delR.ok) throw new Error(`spotify_remove_failed:${delR.status}:${await delR.text()}`);
+
+  const addR = await fetch(`https://api.spotify.com/v1/playlists/${encodeURIComponent(playlist.playlist_id)}/tracks`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ uris: [picked.uri], position: desired })
+  });
+  if (!addR.ok) throw new Error(`spotify_add_failed:${addR.status}:${await addR.text()}`);
+
+  const nowIso = new Date().toISOString();
+  await sb(`/rest/v1/playlist_item_locks?playlist_id=eq.${encodeURIComponent(slot.playlist_id)}&track_id=eq.${encodeURIComponent(slot.current_track_id)}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=minimal" }
+  }).catch(() => {});
+  await sb(`/rest/v1/playlist_item_locks?on_conflict=playlist_id,track_id`, {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify([{
+      playlist_id: slot.playlist_id,
+      track_id: picked.id,
+      locked_position: desired,
+      is_locked: true,
+      lock_source: "flex",
+      locked_at: nowIso
+    }])
+  });
+  await sb(`/rest/v1/playlist_flex_slots?id=eq.${encodeURIComponent(slot.id)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({
+      current_track_id: picked.id,
+      current_track_name: picked.name || null,
+      source_playlist_id: refPlaylistId,
+      source_track_id: picked.id,
+      last_rotated_at: nowIso,
+      updated_at: nowIso
+    })
+  });
+  await sb(`/rest/v1/playlist_flex_settings?playlist_id=eq.${encodeURIComponent(slot.playlist_id)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({
+      last_rotated_at: nowIso,
+      next_rotation_at: nextFlexRotationAt(settings?.interval || "weekly"),
+      updated_at: nowIso
+    })
+  }).catch(() => {});
+
+  const cooldownUntil = await setPlaylistUpdateCooldown(slot.playlist_id, 300);
+  await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(slot.playlist_id)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ needs_sync: true, next_check_at: cooldownUntil })
+  }).catch(() => {});
+
+  const base = process.env.PUBLIC_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
+  if (base) {
+    fetch(`${base}/api/playlists/dispatch-sync`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+      body: JSON.stringify({ playlist_id: slot.playlist_id })
+    }).catch(() => {});
+  }
+
+  return { picked_track_id: picked.id, picked_track_name: picked.name || null, position: desired, cooldown_until: cooldownUntil };
 }
 
 
@@ -4449,6 +4611,238 @@ const routes = {
     });
     if (!r.ok) return bad(res, 500, `supabase_patch_failed: ${await r.text()}`);
     return json(res, 200, { ok: true });
+  },
+
+  /* ---------- flex/settings/get (GET) ---------- */
+  "flex/settings/get": async (req, res) => {
+    if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req, req.query.bubble_user_id);
+    if (!bubbleUserId) return bad(res, 401, "missing_bubble_user_id");
+    const playlist_id = String(req.query.playlist_id || "").trim();
+    if (!playlist_id) return bad(res, 400, "missing_playlist_id");
+    const owned = await getOwnedPlaylist(playlist_id, bubbleUserId);
+    if (!owned) return bad(res, 403, "playlist_not_owned");
+
+    const r = await sb(`/rest/v1/playlist_flex_settings?select=*&limit=1&playlist_id=eq.${encodeURIComponent(playlist_id)}`);
+    if (!r.ok) return bad(res, 500, `flex_settings_select_failed: ${await r.text()}`);
+    const row = (await r.json())?.[0] || null;
+    return json(res, 200, row || {
+      playlist_id,
+      bubble_user_id: bubbleUserId,
+      connection_id: owned.connection_id,
+      reference_playlist_id: null,
+      reference_playlist_url: "",
+      interval: "weekly",
+      enabled: false,
+      next_rotation_at: null,
+      last_rotated_at: null
+    });
+  },
+
+  /* ---------- flex/settings/save (POST) ---------- */
+  "flex/settings/save": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req);
+    if (!bubbleUserId) return bad(res, 401, "missing_bubble_user_id");
+    const body = await readBody(req);
+    const playlist_id = String(body.playlist_id || "").trim();
+    if (!playlist_id) return bad(res, 400, "missing_playlist_id");
+    const owned = await getOwnedPlaylist(playlist_id, bubbleUserId);
+    if (!owned) return bad(res, 403, "playlist_not_owned");
+
+    const interval = String(body.interval || "weekly").toLowerCase();
+    if (!["daily", "weekly", "monthly"].includes(interval)) return bad(res, 400, "invalid_interval");
+    const referenceRaw = String(body.reference_playlist || body.reference_playlist_url || body.reference_playlist_id || "").trim();
+    const reference_playlist_id = referenceRaw ? parseSpotifyPlaylistId(referenceRaw) : null;
+    if (referenceRaw && !reference_playlist_id) return bad(res, 400, "invalid_reference_playlist");
+    const enabled = !!body.enabled && !!reference_playlist_id;
+    const nowIso = new Date().toISOString();
+    const next_rotation_at = enabled
+      ? (body.next_rotation_at || nextFlexRotationAt(interval))
+      : null;
+
+    const payload = {
+      playlist_id,
+      bubble_user_id: bubbleUserId,
+      connection_id: owned.connection_id,
+      reference_playlist_id,
+      reference_playlist_url: referenceRaw || null,
+      interval,
+      enabled,
+      next_rotation_at,
+      updated_at: nowIso
+    };
+
+    const r = await sb(`/rest/v1/playlist_flex_settings?on_conflict=playlist_id`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+      body: JSON.stringify([payload])
+    });
+    if (!r.ok) return bad(res, 500, `flex_settings_upsert_failed: ${await r.text()}`);
+    const rows = await r.json();
+    await setPlaylistUpdateCooldown(playlist_id, 300);
+    return json(res, 200, { ok: true, settings: rows?.[0] || payload });
+  },
+
+  /* ---------- flex/slots/list (GET) ---------- */
+  "flex/slots/list": async (req, res) => {
+    if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req, req.query.bubble_user_id);
+    if (!bubbleUserId) return bad(res, 401, "missing_bubble_user_id");
+    const playlist_id = String(req.query.playlist_id || "").trim();
+    if (!playlist_id) return bad(res, 400, "missing_playlist_id");
+    const owned = await getOwnedPlaylist(playlist_id, bubbleUserId);
+    if (!owned) return bad(res, 403, "playlist_not_owned");
+
+    const r = await sb(`/rest/v1/playlist_flex_slots?select=*&playlist_id=eq.${encodeURIComponent(playlist_id)}&order=position.asc`);
+    if (!r.ok) return bad(res, 500, `flex_slots_select_failed: ${await r.text()}`);
+    return json(res, 200, await r.json());
+  },
+
+  /* ---------- flex/slots/add (POST) ---------- */
+  "flex/slots/add": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req);
+    if (!bubbleUserId) return bad(res, 401, "missing_bubble_user_id");
+    const body = await readBody(req);
+    const playlist_id = String(body.playlist_id || "").trim();
+    const track_id = String(body.track_id || "").trim();
+    if (!playlist_id || !track_id) return bad(res, 400, "missing_playlist_id_or_track_id");
+    const owned = await getOwnedPlaylist(playlist_id, bubbleUserId);
+    if (!owned) return bad(res, 403, "playlist_not_owned");
+
+    const lockRows = await sb(
+      `/rest/v1/playlist_item_locks?select=track_id,locked_position,is_locked` +
+      `&limit=1&playlist_id=eq.${encodeURIComponent(playlist_id)}&track_id=eq.${encodeURIComponent(track_id)}`
+    ).then(r => r.json()).catch(() => []);
+    const lock = lockRows?.[0];
+    if (!lock?.is_locked) return bad(res, 409, "track_must_be_locked_first");
+
+    const itemRows = await sb(
+      `/rest/v1/playlist_items?select=track_name,position` +
+      `&limit=1&playlist_id=eq.${encodeURIComponent(playlist_id)}&track_id=eq.${encodeURIComponent(track_id)}`
+    ).then(r => r.json()).catch(() => []);
+    const item = itemRows?.[0] || {};
+    const position = Number.isFinite(Number(lock.locked_position)) ? Number(lock.locked_position) : Number(item.position || 0);
+
+    const payload = {
+      playlist_id,
+      bubble_user_id: bubbleUserId,
+      connection_id: owned.connection_id,
+      position,
+      current_track_id: track_id,
+      current_track_name: item.track_name || null,
+      updated_at: new Date().toISOString()
+    };
+    const r = await sb(`/rest/v1/playlist_flex_slots?on_conflict=playlist_id,position`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+      body: JSON.stringify([payload])
+    });
+    if (!r.ok) return bad(res, 500, `flex_slot_upsert_failed: ${await r.text()}`);
+    await setPlaylistUpdateCooldown(playlist_id, 300);
+    const rows = await r.json();
+    return json(res, 200, { ok: true, slot: rows?.[0] || payload });
+  },
+
+  /* ---------- flex/slots/remove (POST) ---------- */
+  "flex/slots/remove": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req);
+    if (!bubbleUserId) return bad(res, 401, "missing_bubble_user_id");
+    const body = await readBody(req);
+    const slot_id = String(body.slot_id || "").trim();
+    if (!slot_id) return bad(res, 400, "missing_slot_id");
+    const slotRows = await sb(`/rest/v1/playlist_flex_slots?select=id,playlist_id&limit=1&id=eq.${encodeURIComponent(slot_id)}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r => r.json()).catch(() => []);
+    const slot = slotRows?.[0];
+    if (!slot) return bad(res, 404, "slot_not_found");
+    const r = await sb(`/rest/v1/playlist_flex_slots?id=eq.${encodeURIComponent(slot_id)}`, {
+      method: "DELETE",
+      headers: { Prefer: "return=minimal" }
+    });
+    if (!r.ok) return bad(res, 500, `flex_slot_delete_failed: ${await r.text()}`);
+    await setPlaylistUpdateCooldown(slot.playlist_id, 300);
+    return json(res, 200, { ok: true });
+  },
+
+  /* ---------- flex/rotate (POST) ---------- */
+  "flex/rotate": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req);
+    const isInternal = checkAppSecret(req) || checkCronAuth(req);
+    if (!isInternal && !bubbleUserId) return bad(res, 401, "missing_bubble_user_id");
+    const body = await readBody(req);
+    const playlist_id = String(body.playlist_id || "").trim();
+    const slot_id = String(body.slot_id || "").trim();
+    if (!playlist_id && !slot_id) return bad(res, 400, "missing_playlist_id_or_slot_id");
+
+    let settings = null;
+    let slots = [];
+    if (slot_id) {
+      const slotRows = await sb(`/rest/v1/playlist_flex_slots?select=*&limit=1&id=eq.${encodeURIComponent(slot_id)}`).then(r => r.json()).catch(() => []);
+      const slot = slotRows?.[0];
+      if (!slot) return bad(res, 404, "slot_not_found");
+      if (!isInternal && slot.bubble_user_id !== bubbleUserId) return bad(res, 403, "forbidden");
+      slots = [slot];
+      const stRows = await sb(`/rest/v1/playlist_flex_settings?select=*&limit=1&playlist_id=eq.${encodeURIComponent(slot.playlist_id)}`).then(r => r.json()).catch(() => []);
+      settings = stRows?.[0] || null;
+    } else {
+      const owned = !isInternal ? await getOwnedPlaylist(playlist_id, bubbleUserId) : { id: playlist_id };
+      if (!owned) return bad(res, 403, "playlist_not_owned");
+      const stRows = await sb(`/rest/v1/playlist_flex_settings?select=*&limit=1&playlist_id=eq.${encodeURIComponent(playlist_id)}`).then(r => r.json()).catch(() => []);
+      settings = stRows?.[0] || null;
+      const slotRows = await sb(`/rest/v1/playlist_flex_slots?select=*&playlist_id=eq.${encodeURIComponent(playlist_id)}&order=position.asc`).then(r => r.json()).catch(() => []);
+      slots = slotRows || [];
+    }
+    if (!settings?.reference_playlist_id) return bad(res, 400, "missing_reference_playlist");
+    if (!slots.length) return bad(res, 400, "no_flex_slots");
+
+    const results = [];
+    for (const slot of slots) {
+      try {
+        results.push({ slot_id: slot.id, ok: true, ...(await rotateFlexSlot(slot, settings)) });
+      } catch (e) {
+        results.push({ slot_id: slot.id, ok: false, error: e?.message || String(e) });
+      }
+      await sleep(250);
+    }
+    const okCount = results.filter(r => r.ok).length;
+    return json(res, okCount ? 200 : 500, { ok: !!okCount, rotated: okCount, failed: results.length - okCount, results });
+  },
+
+  /* ---------- flex/cron-rotate-due (GET/POST) ---------- */
+  "flex/cron-rotate-due": async (req, res) => {
+    if (!checkCronAuth(req) && !checkAppSecret(req)) return bad(res, 401, "unauthorized_cron");
+    const qs = Object.fromEntries(new URL(req.url, `http://${req.headers.host}`).searchParams.entries());
+    const limit = Math.max(1, Math.min(25, Number(qs.limit || "10")));
+    const nowIso = new Date().toISOString();
+    const dueR = await sb(
+      `/rest/v1/playlist_flex_settings?select=*` +
+      `&enabled=is.true&reference_playlist_id=not.is.null` +
+      `&or=(next_rotation_at.is.null,next_rotation_at.lte.${encodeURIComponent(nowIso)})` +
+      `&order=next_rotation_at.asc.nullsfirst&limit=${limit}`
+    );
+    if (!dueR.ok) return bad(res, 500, `flex_due_select_failed: ${await dueR.text()}`);
+    const due = await dueR.json();
+    const results = [];
+    for (const settings of due) {
+      const slotRows = await sb(`/rest/v1/playlist_flex_slots?select=*&playlist_id=eq.${encodeURIComponent(settings.playlist_id)}&order=position.asc`).then(r => r.json()).catch(() => []);
+      let rotated = 0, failed = 0;
+      for (const slot of (slotRows || [])) {
+        try { await rotateFlexSlot(slot, settings); rotated++; }
+        catch { failed++; }
+        await sleep(250);
+      }
+      if (!slotRows?.length) {
+        await sb(`/rest/v1/playlist_flex_settings?playlist_id=eq.${encodeURIComponent(settings.playlist_id)}`, {
+          method: "PATCH",
+          headers: { Prefer: "return=minimal" },
+          body: JSON.stringify({ next_rotation_at: nextFlexRotationAt(settings.interval), updated_at: new Date().toISOString() })
+        }).catch(() => {});
+      }
+      results.push({ playlist_id: settings.playlist_id, rotated, failed });
+    }
+    return json(res, 200, { ok: true, playlists: due.length, results });
   },
 
   /* ---------- playlists/dispatch-sync (POST, secret) ---------- */

@@ -95,6 +95,24 @@ function writeStoredSelection(userContext, nextSelection) {
   window.localStorage.setItem(key, JSON.stringify({ ...current, ...nextSelection }));
 }
 
+function Sparkline({ values = [] }) {
+  const points = values.map((v) => Number(v) || 0);
+  if (!points.length) return <div className="sparkline empty" />;
+  const min = Math.min(...points);
+  const max = Math.max(...points);
+  const span = max - min || 1;
+  const d = points.map((v, i) => {
+    const x = points.length === 1 ? 100 : (i / (points.length - 1)) * 100;
+    const y = 54 - ((v - min) / span) * 46;
+    return `${i ? "L" : "M"}${x.toFixed(2)},${y.toFixed(2)}`;
+  }).join(" ");
+  return (
+    <svg className="sparkline" viewBox="0 0 100 60" preserveAspectRatio="none" aria-hidden="true">
+      <path d={d} />
+    </svg>
+  );
+}
+
 export default function PlaylistManager() {
   const [supabase, setSupabase] = useState(null);
   const [session, setSession] = useState(null);
@@ -111,9 +129,17 @@ export default function PlaylistManager() {
   const [trackPosition, setTrackPosition] = useState("1");
   const [trackExpiry, setTrackExpiry] = useState("");
   const [autoWeeks, setAutoWeeks] = useState("4");
+  const [flexSettings, setFlexSettings] = useState(null);
+  const [flexSlots, setFlexSlots] = useState([]);
+  const [flexReference, setFlexReference] = useState("");
+  const [flexInterval, setFlexInterval] = useState("weekly");
+  const [flexEnabled, setFlexEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [view, setView] = useState("manager");
+  const [dashboardSummary, setDashboardSummary] = useState(null);
+  const [dashboardSeries, setDashboardSeries] = useState(null);
 
   useEffect(() => {
     const client = getSupabaseBrowserClient();
@@ -132,6 +158,8 @@ export default function PlaylistManager() {
       setPlaylistId("");
       setPlaylist(null);
       setTracks([]);
+      setFlexSettings(null);
+      setFlexSlots([]);
     });
 
     return () => listener.subscription.unsubscribe();
@@ -145,6 +173,7 @@ export default function PlaylistManager() {
   useEffect(() => {
     if (!userContext?.linked) return;
     loadConnections();
+    loadDashboard();
   }, [userContext?.linked]);
 
   useEffect(() => {
@@ -277,9 +306,18 @@ export default function PlaylistManager() {
         api(`/api/playlists/get?playlist_id=${encodeURIComponent(playlistId)}`, { accessToken: accessToken() }),
         api(`/api/playlist-items/list?playlist_row_id=${encodeURIComponent(playlistId)}`, { accessToken: accessToken() }),
       ]);
+      const [settings, slots] = await Promise.all([
+        api(`/api/flex/settings/get?playlist_id=${encodeURIComponent(playlistId)}`, { accessToken: accessToken() }).catch(() => null),
+        api(`/api/flex/slots/list?playlist_id=${encodeURIComponent(playlistId)}`, { accessToken: accessToken() }).catch(() => []),
+      ]);
       setPlaylist(detail);
       setAutoWeeks(detail?.auto_remove_weeks ? String(detail.auto_remove_weeks) : "4");
       setTracks(items);
+      setFlexSettings(settings);
+      setFlexSlots(Array.isArray(slots) ? slots : []);
+      setFlexReference(settings?.reference_playlist_url || settings?.reference_playlist_id || "");
+      setFlexInterval(settings?.interval || "weekly");
+      setFlexEnabled(!!settings?.enabled);
       return { detail, items };
     });
   }
@@ -403,6 +441,69 @@ export default function PlaylistManager() {
     });
   }
 
+  async function loadDashboard() {
+    if (!session?.access_token) return;
+    return run("Dashboard loaded", async () => {
+      const [summary, series] = await Promise.all([
+        api("/api/dashboard/summary?days=30&removals_limit=12", { accessToken: accessToken() }),
+        api("/api/dashboard/series?days=30&granularity=daily&scope=total", { accessToken: accessToken() }),
+      ]);
+      setDashboardSummary(summary);
+      setDashboardSeries(series);
+      return { summary, series };
+    });
+  }
+
+  async function saveFlexSettings() {
+    if (!playlistId) return;
+    await run("Flex settings saved", async () => {
+      await api("/api/flex/settings/save", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: {
+          playlist_id: playlistId,
+          reference_playlist: flexReference,
+          interval: flexInterval,
+          enabled: flexEnabled,
+        },
+      });
+      await loadSelectedPlaylist();
+    });
+  }
+
+  async function addFlexSlot(track) {
+    await run("Flex slot added", async () => {
+      await api("/api/flex/slots/add", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { playlist_id: playlistId, track_id: track.track_id },
+      });
+      await loadSelectedPlaylist();
+    });
+  }
+
+  async function removeFlexSlot(slot) {
+    await run("Flex slot removed", async () => {
+      await api("/api/flex/slots/remove", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { slot_id: slot.id },
+      });
+      await loadSelectedPlaylist();
+    });
+  }
+
+  async function rotateFlex(slotId = "") {
+    await run("Flex rotation queued", async () => {
+      await api("/api/flex/rotate", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: slotId ? { slot_id: slotId } : { playlist_id: playlistId },
+      });
+      await loadSelectedPlaylist();
+    });
+  }
+
   return (
     <main>
       <header className="topbar">
@@ -414,8 +515,8 @@ export default function PlaylistManager() {
           </div>
         </div>
         <nav>
-          <a>Dashboard</a>
-          <a className="active">Playlist Manager</a>
+          <button className={view === "dashboard" ? "navButton active" : "navButton"} onClick={() => setView("dashboard")}>Dashboard</button>
+          <button className={view === "manager" ? "navButton active" : "navButton"} onClick={() => setView("manager")}>Playlist Manager</button>
           {session ? <button onClick={signOut}>Log Out</button> : null}
         </nav>
       </header>
@@ -441,6 +542,72 @@ export default function PlaylistManager() {
       ) : (
       <>
 
+      {view === "dashboard" ? (
+      <section className="dashboard">
+        <div className="statusLine">
+          {message ? <span>{message}</span> : <span />}
+          {error ? <strong>{error}</strong> : null}
+        </div>
+        <div className="dashboardHero">
+          <div>
+            <h2>Dashboard</h2>
+            <p>{dashboardSummary?.totals?.playlists_count || 0} playlists · {formatNumber(dashboardSummary?.totals?.total_followers)} followers</p>
+          </div>
+          <button disabled={busy} onClick={loadDashboard}>Refresh</button>
+        </div>
+        <div className="metricGrid">
+          <article>
+            <span>Total Followers</span>
+            <strong>{formatNumber(dashboardSummary?.totals?.total_followers)}</strong>
+          </article>
+          <article>
+            <span>30d Growth</span>
+            <strong>{formatNumber(dashboardSummary?.totals?.net_growth_last_days)}</strong>
+          </article>
+          <article>
+            <span>Playlists</span>
+            <strong>{formatNumber(dashboardSummary?.totals?.playlists_count)}</strong>
+          </article>
+          <article>
+            <span>Upcoming Removals</span>
+            <strong>{formatNumber(dashboardSummary?.next_day_removals?.length)}</strong>
+          </article>
+        </div>
+        <div className="dashboardGrid">
+          <section className="dashboardPanel growthPanel">
+            <div>
+              <h2>Growth Trend</h2>
+              <p>Daily follower delta over the last 30 days</p>
+            </div>
+            <Sparkline values={dashboardSeries?.growth || []} />
+          </section>
+          <section className="dashboardPanel">
+            <h2>Top Growing</h2>
+            {dashboardSummary?.top_growing ? (
+              <div className="topGrowing">
+                <Artwork src={dashboardSummary.top_growing.image} alt="" size="lg" />
+                <div>
+                  <strong>{dashboardSummary.top_growing.name}</strong>
+                  <span>+{formatNumber(dashboardSummary.top_growing.delta)} · {formatNumber(dashboardSummary.top_growing.followers_now)} followers</span>
+                </div>
+              </div>
+            ) : <p>No growth data yet.</p>}
+          </section>
+          <section className="dashboardPanel removalsPanel">
+            <h2>Upcoming Auto-Removals</h2>
+            <div className="removalList">
+              {(dashboardSummary?.next_day_removals || []).map((item, index) => (
+                <div key={`${item.playlist_id || index}-${item.track_id || index}`}>
+                  <strong>{item.track_name || item.track_id || "Unknown track"}</strong>
+                  <span>{item.playlist_name || "Playlist"} · {item.age_label || ""}</span>
+                </div>
+              ))}
+              {!dashboardSummary?.next_day_removals?.length ? <p>No upcoming removals.</p> : null}
+            </div>
+          </section>
+        </div>
+      </section>
+      ) : (
       <section className="workspace">
         <aside className="sidebar">
           <div className="accountBox">
@@ -554,6 +721,47 @@ export default function PlaylistManager() {
             </button>
           </div>
 
+          <div className="flexPanel">
+            <div className="flexPanelHeader">
+              <div>
+                <h2>Flex Slots</h2>
+                <p>{flexSlots.length} rotating locked {flexSlots.length === 1 ? "position" : "positions"}</p>
+              </div>
+              <button disabled={busy || !playlistId || !flexSlots.length || !flexReference.trim()} onClick={() => rotateFlex()}>
+                Rotate Now
+              </button>
+            </div>
+            <div className="flexSettings">
+              <input
+                value={flexReference}
+                onChange={(e) => setFlexReference(e.target.value)}
+                placeholder="Reference playlist link"
+              />
+              <select value={flexInterval} onChange={(e) => setFlexInterval(e.target.value)}>
+                <option value="daily">Daily</option>
+                <option value="weekly">Weekly</option>
+                <option value="monthly">Monthly</option>
+              </select>
+              <label className="toggleField">
+                <input type="checkbox" checked={flexEnabled} onChange={(e) => setFlexEnabled(e.target.checked)} />
+                Enabled
+              </label>
+              <button disabled={busy || !playlistId} onClick={saveFlexSettings}>
+                Save
+              </button>
+            </div>
+            <div className="flexSlotList">
+              {flexSlots.map((slot) => (
+                <div className="flexSlot" key={slot.id}>
+                  <span>#{Number(slot.position) + 1}</span>
+                  <strong>{slot.current_track_name || slot.current_track_id}</strong>
+                  <button disabled={busy || !flexReference.trim()} onClick={() => rotateFlex(slot.id)}>Rotate</button>
+                  <button className="danger" disabled={busy} onClick={() => removeFlexSlot(slot)}>Remove</button>
+                </div>
+              ))}
+            </div>
+          </div>
+
           <div className="trackPanel">
             <div className="trackPanelHeader">
               <h2>Tracks</h2>
@@ -587,6 +795,9 @@ export default function PlaylistManager() {
                     <button className="compact" disabled={busy} onClick={() => setSongExpiry(track)}>
                       Exp
                     </button>
+                    <button className="compact" disabled={busy || !track.is_locked || flexSlots.some((slot) => slot.current_track_id === track.track_id)} onClick={() => addFlexSlot(track)}>
+                      Flex
+                    </button>
                     <button className="iconButton" aria-label="Move up" disabled={busy || track.position <= 0} onClick={() => moveTrack(track, "up")}>
                       ↑
                     </button>
@@ -603,6 +814,7 @@ export default function PlaylistManager() {
           </div>
         </section>
       </section>
+      )}
       </>
       )}
 
@@ -688,6 +900,11 @@ export default function PlaylistManager() {
         nav button {
           min-width: 112px;
         }
+        .navButton {
+          border-color: transparent;
+          background: transparent;
+          padding: 12px 0;
+        }
         .loginScreen {
           display: grid;
           gap: 18px;
@@ -727,6 +944,110 @@ export default function PlaylistManager() {
           border: 1px solid #18e06f;
           border-radius: 8px;
           padding: 12px 16px;
+        }
+        .dashboard {
+          display: grid;
+          gap: 20px;
+          padding: 18px clamp(20px, 3vw, 40px) 32px;
+        }
+        .dashboardHero {
+          display: flex;
+          justify-content: space-between;
+          align-items: end;
+          gap: 18px;
+        }
+        .dashboardHero h2 {
+          font-size: clamp(30px, 4vw, 48px);
+          line-height: 1;
+        }
+        .dashboardHero p,
+        .dashboardPanel p,
+        .dashboardPanel span {
+          color: #a6adba;
+        }
+        .metricGrid {
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 14px;
+        }
+        .metricGrid article,
+        .dashboardPanel {
+          border: 1px solid #2a303b;
+          background: #181c23;
+          padding: 18px;
+        }
+        .metricGrid article {
+          display: grid;
+          gap: 10px;
+        }
+        .metricGrid span {
+          color: #a6adba;
+          font-weight: 700;
+        }
+        .metricGrid strong {
+          font-size: 30px;
+        }
+        .dashboardGrid {
+          display: grid;
+          grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.8fr);
+          gap: 14px;
+        }
+        .growthPanel {
+          min-height: 280px;
+        }
+        .sparkline {
+          width: 100%;
+          height: 210px;
+          margin-top: 22px;
+        }
+        .sparkline path {
+          fill: none;
+          stroke: #18e06f;
+          stroke-width: 3;
+          vector-effect: non-scaling-stroke;
+        }
+        .sparkline.empty {
+          background: #222731;
+        }
+        .topGrowing {
+          display: grid;
+          grid-template-columns: 64px minmax(0, 1fr);
+          align-items: center;
+          gap: 14px;
+          margin-top: 18px;
+        }
+        .topGrowing div {
+          display: grid;
+          gap: 6px;
+          min-width: 0;
+        }
+        .topGrowing strong,
+        .topGrowing span {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .removalsPanel {
+          grid-column: 1 / -1;
+        }
+        .removalList {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 10px;
+          margin-top: 14px;
+        }
+        .removalList div {
+          display: grid;
+          gap: 6px;
+          border-top: 1px solid #202630;
+          padding-top: 10px;
+          min-width: 0;
+        }
+        .removalList strong,
+        .removalList span {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
         }
         .workspace {
           display: grid;
@@ -827,7 +1148,7 @@ export default function PlaylistManager() {
         .content {
           display: grid;
           align-content: start;
-          grid-template-rows: auto auto auto minmax(0, 1fr);
+          grid-template-rows: auto auto auto auto minmax(0, 1fr);
           gap: 18px;
           min-height: 0;
           overflow: hidden;
@@ -884,6 +1205,64 @@ export default function PlaylistManager() {
           font-size: 26px;
           font-weight: 800;
           padding: 4px 14px;
+        }
+        .flexPanel {
+          display: grid;
+          gap: 12px;
+          border: 1px solid #2a303b;
+          background: #181c23;
+          padding: 16px 18px;
+        }
+        .flexPanelHeader,
+        .flexSettings,
+        .flexSlot {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+        }
+        .flexPanelHeader h2 {
+          font-size: 20px;
+        }
+        .flexPanelHeader p {
+          margin-top: 5px;
+          color: #a6adba;
+        }
+        .flexSettings {
+          display: grid;
+          grid-template-columns: minmax(220px, 1fr) 132px auto auto;
+        }
+        .toggleField {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          color: #a6adba;
+          font-weight: 700;
+          white-space: nowrap;
+        }
+        .toggleField input {
+          width: 18px;
+          height: 18px;
+          padding: 0;
+        }
+        .flexSlotList {
+          display: grid;
+          gap: 8px;
+        }
+        .flexSlot {
+          display: grid;
+          grid-template-columns: 52px minmax(0, 1fr) auto auto;
+          padding: 10px 0 0;
+          border-top: 1px solid #202630;
+        }
+        .flexSlot strong {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .flexSlot span {
+          color: #a6adba;
+          font-weight: 800;
         }
         .trackPanel {
           border: 1px solid #2a303b;
@@ -963,7 +1342,7 @@ export default function PlaylistManager() {
         }
         .rowActions {
           display: grid;
-          grid-template-columns: minmax(82px, auto) 48px 42px 42px minmax(82px, auto);
+          grid-template-columns: minmax(72px, auto) 48px 58px 42px 42px minmax(82px, auto);
           align-items: center;
           gap: 8px;
           justify-content: end;
@@ -1013,6 +1392,11 @@ export default function PlaylistManager() {
             flex-wrap: wrap;
             gap: 14px;
           }
+          .metricGrid,
+          .dashboardGrid,
+          .removalList {
+            grid-template-columns: 1fr;
+          }
           .workspace {
             grid-template-columns: 1fr;
             height: auto;
@@ -1057,6 +1441,10 @@ export default function PlaylistManager() {
             grid-template-columns: 1fr;
             width: 100%;
           }
+          .dashboardHero {
+            display: grid;
+            align-items: stretch;
+          }
           nav .active {
             width: fit-content;
           }
@@ -1090,6 +1478,15 @@ export default function PlaylistManager() {
           .headerActions button {
             width: 100%;
             box-sizing: border-box;
+          }
+          .flexSettings,
+          .flexSlot {
+            grid-template-columns: 1fr;
+            align-items: stretch;
+          }
+          .flexPanelHeader {
+            display: grid;
+            align-items: stretch;
           }
           .addTrack {
             grid-template-columns: 1fr;
@@ -1133,7 +1530,7 @@ export default function PlaylistManager() {
           }
           .rowActions {
             grid-column: 2;
-            grid-template-columns: repeat(2, minmax(0, 1fr)) 40px 40px;
+            grid-template-columns: repeat(3, minmax(0, 1fr)) 40px 40px;
             justify-content: stretch;
           }
           .rowActions .danger {

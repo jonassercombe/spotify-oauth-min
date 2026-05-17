@@ -1,5 +1,6 @@
 {
   "crons": [
-    { "path": "/api/watch/cron-maintenance-all", "schedule": "0 4 * * *" }
+    { "path": "/api/watch/cron-maintenance-all", "schedule": "0 4 * * *" },
+    { "path": "/api/flex/cron-rotate-due", "schedule": "0 3 * * *" }
   ]
 }
