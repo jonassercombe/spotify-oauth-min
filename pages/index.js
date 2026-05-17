@@ -48,6 +48,72 @@ function Field({ label, children }) {
   );
 }
 
+function IconStopwatch() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M10 2h4" />
+      <path d="M12 14l3-3" />
+      <path d="M12 6a8 8 0 1 0 0 16 8 8 0 0 0 0-16Z" />
+      <path d="M17.5 6.5 19 5" />
+    </svg>
+  );
+}
+
+function IconShuffle() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M3 7h3c4 0 5 10 9 10h2" />
+      <path d="M3 17h3c2.5 0 4-3.5 5.5-6" />
+      <path d="M17 3l4 4-4 4" />
+      <path d="M17 13l4 4-4 4" />
+    </svg>
+  );
+}
+
+function IconLock({ locked = false }) {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="5" y="10" width="14" height="10" rx="2" />
+      {locked ? <path d="M8 10V7a4 4 0 0 1 8 0v3" /> : <path d="M8 10V7a4 4 0 0 1 7.5-2" />}
+    </svg>
+  );
+}
+
+function IconArrow({ direction = "up" }) {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      {direction === "up" ? <path d="M12 19V5" /> : <path d="M12 5v14" />}
+      {direction === "up" ? <path d="M5 12l7-7 7 7" /> : <path d="M5 12l7 7 7-7" />}
+    </svg>
+  );
+}
+
+function IconTrash() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M4 7h16" />
+      <path d="M10 11v6" />
+      <path d="M14 11v6" />
+      <path d="M6 7l1 14h10l1-14" />
+      <path d="M9 7V4h6v3" />
+    </svg>
+  );
+}
+
+function IconButton({ children, className = "", tooltip, label, ...props }) {
+  return (
+    <button
+      {...props}
+      className={`iconButton tooltipButton ${className}`.trim()}
+      aria-label={label || tooltip}
+      title={tooltip}
+      data-tooltip={tooltip}
+    >
+      {children}
+    </button>
+  );
+}
+
 function normalizeSpotifyImageUrl(url) {
   if (!url) return "";
   const value = String(url).trim();
@@ -815,7 +881,13 @@ export default function PlaylistManager() {
                 <h2>Flex Slots</h2>
                 <p>{flexSlots.length} rotating locked {flexSlots.length === 1 ? "position" : "positions"}</p>
               </div>
-              <button disabled={busy || !playlistId || !flexSlots.length || !flexReference.trim()} onClick={() => rotateFlex()}>
+              <button
+                className="tooltipButton"
+                title="Rotate all flex slots now using the reference playlist."
+                data-tooltip="Rotate all flex slots now using the reference playlist."
+                disabled={busy || !playlistId || !flexSlots.length || !flexReference.trim()}
+                onClick={() => rotateFlex()}
+              >
                 Rotate Now
               </button>
             </div>
@@ -834,7 +906,13 @@ export default function PlaylistManager() {
                 <input type="checkbox" checked={flexEnabled} onChange={(e) => setFlexEnabled(e.target.checked)} />
                 Enabled
               </label>
-              <button disabled={busy || !playlistId} onClick={saveFlexSettings}>
+              <button
+                className="tooltipButton"
+                title="Save the reference playlist, rotation interval, and enabled state."
+                data-tooltip="Save the reference playlist, rotation interval, and enabled state."
+                disabled={busy || !playlistId}
+                onClick={saveFlexSettings}
+              >
                 Save
               </button>
             </div>
@@ -843,8 +921,24 @@ export default function PlaylistManager() {
                 <div className="flexSlot" key={slot.id}>
                   <span>#{Number(slot.position) + 1}</span>
                   <strong>{slot.current_track_name || slot.current_track_id}</strong>
-                  <button disabled={busy || !flexReference.trim()} onClick={() => rotateFlex(slot.id)}>Rotate</button>
-                  <button className="danger" disabled={busy} onClick={() => removeFlexSlot(slot)}>Remove</button>
+                  <button
+                    className="tooltipButton"
+                    title="Replace this flex song with a random track from the reference playlist."
+                    data-tooltip="Replace this flex song with a random track from the reference playlist."
+                    disabled={busy || !flexReference.trim()}
+                    onClick={() => rotateFlex(slot.id)}
+                  >
+                    Rotate
+                  </button>
+                  <button
+                    className="danger tooltipButton"
+                    title="Remove this flex slot. The song itself stays in the playlist unless removed separately."
+                    data-tooltip="Remove this flex slot. The song itself stays in the playlist unless removed separately."
+                    disabled={busy}
+                    onClick={() => removeFlexSlot(slot)}
+                  >
+                    Remove
+                  </button>
                 </div>
               ))}
             </div>
@@ -877,24 +971,39 @@ export default function PlaylistManager() {
                     {track.expiry_weeks ? <span className="expiry">{track.expiry_weeks}w</span> : null}
                   </div>
                   <div className="rowActions">
-                    <button className="compact" disabled={busy} onClick={() => toggleLock(track)}>
+                    <button
+                      className="compact tooltipButton"
+                      title={track.is_locked ? "Unlock this song so automation can move or remove it again." : "Lock this song to its current playlist position."}
+                      data-tooltip={track.is_locked ? "Unlock this song so automation can move or remove it again." : "Lock this song to its current playlist position."}
+                      disabled={busy}
+                      onClick={() => toggleLock(track)}
+                    >
+                      <IconLock locked={track.is_locked} />
                       {track.is_locked ? "Unlock" : "Lock"}
                     </button>
-                    <button className="compact" disabled={busy} onClick={() => setSongExpiry(track)}>
-                      Exp
-                    </button>
-                    <button className="compact" disabled={busy || !track.is_locked || flexSlots.some((slot) => slot.current_track_id === track.track_id)} onClick={() => addFlexSlot(track)}>
-                      Flex
-                    </button>
-                    <button className="iconButton" aria-label="Move up" disabled={busy || track.position <= 0} onClick={() => moveTrack(track, "up")}>
-                      ↑
-                    </button>
-                    <button className="iconButton" aria-label="Move down" disabled={busy} onClick={() => moveTrack(track, "down")}>
-                      ↓
-                    </button>
-                    <button className="compact danger" disabled={busy} onClick={() => removeTrack(track)}>
-                      Remove
-                    </button>
+                    <IconButton
+                      tooltip="Set or clear a custom expiry timer for this song."
+                      disabled={busy}
+                      onClick={() => setSongExpiry(track)}
+                    >
+                      <IconStopwatch />
+                    </IconButton>
+                    <IconButton
+                      tooltip="Turn this locked song into a flex slot that rotates from the reference playlist."
+                      disabled={busy || !track.is_locked || flexSlots.some((slot) => slot.current_track_id === track.track_id)}
+                      onClick={() => addFlexSlot(track)}
+                    >
+                      <IconShuffle />
+                    </IconButton>
+                    <IconButton tooltip="Move this song one position up." disabled={busy || track.position <= 0} onClick={() => moveTrack(track, "up")}>
+                      <IconArrow direction="up" />
+                    </IconButton>
+                    <IconButton tooltip="Move this song one position down." disabled={busy} onClick={() => moveTrack(track, "down")}>
+                      <IconArrow direction="down" />
+                    </IconButton>
+                    <IconButton className="danger" tooltip="Remove this song from the playlist." disabled={busy} onClick={() => removeTrack(track)}>
+                      <IconTrash />
+                    </IconButton>
                   </div>
                 </article>
               ))}
@@ -923,6 +1032,16 @@ export default function PlaylistManager() {
           border-radius: 8px;
           padding: 10px 14px;
           cursor: pointer;
+        }
+        button svg {
+          width: 18px;
+          height: 18px;
+          stroke: currentColor;
+          stroke-width: 2;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+          fill: none;
+          flex: 0 0 auto;
         }
         button:disabled {
           cursor: not-allowed;
@@ -1510,22 +1629,70 @@ export default function PlaylistManager() {
         }
         .rowActions {
           display: grid;
-          grid-template-columns: minmax(72px, auto) 48px 58px 42px 42px minmax(82px, auto);
+          grid-template-columns: minmax(86px, auto) repeat(5, 42px);
           align-items: center;
           gap: 8px;
           justify-content: end;
         }
         .compact,
         .iconButton {
+          position: relative;
           min-height: 38px;
           padding: 7px 10px;
           white-space: nowrap;
         }
+        .compact {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 7px;
+        }
         .iconButton {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
           width: 42px;
           padding: 7px 0;
           font-size: 18px;
           line-height: 1;
+        }
+        .tooltipButton {
+          position: relative;
+        }
+        .tooltipButton::after {
+          content: attr(data-tooltip);
+          position: absolute;
+          right: 0;
+          bottom: calc(100% + 10px);
+          z-index: 20;
+          width: max-content;
+          max-width: 260px;
+          padding: 8px 10px;
+          border: 1px solid #303743;
+          border-radius: 6px;
+          background: #0f1217;
+          color: #f4f6fb;
+          font-size: 12px;
+          line-height: 1.35;
+          font-weight: 700;
+          text-align: left;
+          white-space: normal;
+          box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+          opacity: 0;
+          pointer-events: none;
+          transform: translateY(4px);
+          transition: opacity 140ms ease, transform 140ms ease;
+        }
+        .tooltipButton:hover::after,
+        .tooltipButton:focus-visible::after {
+          opacity: 1;
+          transform: translateY(0);
+          transition-delay: 420ms;
+        }
+        .trackRow:first-child .tooltipButton::after,
+        .flexPanel .tooltipButton::after {
+          bottom: auto;
+          top: calc(100% + 10px);
         }
         @media (max-width: 1320px) {
           .workspace {
@@ -1717,11 +1884,11 @@ export default function PlaylistManager() {
           }
           .rowActions {
             grid-column: 2;
-            grid-template-columns: repeat(3, minmax(0, 1fr)) 40px 40px;
+            grid-template-columns: repeat(6, minmax(0, 1fr));
             justify-content: stretch;
           }
-          .rowActions .danger {
-            grid-column: 1 / -1;
+          .rowActions .compact {
+            grid-column: 1 / 3;
           }
           .compact,
           .iconButton {
