@@ -373,7 +373,7 @@ export default function PlaylistManager() {
     <main>
       <header className="topbar">
         <div className="brand">
-          <div className="logo">PP</div>
+          <img className="logo" src="/playlistpilot-logo-v1.jpg" alt="Playlist Pilot" />
           <div>
             <h1>Playlist Pilot</h1>
             <p>Playlist Manager</p>
@@ -628,14 +628,11 @@ export default function PlaylistManager() {
           gap: 18px;
         }
         .logo {
-          display: grid;
-          place-items: center;
           width: 72px;
           height: 72px;
           border-radius: 14px;
+          object-fit: cover;
           background: #082331;
-          color: #18e06f;
-          font-weight: 800;
         }
         h1, h2, h3, p {
           margin: 0;
