@@ -300,6 +300,16 @@ async function setConnectionCooldown(connection_id, seconds) {
   return until;
 }
 
+async function setPlaylistUpdateCooldown(playlist_id, seconds = 300) {
+  const until = new Date(Date.now() + Math.max(1, seconds) * 1000).toISOString();
+  await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(String(playlist_id))}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ next_check_at: until })
+  }).catch(() => {});
+  return until;
+}
+
 
 /* ==============================
    PayPal helpers
@@ -1928,10 +1938,11 @@ const routes = {
        }
    
        // Nach Erfolg: DB-Sync markieren und asynchronen Sync anstoßen
+       const cooldownUntil = await setPlaylistUpdateCooldown(row.id, 300);
        await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(row.id)}`, {
          method: "PATCH",
          headers: { Prefer: "return=minimal" },
-         body: JSON.stringify({ needs_sync: true })
+         body: JSON.stringify({ needs_sync: true, next_check_at: cooldownUntil })
        }).catch(() => {});
 
        // Wenn expiry_weeks angegeben wurde, in playlist_item_locks speichern
@@ -1967,7 +1978,8 @@ const routes = {
          ok: true,
          added: trackUri,
          position_used: (wantPosition !== null && wantPosition !== undefined) ? wantPosition : "append",
-         snapshot_id: addRes.json?.snapshot_id || null
+         snapshot_id: addRes.json?.snapshot_id || null,
+         cooldown_until: cooldownUntil
        });
      } catch (e) {
        return bad(res, 500, `add_track_exception: ${e && e.stack ? e.stack : String(e)}`);
@@ -2397,10 +2409,12 @@ const routes = {
      if (enabled && (!Number.isInteger(weeks) || weeks < 1 || weeks > 104)) {
        return bad(res, 400, "invalid_weeks_range_1_104");
      }
+     const cooldownUntil = await setPlaylistUpdateCooldown(playlist_id, 300);
    
      const patch = {
        auto_remove_enabled: enabled,
-       auto_remove_weeks: weeks
+       auto_remove_weeks: weeks,
+       next_check_at: cooldownUntil
      };
    
      const r = await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(playlist_id)}`, {
@@ -2411,16 +2425,7 @@ const routes = {
      if (!r.ok) return bad(res, 500, `supabase_patch_failed: ${await r.text()}`);
      const data = await r.json();
 
-     const base = process.env.PUBLIC_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
-     if (base) {
-       fetch(`${base}/api/playlists/dispatch-sync`, {
-         method: "POST",
-         headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
-         body: JSON.stringify({ playlist_id })
-       }).catch(() => {});
-     }
-
-     return json(res, 200, { ok:true, playlist: Array.isArray(data) ? data[0] : data });
+     return json(res, 200, { ok:true, playlist: Array.isArray(data) ? data[0] : data, cooldown_until: cooldownUntil });
    },
    
 
@@ -2692,6 +2697,12 @@ const routes = {
        if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
        const own = await sb(`/rest/v1/playlists?select=id&limit=1&id=eq.${encodeURIComponent(String(playlist_id))}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r=>r.json());
        if (!own?.[0]) return bad(res, 403, "Playlist not owned by user");
+     } else {
+       const cdRows = await sb(`/rest/v1/playlists?select=next_check_at&limit=1&id=eq.${encodeURIComponent(String(playlist_id))}`).then(r => r.json()).catch(() => []);
+       const cooldownUntil = cdRows?.[0]?.next_check_at ? new Date(cdRows[0].next_check_at) : null;
+       if (cooldownUntil && cooldownUntil > new Date()) {
+         return json(res, 200, { ok: true, skipped: true, reason: "playlist_cooldown", until: cooldownUntil.toISOString() });
+       }
      }
    
      const r = await sb(`/rest/v1/rpc/playlist_maintenance`, {
@@ -2702,7 +2713,8 @@ const routes = {
      if (!r.ok) return bad(res, 500, `rpc_playlist_maintenance_failed: ${t}`);
    
      const out = t ? JSON.parse(t) : [{ removed:0, total_after:0 }];
-     return json(res, 200, { ok:true, result: out[0] || out });
+     const cooldownUntil = !isInternal ? await setPlaylistUpdateCooldown(playlist_id, 300) : null;
+     return json(res, 200, { ok:true, result: out[0] || out, ...(cooldownUntil ? { cooldown_until: cooldownUntil } : {}) });
    },
 
   /* ---------- playlist-items/list (GET) ---------- */
@@ -3804,7 +3816,13 @@ const routes = {
        return json(res, 200, { ok:true, synced:0, failed:0, skipped:true, reason: u.sync_paused ? "user_paused" : "subscription_inactive" });
      }
    
-     const r = await sb(`/rest/v1/playlists?select=id&connection_id=eq.${encodeURIComponent(body.connection_id)}&needs_sync=is.true&limit=${encodeURIComponent(qs.limit || "50")}`);
+     const r = await sb(
+       `/rest/v1/playlists?select=id,next_check_at` +
+       `&connection_id=eq.${encodeURIComponent(body.connection_id)}` +
+       `&needs_sync=is.true` +
+       `&or=(next_check_at.is.null,next_check_at.lte.${encodeURIComponent(new Date().toISOString())})` +
+       `&limit=${encodeURIComponent(qs.limit || "50")}`
+     );
      if (!r.ok) return bad(res, 500, `supabase_select_failed: ${await r.text()}`);
      const rows = await r.json();
      if (rows.length === 0) return json(res, 200, { ok:true, synced:0 });
@@ -3952,7 +3970,11 @@ const routes = {
      const qs = Object.fromEntries(new URL(req.url, `http://${req.headers.host}`).searchParams.entries());
    
      // Zielmenge: alle, die Auto-Remove aktiv haben (und Wochen gesetzt)
-     const sel = await sb(`/rest/v1/playlists?select=id&auto_remove_enabled=is.true&auto_remove_weeks=not.is.null`);
+     const sel = await sb(
+       `/rest/v1/playlists?select=id` +
+       `&auto_remove_enabled=is.true&auto_remove_weeks=not.is.null` +
+       `&or=(next_check_at.is.null,next_check_at.lte.${encodeURIComponent(new Date().toISOString())})`
+     );
      if (!sel.ok) return bad(res, 500, `supabase_select_failed: ${await sel.text()}`);
      const rows = await sel.json();
      if (!rows.length) return json(res, 200, { ok:true, processed:0 });
@@ -4077,6 +4099,8 @@ const routes = {
      const txt = await r.text();
      let j = null; try { j = txt ? JSON.parse(txt) : null; } catch {}
      if (!r.ok) return bad(res, r.status, `rpc_move_failed: ${txt}`);
+
+     const cooldownUntil = await setPlaylistUpdateCooldown(playlist_id, 300);
    
      const base = process.env.PUBLIC_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
      if (base) {
@@ -4087,7 +4111,7 @@ const routes = {
        }).catch(() => {});
      }
    
-     return json(res, 200, { ok: true, result: j?.[0] || null });
+     return json(res, 200, { ok: true, result: j?.[0] || null, cooldown_until: cooldownUntil });
    },
    
   /* ---------- playlist-items/remove (POST, Bubble) ---------- */
@@ -4243,12 +4267,13 @@ const routes = {
          }
    
          const newSnap = j?.snapshot_id || null;
+         const cooldownUntil = await setPlaylistUpdateCooldown(p.id, 300);
    
          // Supabase sync triggern
          await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
            method: "PATCH",
            headers: { Prefer: "return=minimal" },
-           body: JSON.stringify({ needs_sync: true, last_snapshot_checked_at: new Date().toISOString() })
+           body: JSON.stringify({ needs_sync: true, last_snapshot_checked_at: new Date().toISOString(), next_check_at: cooldownUntil })
          }).catch(()=>{});
    
          const base = process.env.PUBLIC_BASE_URL || `https://${process.env.VERCEL_URL}`;
@@ -4260,7 +4285,7 @@ const routes = {
            }).catch(()=>{});
          }
    
-         return json(res, 200, { ok: true, removed_at_position0: delBody.tracks[0].positions[0], new_snapshot_id: newSnap });
+         return json(res, 200, { ok: true, removed_at_position0: delBody.tracks[0].positions[0], new_snapshot_id: newSnap, cooldown_until: cooldownUntil });
        }
      } catch (e) {
        return bad(res, 500, `remove_exception: ${e?.message || e}`);
@@ -4343,16 +4368,9 @@ const routes = {
      if (!up.ok) return bad(res, 500, `supabase_upsert_failed: ${await up.text()}`);
      const data = await up.json();
 
-     const base = process.env.PUBLIC_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
-     if (base) {
-       fetch(`${base}/api/playlists/dispatch-sync`, {
-         method: "POST",
-         headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
-         body: JSON.stringify({ playlist_id })
-       }).catch(() => {});
-     }
+     const cooldownUntil = await setPlaylistUpdateCooldown(playlist_id, 300);
 
-     return json(res, 200, { ok:true, lock: Array.isArray(data) ? data[0] : data });
+     return json(res, 200, { ok:true, lock: Array.isArray(data) ? data[0] : data, cooldown_until: cooldownUntil });
    },
 
 
@@ -4376,16 +4394,9 @@ const routes = {
     });
     if (!del.ok) return bad(res, 500, `supabase_delete_failed: ${await del.text()}`);
 
-    const base = process.env.PUBLIC_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
-    if (base) {
-      fetch(`${base}/api/playlists/dispatch-sync`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
-        body: JSON.stringify({ playlist_id })
-      }).catch(() => {});
-    }
+    const cooldownUntil = await setPlaylistUpdateCooldown(playlist_id, 300);
 
-    return json(res, 200, { ok:true });
+    return json(res, 200, { ok:true, cooldown_until: cooldownUntil });
   },
 
   /* ---------- playlists/enforce (POST, server/cron) ---------- */

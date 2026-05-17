@@ -55,12 +55,12 @@ function Artwork({ src, alt = "", size = "md" }) {
   }, [src]);
 
   if (failed || !currentSrc) {
-    return <div className={`coverFallback ${size}`} aria-hidden="true" />;
+    return <div className={`coverFallback artwork--${size}`} aria-hidden="true" />;
   }
 
   return (
     <img
-      className={`artwork ${size}`}
+      className={`artwork artwork--${size}`}
       src={currentSrc}
       alt={alt}
       referrerPolicy="no-referrer"
@@ -582,7 +582,7 @@ export default function PlaylistManager() {
                   </div>
                   <div className="rowActions">
                     <button className="compact" disabled={busy} onClick={() => toggleLock(track)}>
-                      {track.is_locked ? "Unlock" : "Set Lock"}
+                      {track.is_locked ? "Unlock" : "Lock"}
                     </button>
                     <button className="compact" disabled={busy} onClick={() => setSongExpiry(track)}>
                       Exp
@@ -792,17 +792,17 @@ export default function PlaylistManager() {
           background: #303743;
           flex: 0 0 auto;
         }
-        .sm {
+        .artwork--sm {
           width: 52px;
           height: 52px;
         }
-        .lg {
+        .artwork--lg {
           width: 64px;
           height: 64px;
         }
-        .xl {
-          width: 112px;
-          height: 112px;
+        .artwork--xl {
+          width: 92px;
+          height: 92px;
           border-radius: 6px;
         }
         .coverFallback {
@@ -1073,7 +1073,7 @@ export default function PlaylistManager() {
             grid-template-columns: 72px minmax(0, 1fr);
             align-items: center;
           }
-          .playlistHeader .xl {
+          .playlistHeader .artwork--xl {
             width: 72px;
             height: 72px;
           }
@@ -1122,7 +1122,7 @@ export default function PlaylistManager() {
             gap: 10px;
             padding: 12px;
           }
-          .trackRow .sm {
+          .trackRow .artwork--sm {
             display: none;
           }
           .trackMeta {
