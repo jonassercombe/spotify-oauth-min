@@ -237,6 +237,7 @@ export default function PlaylistManager() {
   const [flexSettings, setFlexSettings] = useState(null);
   const [flexSlots, setFlexSlots] = useState([]);
   const [flexReference, setFlexReference] = useState("");
+  const [flexReferenceMeta, setFlexReferenceMeta] = useState(null);
   const [flexInterval, setFlexInterval] = useState("weekly");
   const [flexEnabled, setFlexEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -265,6 +266,7 @@ export default function PlaylistManager() {
       setTracks([]);
       setFlexSettings(null);
       setFlexSlots([]);
+      setFlexReferenceMeta(null);
     });
 
     return () => listener.subscription.unsubscribe();
@@ -426,6 +428,7 @@ export default function PlaylistManager() {
       setFlexSettings(settings);
       setFlexSlots(Array.isArray(slots) ? slots : []);
       setFlexReference(settings?.reference_playlist_url || settings?.reference_playlist_id || "");
+      setFlexReferenceMeta(settings?.reference_playlist || null);
       setFlexInterval(settings?.interval || "weekly");
       setFlexEnabled(!!settings?.enabled);
       return { detail, items };
@@ -567,7 +570,7 @@ export default function PlaylistManager() {
   async function saveFlexSettings() {
     if (!playlistId) return;
     await run("Flex settings saved", async () => {
-      await api("/api/flex/settings/save", {
+      const result = await api("/api/flex/settings/save", {
         method: "POST",
         accessToken: accessToken(),
         body: {
@@ -577,6 +580,9 @@ export default function PlaylistManager() {
           enabled: flexEnabled,
         },
       });
+      if (result?.settings?.reference_playlist) {
+        setFlexReferenceMeta(result.settings.reference_playlist);
+      }
       await loadSelectedPlaylist();
     });
   }
@@ -921,6 +927,20 @@ export default function PlaylistManager() {
                 Save
               </button>
             </div>
+            {flexReferenceMeta ? (
+              <div className="referencePlaylist">
+                <Artwork src={flexReferenceMeta.image} alt="" size="lg" />
+                <div>
+                  <span>Reference Playlist</span>
+                  <strong>{flexReferenceMeta.name || flexReferenceMeta.id}</strong>
+                  <small>
+                    {formatNumber(flexReferenceMeta.tracks_total)} tracks
+                    {flexReferenceMeta.owner_name ? ` · by ${flexReferenceMeta.owner_name}` : ""}
+                    {flexReferenceMeta.followers !== null && flexReferenceMeta.followers !== undefined ? ` · ${formatNumber(flexReferenceMeta.followers)} followers` : ""}
+                  </small>
+                </div>
+              </div>
+            ) : null}
             <div className="flexSlotList">
               {flexSlots.map((slot) => (
                 <div className="flexSlot" key={slot.id}>
@@ -1543,6 +1563,36 @@ export default function PlaylistManager() {
           width: 18px;
           height: 18px;
           padding: 0;
+        }
+        .referencePlaylist {
+          display: grid;
+          grid-template-columns: 64px minmax(0, 1fr);
+          align-items: center;
+          gap: 14px;
+          padding: 12px;
+          border: 1px solid rgba(24, 224, 111, 0.28);
+          border-radius: 8px;
+          background: rgba(24, 224, 111, 0.06);
+        }
+        .referencePlaylist div {
+          display: grid;
+          gap: 5px;
+          min-width: 0;
+        }
+        .referencePlaylist span {
+          color: #18e06f;
+          font-size: 12px;
+          font-weight: 800;
+          text-transform: uppercase;
+        }
+        .referencePlaylist strong,
+        .referencePlaylist small {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .referencePlaylist small {
+          color: #a6adba;
         }
         .flexSlotList {
           display: grid;
