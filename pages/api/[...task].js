@@ -887,8 +887,26 @@ const routes = {
               customer_id: session.customer,
               subscription,
             });
-          }
-        }
+  }
+}
+
+async function refreshAccessTokenDirect(refresh_token, credentials) {
+  const response = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token,
+      client_id: credentials.client_id,
+      client_secret: credentials.client_secret,
+    }),
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok || !payload?.access_token) {
+    throw new Error(`spotify_refresh_failed_${response.status}`);
+  }
+  return payload.access_token;
+}
       }
 
       if (event.type === "customer.subscription.created" || event.type === "customer.subscription.updated" || event.type === "customer.subscription.deleted") {
@@ -2329,18 +2347,18 @@ const routes = {
        const conn = connR.ok ? (await connR.json().catch(() => []))?.[0] : null;
        if (!conn?.refresh_token_enc) return bad(res, 404, "connection_not_found");
        const credentials = await getSpotifyAppCredentialsForConnection(connection_id);
-       const refreshed = await refreshAccessToken(decryptToken(conn.refresh_token_enc), credentials);
-       const token = refreshed.access_token;
+       const token = await refreshAccessTokenDirect(decryptToken(conn.refresh_token_enc), credentials);
        const url = `https://api.spotify.com/v1/search?type=track&market=from_token&limit=${encodeURIComponent(
          String(limit)
        )}&q=${encodeURIComponent(q)}`;
    
-       const { r, json, text } = await fetchJSON(url, {
+       const searchResponse = await fetch(url, {
          headers: { Authorization: `Bearer ${token}` },
-       }, 20000);
+       });
+       const { json, text } = await parseJsonSafe(searchResponse);
    
-       if (!r.ok) {
-         return bad(res, r.status, `spotify_search_failed: ${json ? JSON.stringify(json) : text}`);
+       if (!searchResponse.ok) {
+         return bad(res, searchResponse.status, `spotify_search_failed: ${json ? JSON.stringify(json) : text}`);
        }
    
        const items = (json?.tracks?.items || []).map((t) => ({

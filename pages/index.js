@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowDown, ArrowUp, GripVertical, Lock, Shuffle, TimerReset, Trash2, Unlock } from "lucide-react";
+import { ArrowDown, ArrowUp, GripVertical, Lock, Settings, Shuffle, TimerReset, Trash2, Unlock, X } from "lucide-react";
 import { getSupabaseBrowserClient } from "../lib/supabaseBrowser";
 
 const ENABLE_OPTIMISTIC_PLAYLIST_UI = true;
@@ -228,6 +228,7 @@ export default function PlaylistManager() {
   const [dragTrackId, setDragTrackId] = useState("");
   const [spotifyCredentials, setSpotifyCredentials] = useState(null);
   const [spotifyCredsOpen, setSpotifyCredsOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [spotifyClientId, setSpotifyClientId] = useState("");
   const [spotifyClientSecret, setSpotifyClientSecret] = useState("");
   const [spotifyAppName, setSpotifyAppName] = useState("");
@@ -871,6 +872,64 @@ export default function PlaylistManager() {
         </section>
       ) : (
       <>
+      {settingsOpen ? (
+        <div className="settingsOverlay" role="dialog" aria-modal="true" aria-label="Settings">
+          <div className="settingsPanel">
+            <div className="settingsHeader">
+              <div>
+                <h2>Settings</h2>
+                <p>Account, billing, and Spotify API setup.</p>
+              </div>
+              <button className="iconOnlyButton" onClick={() => setSettingsOpen(false)} aria-label="Close settings">
+                <X aria-hidden="true" />
+              </button>
+            </div>
+
+            <section className="settingsSection">
+              <span>Signed in</span>
+              <strong>{userContext.email}</strong>
+            </section>
+
+            <section className={billingActive ? "billingBox billingBox--active" : "billingBox"}>
+              <span>{billingActive ? "Subscription active" : "Subscription required"}</span>
+              <strong>{billing.plan_code || (billingActive ? "Active plan" : "PlaylistPilot Pro")}</strong>
+              {billing.current_period_end ? <small>Renews through {formatShortDate(String(billing.current_period_end).slice(0, 10))}</small> : null}
+              {billingActive ? (
+                <button disabled={busy} onClick={openBillingPortal}>Manage billing</button>
+              ) : (
+                <button disabled={busy} onClick={startCheckout}>Upgrade</button>
+              )}
+            </section>
+
+            <section className="settingsSection">
+              <div>
+                <h3>Spotify API App</h3>
+                <p>Create a Spotify Developer app, add this Redirect URI, then paste the Client ID and Client Secret here.</p>
+              </div>
+              <ol>
+                <li>Open developer.spotify.com/dashboard and create an app.</li>
+                <li>Add the Redirect URI below in the app settings.</li>
+                <li>Copy Client ID and Client Secret into Playlist Pilot.</li>
+              </ol>
+              <label>
+                <span>Redirect URI</span>
+                <input value={spotifyRedirectUri} onChange={(e) => setSpotifyRedirectUri(e.target.value)} />
+              </label>
+              <input value={spotifyAppName} onChange={(e) => setSpotifyAppName(e.target.value)} placeholder="App name" />
+              <input value={spotifyClientId} onChange={(e) => setSpotifyClientId(e.target.value)} placeholder="Client ID" />
+              <input
+                type="password"
+                value={spotifyClientSecret}
+                onChange={(e) => setSpotifyClientSecret(e.target.value)}
+                placeholder={spotifyCredentials?.configured ? "New Client Secret to replace" : "Client Secret"}
+              />
+              <button disabled={busy || !spotifyClientId.trim() || !spotifyClientSecret.trim()} onClick={saveSpotifyCredentials}>
+                Save Spotify App
+              </button>
+            </section>
+          </div>
+        </div>
+      ) : null}
 
       {view === "dashboard" ? (
       <section className="dashboard">
@@ -989,53 +1048,15 @@ export default function PlaylistManager() {
       ) : (
       <section className="workspace">
         <aside className="sidebar">
-          <div className="accountBox">
-            <span>Signed in</span>
-            <strong>{userContext.email}</strong>
-          </div>
-
-          <section className={billingActive ? "billingBox billingBox--active" : "billingBox"}>
-            <span>{billingActive ? "Subscription active" : "Subscription required"}</span>
-            <strong>{billing.plan_code || (billingActive ? "Active plan" : "PlaylistPilot Pro")}</strong>
-            {billing.current_period_end ? <small>Renews through {formatShortDate(String(billing.current_period_end).slice(0, 10))}</small> : null}
-            {billingActive ? (
-              <button disabled={busy} onClick={openBillingPortal}>Manage billing</button>
-            ) : (
-              <button disabled={busy} onClick={startCheckout}>Upgrade</button>
-            )}
-          </section>
-
-          <section className={`spotifySetup ${spotifyCredsOpen ? "spotifySetup--open" : ""}`}>
-            <button className="spotifySetupToggle" onClick={() => setSpotifyCredsOpen(!spotifyCredsOpen)}>
-              <span>Spotify API App</span>
-              <small>{spotifyCredentials?.configured ? "Configured" : "Required"}</small>
+          <div className="sidebarHeader">
+            <div>
+              <span>Workspace</span>
+              <strong>{billing.plan_code || "PlaylistPilot"}</strong>
+            </div>
+            <button className="settingsButton" onClick={() => setSettingsOpen(true)} aria-label="Open settings">
+              <Settings aria-hidden="true" />
             </button>
-            {spotifyCredsOpen ? (
-              <div className="spotifySetupBody">
-                <p>Create a Spotify Developer app, add this Redirect URI, then paste the Client ID and Client Secret here.</p>
-                <ol>
-                  <li>Open developer.spotify.com/dashboard and create an app.</li>
-                  <li>Add the Redirect URI below in the app settings.</li>
-                  <li>Copy Client ID and Client Secret into Playlist Pilot.</li>
-                </ol>
-                <label>
-                  <span>Redirect URI</span>
-                  <input value={spotifyRedirectUri} onChange={(e) => setSpotifyRedirectUri(e.target.value)} />
-                </label>
-                <input value={spotifyAppName} onChange={(e) => setSpotifyAppName(e.target.value)} placeholder="App name" />
-                <input value={spotifyClientId} onChange={(e) => setSpotifyClientId(e.target.value)} placeholder="Client ID" />
-                <input
-                  type="password"
-                  value={spotifyClientSecret}
-                  onChange={(e) => setSpotifyClientSecret(e.target.value)}
-                  placeholder={spotifyCredentials?.configured ? "New Client Secret to replace" : "Client Secret"}
-                />
-                <button disabled={busy || !spotifyClientId.trim() || !spotifyClientSecret.trim()} onClick={saveSpotifyCredentials}>
-                  Save Spotify App
-                </button>
-              </div>
-            ) : null}
-          </section>
+          </div>
 
           <label className="accountField">
             <span>Account</span>
@@ -1506,6 +1527,119 @@ export default function PlaylistManager() {
         }
         @keyframes spin {
           to { transform: rotate(360deg); }
+        }
+        .settingsOverlay {
+          position: fixed;
+          inset: 0;
+          z-index: 80;
+          display: grid;
+          place-items: center;
+          padding: 24px;
+          background: rgba(7, 9, 12, 0.72);
+          backdrop-filter: blur(8px);
+        }
+        .settingsPanel {
+          width: min(680px, 100%);
+          max-height: min(760px, calc(100vh - 48px));
+          overflow: auto;
+          display: grid;
+          gap: 14px;
+          padding: 18px;
+          border: 1px solid #303743;
+          border-radius: 8px;
+          background: #181c23;
+          box-shadow: 0 24px 80px rgba(0, 0, 0, 0.52);
+        }
+        .settingsHeader {
+          display: flex;
+          align-items: start;
+          justify-content: space-between;
+          gap: 18px;
+          padding-bottom: 4px;
+        }
+        .settingsHeader h2 {
+          font-size: 24px;
+        }
+        .settingsHeader p,
+        .settingsSection p,
+        .settingsSection ol {
+          margin: 0;
+          color: #a6adba;
+          line-height: 1.45;
+        }
+        .settingsSection {
+          display: grid;
+          gap: 10px;
+          padding: 14px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #12161d;
+        }
+        .settingsSection h3 {
+          font-size: 18px;
+        }
+        .settingsSection > span,
+        .settingsSection label span {
+          color: #a6adba;
+          font-size: 13px;
+          font-weight: 800;
+        }
+        .settingsSection strong {
+          overflow-wrap: anywhere;
+        }
+        .settingsSection ol {
+          padding-left: 18px;
+        }
+        .settingsSection label {
+          display: grid;
+          gap: 6px;
+        }
+        .settingsSection input {
+          width: 100%;
+        }
+        .iconOnlyButton,
+        .settingsButton {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 40px;
+          height: 40px;
+          min-height: 40px;
+          padding: 0;
+          border: 1px solid #18e06f;
+          background: transparent;
+          color: #18e06f;
+          border-radius: 8px;
+        }
+        .iconOnlyButton svg,
+        .settingsButton svg {
+          width: 18px;
+          height: 18px;
+        }
+        .sidebarHeader {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto;
+          align-items: center;
+          gap: 12px;
+          padding: 14px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #181c23;
+        }
+        .sidebarHeader div {
+          display: grid;
+          gap: 5px;
+          min-width: 0;
+        }
+        .sidebarHeader span {
+          color: #a6adba;
+          font-size: 13px;
+          font-weight: 800;
+        }
+        .sidebarHeader strong {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
         }
         .accountBox {
           display: grid;
