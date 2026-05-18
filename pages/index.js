@@ -391,6 +391,36 @@ export default function PlaylistManager() {
     await supabase.auth.signOut();
   }
 
+  function startSpotifyConnect() {
+    if (!userContext?.bubble_user_id) return;
+    const qs = new URLSearchParams({
+      bubble_user_id: userContext.bubble_user_id,
+      return_to: window.location.origin,
+    });
+    window.location.href = `/api/oauth/spotify/start?${qs.toString()}`;
+  }
+
+  async function disconnectSpotifyConnection(id) {
+    if (!id) return;
+    const currentId = connectionId;
+    await run("Spotify account removed", async () => {
+      await api("/api/connections/disconnect", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { connection_id: id },
+      });
+      const nextConnections = await api("/api/connections/list", { accessToken: accessToken() });
+      setConnections(nextConnections);
+      if (currentId === id) {
+        setConnectionId(nextConnections[0]?.id || "");
+        setPlaylistId("");
+        setPlaylist(null);
+        setTracks([]);
+      }
+      return nextConnections;
+    });
+  }
+
   async function startCheckout() {
     await run("Opening checkout", async () => {
       const data = await api("/api/stripe/checkout", { method: "POST", accessToken: accessToken() });
@@ -843,6 +873,11 @@ export default function PlaylistManager() {
         <nav>
           <button className={view === "dashboard" ? "navButton active" : "navButton"} onClick={() => setView("dashboard")}>Dashboard</button>
           <button className={view === "manager" ? "navButton active" : "navButton"} onClick={() => setView("manager")}>Playlist Manager</button>
+          {session ? (
+            <button className="settingsButton topSettingsButton" onClick={() => setSettingsOpen(true)} aria-label="Open settings">
+              <Settings aria-hidden="true" />
+            </button>
+          ) : null}
           {session ? <button onClick={signOut}>Log Out</button> : null}
         </nav>
       </header>
@@ -888,6 +923,40 @@ export default function PlaylistManager() {
             <section className="settingsSection">
               <span>Signed in</span>
               <strong>{userContext.email}</strong>
+            </section>
+
+            <section className="settingsSection">
+              <div className="settingsSectionHeader">
+                <div>
+                  <h3>Spotify Accounts</h3>
+                  <p>Connect the Spotify accounts you want to manage in Playlist Pilot.</p>
+                </div>
+                <button
+                  disabled={busy || (!spotifyCredentials?.configured && !spotifyCredentials?.fallback_available)}
+                  onClick={startSpotifyConnect}
+                >
+                  Connect Spotify
+                </button>
+              </div>
+              <div className="connectionList">
+                {connections.map((c) => (
+                  <div key={c.id} className="connectionItem">
+                    <Artwork src={c.avatar_url} alt="" size="sm" />
+                    <div>
+                      <strong>{c.display_name || c.spotify_user_id || "Spotify Account"}</strong>
+                      <span>{c.spotify_user_id || "Connected account"}</span>
+                    </div>
+                    <button
+                      className="dangerOutline"
+                      disabled={busy}
+                      onClick={() => disconnectSpotifyConnection(c.id)}
+                    >
+                      Remove
+                    </button>
+                  </div>
+                ))}
+                {!connections.length ? <p>No Spotify account connected yet.</p> : null}
+              </div>
             </section>
 
             <section className={billingActive ? "billingBox billingBox--active" : "billingBox"}>
@@ -1048,16 +1117,6 @@ export default function PlaylistManager() {
       ) : (
       <section className="workspace">
         <aside className="sidebar">
-          <div className="sidebarHeader">
-            <div>
-              <span>Workspace</span>
-              <strong>{billing.plan_code || "PlaylistPilot"}</strong>
-            </div>
-            <button className="settingsButton" onClick={() => setSettingsOpen(true)} aria-label="Open settings">
-              <Settings aria-hidden="true" />
-            </button>
-          </div>
-
           <label className="accountField">
             <span>Account</span>
             <select value={connectionId} onChange={(e) => setConnectionId(e.target.value)}>
@@ -1069,19 +1128,6 @@ export default function PlaylistManager() {
               ))}
             </select>
           </label>
-
-          <button
-            disabled={!spotifyCredentials?.configured && !spotifyCredentials?.fallback_available}
-            onClick={() => {
-              const qs = new URLSearchParams({
-                bubble_user_id: userContext.bubble_user_id,
-                return_to: window.location.origin,
-              });
-              window.location.href = `/api/oauth/spotify/start?${qs.toString()}`;
-            }}
-          >
-            Connect Spotify
-          </button>
 
           <div className="sectionTitle">
             <h2>Playlists</h2>
@@ -1462,6 +1508,10 @@ export default function PlaylistManager() {
           background: transparent;
           padding: 12px 0;
         }
+        .topSettingsButton {
+          min-width: 40px;
+          flex: 0 0 auto;
+        }
         .loginScreen {
           display: grid;
           gap: 18px;
@@ -1596,6 +1646,50 @@ export default function PlaylistManager() {
         }
         .settingsSection input {
           width: 100%;
+        }
+        .settingsSectionHeader {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto;
+          align-items: start;
+          gap: 14px;
+        }
+        .connectionList {
+          display: grid;
+          gap: 8px;
+        }
+        .connectionItem {
+          display: grid;
+          grid-template-columns: 42px minmax(0, 1fr) auto;
+          align-items: center;
+          gap: 12px;
+          padding: 10px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #181c23;
+        }
+        .connectionItem div {
+          display: grid;
+          gap: 3px;
+          min-width: 0;
+        }
+        .connectionItem strong,
+        .connectionItem span {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .connectionItem span {
+          color: #a6adba;
+          font-size: 13px;
+        }
+        .dangerOutline {
+          border-color: #ff4d4d;
+          background: transparent;
+          color: #ff4d4d;
+        }
+        .dangerOutline:hover:not(:disabled),
+        .dangerOutline:focus-visible:not(:disabled) {
+          background: rgba(255, 77, 77, 0.14);
         }
         .iconOnlyButton,
         .settingsButton {
@@ -1976,7 +2070,7 @@ export default function PlaylistManager() {
         .sidebar {
           display: grid;
           align-content: start;
-          grid-template-rows: auto auto auto auto auto minmax(0, 1fr);
+          grid-template-rows: auto auto auto minmax(0, 1fr);
           gap: 14px;
           min-height: 0;
         }
