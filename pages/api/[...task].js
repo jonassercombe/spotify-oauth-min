@@ -260,12 +260,71 @@ function encToken(plain) {
   return Buffer.concat([iv, tag, ct]).toString("base64");
 }
 
-async function refreshAccessToken(refresh_token) {
+function fallbackSpotifyCredentials() {
+  const client_id = process.env.SPOTIFY_CLIENT_ID || "";
+  const client_secret = process.env.SPOTIFY_CLIENT_SECRET || "";
+  const redirect_uri = process.env.SPOTIFY_REDIRECT_URI || "";
+  if (!client_id || !client_secret || !redirect_uri) return null;
+  return { id: null, client_id, client_secret, redirect_uri, source: "global" };
+}
+
+async function getSpotifyAppCredentialsForUser(bubble_user_id, { allowFallback = true } = {}) {
+  if (bubble_user_id) {
+    const r = await sb(
+      `/rest/v1/spotify_app_credentials?select=id,client_id,client_secret_enc,redirect_uri,app_name` +
+      `&limit=1&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}`
+    );
+    const row = r.ok ? (await r.json().catch(() => []))?.[0] : null;
+    if (row?.client_id && row?.client_secret_enc && row?.redirect_uri) {
+      return {
+        id: row.id,
+        client_id: row.client_id,
+        client_secret: decryptToken(row.client_secret_enc),
+        redirect_uri: row.redirect_uri,
+        app_name: row.app_name || "",
+        source: "user",
+      };
+    }
+  }
+
+  if (!allowFallback) return null;
+  return fallbackSpotifyCredentials();
+}
+
+async function getSpotifyAppCredentialsForConnection(connection_id) {
+  const r = await sb(
+    `/rest/v1/spotify_connections?select=bubble_user_id,credential_id` +
+    `&limit=1&id=eq.${encodeURIComponent(connection_id)}`
+  );
+  const row = r.ok ? (await r.json().catch(() => []))?.[0] : null;
+  if (row?.credential_id) {
+    const cr = await sb(
+      `/rest/v1/spotify_app_credentials?select=id,client_id,client_secret_enc,redirect_uri,app_name` +
+      `&limit=1&id=eq.${encodeURIComponent(row.credential_id)}`
+    );
+    const cred = cr.ok ? (await cr.json().catch(() => []))?.[0] : null;
+    if (cred?.client_id && cred?.client_secret_enc && cred?.redirect_uri) {
+      return {
+        id: cred.id,
+        client_id: cred.client_id,
+        client_secret: decryptToken(cred.client_secret_enc),
+        redirect_uri: cred.redirect_uri,
+        app_name: cred.app_name || "",
+        source: "connection",
+      };
+    }
+  }
+  return getSpotifyAppCredentialsForUser(row?.bubble_user_id || "", { allowFallback: true });
+}
+
+async function refreshAccessToken(refresh_token, credentials = null) {
+  const creds = credentials || fallbackSpotifyCredentials();
+  if (!creds?.client_id || !creds?.client_secret) throw new Error("missing_spotify_app_credentials");
   const body = new URLSearchParams({
     grant_type:"refresh_token",
     refresh_token,
-    client_id: need("SPOTIFY_CLIENT_ID"),
-    client_secret: need("SPOTIFY_CLIENT_SECRET")
+    client_id: creds.client_id,
+    client_secret: creds.client_secret
   });
   const { r, json, text } = await fetchJSON("https://accounts.spotify.com/api/token", {
     method:"POST",
@@ -286,7 +345,8 @@ async function getAccessTokenFromConnection(connection_id) {
   const enc = arr?.[0]?.refresh_token_enc;
   if (!enc) throw new Error("no refresh token on connection");
   const refresh_token = decryptToken(enc);
-  const t = await refreshAccessToken(refresh_token);
+  const creds = await getSpotifyAppCredentialsForConnection(connection_id);
+  const t = await refreshAccessToken(refresh_token, creds);
   return t.access_token;
 }
 
@@ -635,13 +695,98 @@ const routes = {
       });
     }
 
+    const credentials = await getSpotifyAppCredentialsForUser(ctx.bubble_user_id, { allowFallback: false }).catch(() => null);
+
     return json(res, 200, {
       ok: true,
       linked: true,
       email: ctx.email,
       bubble_user_id: ctx.bubble_user_id,
       role: ctx.role,
+      has_spotify_credentials: !!credentials,
+      spotify_redirect_uri: `${process.env.PUBLIC_BASE_URL || "https://playlist-pilot.com"}/api/oauth/spotify/callback`,
     });
+  },
+
+  /* ---------- spotify/credentials/get (GET) ---------- */
+  "spotify/credentials/get": async (req, res) => {
+    if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req);
+    if (!bubbleUserId) return bad(res, 401, "missing_user");
+
+    const r = await sb(
+      `/rest/v1/spotify_app_credentials?select=id,client_id,redirect_uri,app_name,created_at,updated_at` +
+      `&limit=1&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`
+    );
+    const rows = r.ok ? await r.json().catch(() => []) : [];
+    if (!r.ok) return bad(res, 500, `spotify_credentials_select_failed: ${await r.text().catch(() => "")}`);
+    const row = rows?.[0] || null;
+    return json(res, 200, {
+      configured: !!row,
+      credentials: row,
+      required_redirect_uri: `${process.env.PUBLIC_BASE_URL || "https://playlist-pilot.com"}/api/oauth/spotify/callback`,
+      fallback_available: !!fallbackSpotifyCredentials(),
+    });
+  },
+
+  /* ---------- spotify/credentials/save (POST) ---------- */
+  "spotify/credentials/save": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req);
+    if (!bubbleUserId) return bad(res, 401, "missing_user");
+    const body = await readBody(req);
+    const client_id = String(body.client_id || "").trim();
+    const client_secret = String(body.client_secret || "").trim();
+    const redirect_uri = String(body.redirect_uri || `${process.env.PUBLIC_BASE_URL || "https://playlist-pilot.com"}/api/oauth/spotify/callback`).trim();
+    const app_name = String(body.app_name || "").trim();
+
+    if (!/^[A-Za-z0-9]{20,80}$/.test(client_id)) return bad(res, 400, "invalid_client_id");
+    if (client_secret.length < 20) return bad(res, 400, "invalid_client_secret");
+    let parsedRedirect;
+    try { parsedRedirect = new URL(redirect_uri); } catch { return bad(res, 400, "invalid_redirect_uri"); }
+    if (!/^https?:$/.test(parsedRedirect.protocol)) return bad(res, 400, "invalid_redirect_uri_protocol");
+
+    const payload = {
+      bubble_user_id: bubbleUserId,
+      client_id,
+      client_secret_enc: encToken(client_secret),
+      redirect_uri,
+      app_name: app_name || null,
+      updated_at: new Date().toISOString(),
+    };
+
+    const up = await sb(`/rest/v1/spotify_app_credentials?on_conflict=bubble_user_id`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+      body: JSON.stringify([payload]),
+    });
+    const txt = await up.text();
+    let data = null; try { data = txt ? JSON.parse(txt) : null; } catch {}
+    if (!up.ok) return bad(res, up.status, `spotify_credentials_save_failed: ${txt}`);
+    const row = Array.isArray(data) ? data[0] : data;
+    return json(res, 200, {
+      ok: true,
+      credentials: row ? {
+        id: row.id,
+        client_id: row.client_id,
+        redirect_uri: row.redirect_uri,
+        app_name: row.app_name,
+        updated_at: row.updated_at,
+      } : null,
+    });
+  },
+
+  /* ---------- spotify/credentials/delete (POST) ---------- */
+  "spotify/credentials/delete": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req);
+    if (!bubbleUserId) return bad(res, 401, "missing_user");
+    const del = await sb(`/rest/v1/spotify_app_credentials?bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`, {
+      method: "DELETE",
+      headers: { Prefer: "return=minimal" },
+    });
+    if (!del.ok) return bad(res, del.status, `spotify_credentials_delete_failed: ${await del.text().catch(() => "")}`);
+    return json(res, 200, { ok: true });
   },
 
 
@@ -2276,10 +2421,6 @@ const routes = {
       =========================== */
    "oauth/spotify/start": async (req, res) => {
      try {
-       const needEnv = (n) => need(n);
-       const CLIENT_ID     = needEnv("SPOTIFY_CLIENT_ID");
-       const REDIRECT_URI  = needEnv("SPOTIFY_REDIRECT_URI");
-   
        // Eingaben
        const bubble_user_id = String(req.query.bubble_user_id || "").trim();
        const return_to      = String(req.query.return_to || "/").trim();
@@ -2289,6 +2430,13 @@ const routes = {
          const base = return_to || "/";
          const sep  = base.includes("?") ? "&" : "?";
          return res.redirect(`${base}${sep}spotify_error=missing_bubble_user_id`);
+       }
+
+       const credentials = await getSpotifyAppCredentialsForUser(bubble_user_id, { allowFallback: true });
+       if (!credentials?.client_id || !credentials?.redirect_uri) {
+         const base = return_to || "/";
+         const sep  = base.includes("?") ? "&" : "?";
+         return res.redirect(`${base}${sep}spotify_error=missing_spotify_app_credentials`);
        }
    
        // Scopes – je nach Feature erweitern
@@ -2303,6 +2451,7 @@ const routes = {
          bubble_user_id,
          return_to,
          label,
+         credential_id: credentials.id || null,
          nonce: Math.random().toString(36).slice(2),
          issued_at: Date.now()
        };
@@ -2312,8 +2461,8 @@ const routes = {
        // prompt=consent ist ein zusätzliches Hint (von vielen Libs verwendet)
        const params = new URLSearchParams({
          response_type: "code",
-         client_id: CLIENT_ID,
-         redirect_uri: REDIRECT_URI,
+         client_id: credentials.client_id,
+         redirect_uri: credentials.redirect_uri,
          scope: SCOPES.join(" "),
          state,
          show_dialog: "true",
@@ -2342,11 +2491,7 @@ const routes = {
      };
    
      try {
-       // Env prüfen
        const assertEnv = (n) => need(n);
-       const CLIENT_ID     = assertEnv("SPOTIFY_CLIENT_ID");
-       const CLIENT_SECRET = assertEnv("SPOTIFY_CLIENT_SECRET");
-       const REDIRECT_URI  = assertEnv("SPOTIFY_REDIRECT_URI");
        const SB_URL        = assertEnv("SUPABASE_URL");
        const SB_KEY        = assertEnv("SUPABASE_SERVICE_ROLE_KEY");
        assertEnv("ENC_SECRET");
@@ -2366,19 +2511,42 @@ const routes = {
        const bubble_user_id = parsed.bubble_user_id;
        const label          = parsed.label || "";
        const return_to      = parsed.return_to || "/";
+       const credential_id  = parsed.credential_id || null;
        if (!bubble_user_id) return backWithError(return_to, "missing_user_in_state");
+
+       let credentials = null;
+       if (credential_id) {
+         const cr = await sb(
+           `/rest/v1/spotify_app_credentials?select=id,client_id,client_secret_enc,redirect_uri,app_name` +
+           `&limit=1&id=eq.${encodeURIComponent(credential_id)}&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}`
+         );
+         const row = cr.ok ? (await cr.json().catch(() => []))?.[0] : null;
+         if (row?.client_id && row?.client_secret_enc && row?.redirect_uri) {
+           credentials = {
+             id: row.id,
+             client_id: row.client_id,
+             client_secret: decryptToken(row.client_secret_enc),
+             redirect_uri: row.redirect_uri,
+             source: "user",
+           };
+         }
+       }
+       if (!credentials) credentials = await getSpotifyAppCredentialsForUser(bubble_user_id, { allowFallback: true });
+       if (!credentials?.client_id || !credentials?.client_secret || !credentials?.redirect_uri) {
+         return backWithError(return_to, "missing_spotify_app_credentials");
+       }
    
        // Token-Exchange
        const tokenResRaw = await fetch("https://accounts.spotify.com/api/token", {
          method: "POST",
          headers: {
            "Content-Type": "application/x-www-form-urlencoded",
-           Authorization: "Basic " + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64"),
+           Authorization: "Basic " + Buffer.from(`${credentials.client_id}:${credentials.client_secret}`).toString("base64"),
          },
          body: new URLSearchParams({
            grant_type: "authorization_code",
            code,
-           redirect_uri: REDIRECT_URI,
+           redirect_uri: credentials.redirect_uri,
          }),
        });
    
@@ -2497,6 +2665,7 @@ const routes = {
          access_token_enc,
          access_expires_at,
          cron_bucket,
+         credential_id: credentials.id || null,
        };
    
        // Upsert
@@ -2724,30 +2893,14 @@ const routes = {
          const stillValid = expMs - now > 5 * 60 * 1000; // ≥5 Min Puffer
    
          if (stillValid && conn.access_token_enc) {
-           try { return { token: decToken(conn.access_token_enc), refreshed:false }; }
+           try { return { token: decryptToken(conn.access_token_enc), refreshed:false }; }
            catch { /* fallthrough to refresh */ }
          }
          // Refresh
          if (!conn.refresh_token_enc) throw new Error("missing_refresh_token");
-         const refresh_token = decToken(conn.refresh_token_enc);
-   
-         const body = new URLSearchParams({
-           grant_type: "refresh_token",
-           refresh_token,
-           client_id: process.env.SPOTIFY_CLIENT_ID,
-           client_secret: process.env.SPOTIFY_CLIENT_SECRET,
-         });
-   
-         const r = await fetch("https://accounts.spotify.com/api/token", {
-           method: "POST",
-           headers: { "Content-Type":"application/x-www-form-urlencoded" },
-           body
-         });
-         if (!r.ok) {
-           const tt = await r.text().catch(()=> "");
-           throw new Error(`token_refresh_failed_${r.status}:${tt.slice(0,200)}`);
-         }
-         const j = await r.json();
+         const refresh_token = decryptToken(conn.refresh_token_enc);
+         const credentials = await getSpotifyAppCredentialsForConnection(conn.id);
+         const j = await refreshAccessToken(refresh_token, credentials);
          const newAccess = j.access_token;
          const newExpiresAt = new Date(Date.now() + (j.expires_in || 3600) * 1000).toISOString();
          const newAccessEnc = encToken(newAccess);
@@ -3384,7 +3537,8 @@ const routes = {
    
        const refresh_token = decryptToken(conn.refresh_token_enc);
        const t0 = Date.now();
-       const tokenRef = await refreshAccessToken(refresh_token);
+       const credentials = await getSpotifyAppCredentialsForConnection(conn.id);
+       const tokenRef = await refreshAccessToken(refresh_token, credentials);
        const access_token = tokenRef.access_token;
        console.log("sync-items:token_refreshed", { took_ms: Date.now() - t0, expires_in: tokenRef.expires_in });
    
@@ -3859,7 +4013,8 @@ const routes = {
     }
 
     const refresh_token = decryptToken(conn.refresh_token_enc);
-    const token = await refreshAccessToken(refresh_token);
+    const credentials = await getSpotifyAppCredentialsForConnection(conn.id);
+    const token = await refreshAccessToken(refresh_token, credentials);
     const access_token = token.access_token;
 
     // 3) /me/playlists

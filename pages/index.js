@@ -224,6 +224,12 @@ export default function PlaylistManager() {
   const [toolsOpen, setToolsOpen] = useState(false);
   const [activeTool, setActiveTool] = useState("add");
   const [dragTrackId, setDragTrackId] = useState("");
+  const [spotifyCredentials, setSpotifyCredentials] = useState(null);
+  const [spotifyCredsOpen, setSpotifyCredsOpen] = useState(false);
+  const [spotifyClientId, setSpotifyClientId] = useState("");
+  const [spotifyClientSecret, setSpotifyClientSecret] = useState("");
+  const [spotifyAppName, setSpotifyAppName] = useState("");
+  const [spotifyRedirectUri, setSpotifyRedirectUri] = useState("https://playlist-pilot.com/api/oauth/spotify/callback");
 
   useEffect(() => {
     const client = getSupabaseBrowserClient();
@@ -260,6 +266,7 @@ export default function PlaylistManager() {
     if (!userContext?.linked) return;
     loadConnections();
     loadDashboard();
+    loadSpotifyCredentials();
   }, [userContext?.linked]);
 
   useEffect(() => {
@@ -651,6 +658,37 @@ export default function PlaylistManager() {
     });
   }
 
+  async function loadSpotifyCredentials() {
+    if (!session?.access_token) return;
+    return run("Spotify app settings loaded", async () => {
+      const data = await api("/api/spotify/credentials/get", { accessToken: accessToken() });
+      setSpotifyCredentials(data);
+      setSpotifyClientId(data.credentials?.client_id || "");
+      setSpotifyAppName(data.credentials?.app_name || "");
+      setSpotifyRedirectUri(data.credentials?.redirect_uri || data.required_redirect_uri || "https://playlist-pilot.com/api/oauth/spotify/callback");
+      setSpotifyCredsOpen(!data.configured);
+      return data;
+    });
+  }
+
+  async function saveSpotifyCredentials() {
+    await run("Spotify app settings saved", async () => {
+      const data = await api("/api/spotify/credentials/save", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: {
+          client_id: spotifyClientId,
+          client_secret: spotifyClientSecret,
+          redirect_uri: spotifyRedirectUri,
+          app_name: spotifyAppName,
+        },
+      });
+      setSpotifyClientSecret("");
+      await loadSpotifyCredentials();
+      return data;
+    });
+  }
+
   async function saveFlexSettings() {
     if (!playlistId) return;
     await run("Flex settings saved", async () => {
@@ -920,6 +958,38 @@ export default function PlaylistManager() {
             <strong>{userContext.email}</strong>
           </div>
 
+          <section className={`spotifySetup ${spotifyCredsOpen ? "spotifySetup--open" : ""}`}>
+            <button className="spotifySetupToggle" onClick={() => setSpotifyCredsOpen(!spotifyCredsOpen)}>
+              <span>Spotify API App</span>
+              <small>{spotifyCredentials?.configured ? "Configured" : "Required"}</small>
+            </button>
+            {spotifyCredsOpen ? (
+              <div className="spotifySetupBody">
+                <p>Create a Spotify Developer app, add this Redirect URI, then paste the Client ID and Client Secret here.</p>
+                <ol>
+                  <li>Open developer.spotify.com/dashboard and create an app.</li>
+                  <li>Add the Redirect URI below in the app settings.</li>
+                  <li>Copy Client ID and Client Secret into Playlist Pilot.</li>
+                </ol>
+                <label>
+                  <span>Redirect URI</span>
+                  <input value={spotifyRedirectUri} onChange={(e) => setSpotifyRedirectUri(e.target.value)} />
+                </label>
+                <input value={spotifyAppName} onChange={(e) => setSpotifyAppName(e.target.value)} placeholder="App name" />
+                <input value={spotifyClientId} onChange={(e) => setSpotifyClientId(e.target.value)} placeholder="Client ID" />
+                <input
+                  type="password"
+                  value={spotifyClientSecret}
+                  onChange={(e) => setSpotifyClientSecret(e.target.value)}
+                  placeholder={spotifyCredentials?.configured ? "New Client Secret to replace" : "Client Secret"}
+                />
+                <button disabled={busy || !spotifyClientId.trim() || !spotifyClientSecret.trim()} onClick={saveSpotifyCredentials}>
+                  Save Spotify App
+                </button>
+              </div>
+            ) : null}
+          </section>
+
           <label className="accountField">
             <span>Account</span>
             <select value={connectionId} onChange={(e) => setConnectionId(e.target.value)}>
@@ -933,6 +1003,7 @@ export default function PlaylistManager() {
           </label>
 
           <button
+            disabled={!spotifyCredentials?.configured && !spotifyCredentials?.fallback_available}
             onClick={() => {
               const qs = new URLSearchParams({
                 bubble_user_id: userContext.bubble_user_id,
@@ -1399,6 +1470,57 @@ export default function PlaylistManager() {
         }
         .accountBox strong {
           overflow-wrap: anywhere;
+        }
+        .spotifySetup {
+          border: 1px solid #2a303b;
+          background: #181c23;
+        }
+        .spotifySetupToggle {
+          width: 100%;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 14px;
+          border: 0;
+          border-radius: 0;
+          background: #222831;
+          padding: 12px 14px;
+          text-align: left;
+        }
+        .spotifySetupToggle span {
+          font-weight: 800;
+        }
+        .spotifySetupToggle small {
+          color: #18e06f;
+          font-weight: 800;
+        }
+        .spotifySetupBody {
+          display: grid;
+          gap: 10px;
+          padding: 14px;
+        }
+        .spotifySetupBody p,
+        .spotifySetupBody ol {
+          margin: 0;
+          color: #a6adba;
+          font-size: 13px;
+          line-height: 1.45;
+        }
+        .spotifySetupBody ol {
+          padding-left: 18px;
+        }
+        .spotifySetupBody label {
+          display: grid;
+          gap: 6px;
+        }
+        .spotifySetupBody label span {
+          color: #a6adba;
+          font-size: 13px;
+          font-weight: 800;
+        }
+        .spotifySetupBody input {
+          width: 100%;
+          min-width: 0;
         }
         nav .active {
           border: 1px solid #18e06f;
