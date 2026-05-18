@@ -708,7 +708,7 @@ export default function PlaylistManager() {
 
   async function saveFlexSettings() {
     if (!playlistId) return;
-    await run("Flex settings saved", async () => {
+    await run("Rotator settings saved", async () => {
       let result;
       setFlexReferenceIssue(null);
       try {
@@ -757,7 +757,7 @@ export default function PlaylistManager() {
         },
       ]);
     }
-    await run("Flex slot added", async () => {
+    await run("Rotation slot added", async () => {
       await api("/api/flex/slots/add", {
         method: "POST",
         accessToken: accessToken(),
@@ -784,7 +784,7 @@ export default function PlaylistManager() {
           : item
       ));
     }
-    await run("Flex slot removed", async () => {
+    await run("Rotation slot removed", async () => {
       await api("/api/flex/slots/remove", {
         method: "POST",
         accessToken: accessToken(),
@@ -800,7 +800,7 @@ export default function PlaylistManager() {
   }
 
   async function rotateFlex(slotId = "") {
-    await run("Flex rotation queued", async () => {
+    await run("Rotation queued", async () => {
       await api("/api/flex/rotate", {
         method: "POST",
         accessToken: accessToken(),
@@ -890,7 +890,7 @@ export default function PlaylistManager() {
             <small>{formatNumber(dashboardSummary?.totals?.cooldown_count)} on cooldown</small>
           </article>
           <article>
-            <span>Flex Rotation</span>
+            <span>Track Rotator</span>
             <strong>{formatNumber(dashboardSummary?.totals?.flex_enabled_count)}</strong>
             <small>{formatNumber(dashboardSummary?.totals?.flex_due_count)} due soon</small>
           </article>
@@ -1090,7 +1090,7 @@ export default function PlaylistManager() {
                 {[
                   ["add", "Add song"],
                   ["expiry", "Expiry"],
-                  ["flex", "Flex"],
+                  ["flex", "Rotator"],
                 ].map(([key, label]) => (
                   <button key={key} className={activeTool === key ? "selected" : ""} onClick={() => setActiveTool(key)}>
                     {label}
@@ -1149,12 +1149,9 @@ export default function PlaylistManager() {
                   <>
                     <div className="flexPanelHeader">
                       <div>
-                        <h2>Flex</h2>
-                        <p>Rotate locked flex slots from a reference playlist on your schedule. Use public/editorial playlists when Spotify allows access.</p>
+                        <h2>Track Rotator</h2>
+                        <p>Set rotation slots that automatically swap songs from a reference playlist on your schedule.</p>
                       </div>
-                      <button className="tooltipButton" data-tooltip="Rotate all flex slots now using the reference playlist." disabled={busy || !playlistId || !flexSlots.length || !flexReference.trim()} onClick={() => rotateFlex()}>
-                        Rotate now
-                      </button>
                     </div>
                     <div className="flexSettings">
                       <input value={flexReference} onChange={(e) => { setFlexReference(e.target.value); setFlexReferenceIssue(null); }} placeholder="Reference playlist link" />
@@ -1168,7 +1165,7 @@ export default function PlaylistManager() {
                         Enabled
                       </label>
                       <button className="tooltipButton" data-tooltip="Save the reference playlist, rotation interval, and enabled state." disabled={busy || !playlistId} onClick={saveFlexSettings}>
-                        Save flex
+                        Save rotator
                       </button>
                     </div>
                     {flexReferenceMeta ? (
@@ -1183,6 +1180,9 @@ export default function PlaylistManager() {
                             {flexReferenceMeta.followers !== null && flexReferenceMeta.followers !== undefined ? ` · ${formatNumber(flexReferenceMeta.followers)} followers` : ""}
                           </small>
                         </div>
+                        <button className="tooltipButton" data-tooltip="Rotate all rotation slots now using the reference playlist." disabled={busy || !playlistId || !flexEnabled || !flexSlots.length || !flexReference.trim()} onClick={() => rotateFlex()}>
+                          Rotate now
+                        </button>
                       </div>
                     ) : null}
                     {flexReferenceIssue ? (
@@ -1202,8 +1202,8 @@ export default function PlaylistManager() {
                         <div className="flexSlot" key={slot.id}>
                           <span>#{Number(slot.position) + 1}</span>
                           <strong>{slot.current_track_name || slot.current_track_id}</strong>
-                          <button className="tooltipButton" data-tooltip="Replace this flex song with a random track from the reference playlist." disabled={busy || !flexReference.trim()} onClick={() => rotateFlex(slot.id)}>Rotate</button>
-                          <button className="danger tooltipButton" data-tooltip="Remove this flex slot. The song itself stays in the playlist unless removed separately." disabled={busy} onClick={() => removeFlexSlot(slot)}>Remove</button>
+                          <button className="tooltipButton" data-tooltip="Replace this rotation slot with a random track from the reference playlist." disabled={busy || !flexReference.trim()} onClick={() => rotateFlex(slot.id)}>Rotate</button>
+                          <button className="danger tooltipButton" data-tooltip="Remove this rotation slot. The song becomes a normal playlist item." disabled={busy} onClick={() => removeFlexSlot(slot)}>Remove</button>
                         </div>
                       ))}
                     </div>
@@ -1259,7 +1259,7 @@ export default function PlaylistManager() {
                       </small>
                     </div>
                     <div className="badges">
-                      {isFlexTrack ? <span className="flexBadge"><Shuffle aria-hidden="true" /> Flex</span> : null}
+                      {isFlexTrack ? <span className="flexBadge"><Shuffle aria-hidden="true" /> Rotator</span> : null}
                       {track.is_locked ? <span className="locked">Locked</span> : null}
                       {track.expiry_weeks ? <span className="expiry">{track.expiry_weeks}w</span> : null}
                     </div>
@@ -1281,16 +1281,18 @@ export default function PlaylistManager() {
                       >
                         <TimerReset aria-hidden="true" />
                       </IconButton>
-                      <IconButton
-                        tooltip={isFlexTrack ? "Convert this flex slot back into a normal song." : "Turn this song into a locked flex slot that rotates from the reference playlist."}
-                        disabled={busy}
-                        onClick={() => isFlexTrack
-                          ? removeFlexSlot(flexSlots.find((slot) => slot.current_track_id === track.track_id))
-                          : addFlexSlot(track)
-                        }
-                      >
-                        <Shuffle aria-hidden="true" />
-                      </IconButton>
+                      {(flexEnabled || isFlexTrack) ? (
+                        <IconButton
+                          tooltip={isFlexTrack ? "Convert this rotation slot back into a normal song." : "Turn this song into a locked rotation slot."}
+                          disabled={busy}
+                          onClick={() => isFlexTrack
+                            ? removeFlexSlot(flexSlots.find((slot) => slot.current_track_id === track.track_id))
+                            : addFlexSlot(track)
+                          }
+                        >
+                          <Shuffle aria-hidden="true" />
+                        </IconButton>
+                      ) : null}
                       <IconButton tooltip="Move this song one position up." disabled={busy || track.position <= 0} onClick={() => moveTrack(track, "up")}>
                         <ArrowUp aria-hidden="true" />
                       </IconButton>
@@ -2072,7 +2074,7 @@ export default function PlaylistManager() {
         }
         .referencePlaylist {
           display: grid;
-          grid-template-columns: 64px minmax(0, 1fr);
+          grid-template-columns: 64px minmax(0, 1fr) auto;
           align-items: center;
           gap: 14px;
           padding: 12px;
@@ -2084,6 +2086,10 @@ export default function PlaylistManager() {
           display: grid;
           gap: 5px;
           min-width: 0;
+        }
+        .referencePlaylist button {
+          align-self: start;
+          white-space: nowrap;
         }
         .referencePlaylist span {
           color: #18e06f;
