@@ -438,9 +438,13 @@ export default function PlaylistManager() {
     });
   }
 
-  async function startCheckout() {
+  async function startCheckout(plan = "economy", interval = "monthly") {
     await run("Opening checkout", async () => {
-      const data = await api("/api/stripe/checkout", { method: "POST", accessToken: accessToken() });
+      const data = await api("/api/stripe/checkout", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { plan, interval },
+      });
       if (data?.url) window.location.href = data.url;
       return data;
     });
@@ -997,12 +1001,27 @@ export default function PlaylistManager() {
 
             <section className={billingActive ? "billingBox billingBox--active" : "billingBox"}>
               <span>{billingActive ? "Subscription active" : "Subscription required"}</span>
-              <strong>{billing.plan_code || (billingActive ? "Active plan" : "PlaylistPilot Pro")}</strong>
+              <strong>{billing.plan_code ? `${billing.plan_code} plan` : (billingActive ? "Active plan" : "Choose a plan")}</strong>
               {billing.current_period_end ? <small>Renews through {formatShortDate(String(billing.current_period_end).slice(0, 10))}</small> : null}
               {billingActive ? (
                 <button disabled={busy} onClick={openBillingPortal}>Manage billing</button>
               ) : (
-                <button disabled={busy} onClick={startCheckout}>Upgrade</button>
+                <div className="pricingGrid">
+                  <article>
+                    <span>Economy Class</span>
+                    <strong>8 EUR <small>/ month</small></strong>
+                    <p>1 Spotify account seat</p>
+                    <button disabled={busy} onClick={() => startCheckout("economy", "monthly")}>Monthly</button>
+                    <button disabled={busy} onClick={() => startCheckout("economy", "yearly")}>79 EUR yearly</button>
+                  </article>
+                  <article>
+                    <span>Business Class</span>
+                    <strong>15 EUR <small>/ month</small></strong>
+                    <p>5 Spotify account seats</p>
+                    <button disabled={busy} onClick={() => startCheckout("business", "monthly")}>Monthly</button>
+                    <button disabled={busy} onClick={() => startCheckout("business", "yearly")}>149 EUR yearly</button>
+                  </article>
+                </div>
               )}
             </section>
 
@@ -1862,6 +1881,32 @@ export default function PlaylistManager() {
         .billingBox button {
           width: 100%;
           margin-top: 4px;
+        }
+        .pricingGrid {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 10px;
+        }
+        .pricingGrid article {
+          display: grid;
+          gap: 8px;
+          padding: 12px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #181c23;
+        }
+        .pricingGrid article span {
+          color: #18e06f;
+          font-size: 13px;
+          font-weight: 800;
+        }
+        .pricingGrid article strong {
+          font-size: 20px;
+        }
+        .pricingGrid article small,
+        .pricingGrid article p {
+          color: #a6adba;
+          font-size: 13px;
         }
         .spotifySetup {
           border: 1px solid #2a303b;

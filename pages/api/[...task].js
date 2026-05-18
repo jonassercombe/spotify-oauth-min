@@ -161,12 +161,50 @@ function publicBaseUrl(req = null) {
   return process.env.PUBLIC_BASE_URL || (req?.headers?.host ? `https://${req.headers.host}` : "https://playlist-pilot.com");
 }
 
+function stripePlanCatalog() {
+  return {
+    economy_monthly: {
+      price: process.env.STRIPE_PRICE_ECONOMY_MONTHLY || process.env.STRIPE_PRICE_PRO || "",
+      plan_code: "economy",
+      plan_name: "Economy Class",
+      interval: "month",
+      seats_limit: 1,
+      features: { playlist_tools: true, rotator: true, automations: true },
+    },
+    economy_yearly: {
+      price: process.env.STRIPE_PRICE_ECONOMY_YEARLY || "",
+      plan_code: "economy",
+      plan_name: "Economy Class",
+      interval: "year",
+      seats_limit: 1,
+      features: { playlist_tools: true, rotator: true, automations: true },
+    },
+    business_monthly: {
+      price: process.env.STRIPE_PRICE_BUSINESS_MONTHLY || "",
+      plan_code: "business",
+      plan_name: "Business Class",
+      interval: "month",
+      seats_limit: 5,
+      features: { playlist_tools: true, rotator: true, automations: true, multi_account: true },
+    },
+    business_yearly: {
+      price: process.env.STRIPE_PRICE_BUSINESS_YEARLY || "",
+      plan_code: "business",
+      plan_name: "Business Class",
+      interval: "year",
+      seats_limit: 5,
+      features: { playlist_tools: true, rotator: true, automations: true, multi_account: true },
+    },
+  };
+}
+
 function mapStripePlan(priceId) {
-  const proPrice = process.env.STRIPE_PRICE_PRO || "";
-  if (proPrice && priceId === proPrice) {
-    return { plan_code: "pro", seats_limit: 1, features: { playlist_tools: true, rotator: true, automations: true } };
+  for (const plan of Object.values(stripePlanCatalog())) {
+    if (plan.price && priceId === plan.price) {
+      return { plan_code: plan.plan_code, seats_limit: plan.seats_limit, features: plan.features };
+    }
   }
-  return { plan_code: "pro", seats_limit: 1, features: { playlist_tools: true, rotator: true, automations: true } };
+  return { plan_code: "economy", seats_limit: 1, features: { playlist_tools: true, rotator: true, automations: true } };
 }
 
 function isAppSubscriptionActive(row = {}) {
@@ -829,7 +867,12 @@ const routes = {
     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
     const ctx = await getUserContext(req);
     if (!ctx?.linked) return bad(res, 401, "not_authenticated");
-    const price = process.env.STRIPE_PRICE_PRO;
+    const body = await readBody(req);
+    const requestedPlan = String(body.plan || "economy").toLowerCase();
+    const requestedInterval = String(body.interval || "monthly").toLowerCase();
+    const planKey = `${requestedPlan}_${requestedInterval === "year" || requestedInterval === "yearly" ? "yearly" : "monthly"}`;
+    const selectedPlan = stripePlanCatalog()[planKey] || stripePlanCatalog().economy_monthly;
+    const price = selectedPlan.price;
     if (!price) return bad(res, 500, "missing_stripe_price");
 
     const stripe = getStripeClient();
@@ -856,8 +899,8 @@ const routes = {
       line_items: [{ price, quantity: 1 }],
       success_url: `${base}/?billing=success`,
       cancel_url: `${base}/?billing=cancelled`,
-      metadata: { bubble_user_id: ctx.bubble_user_id },
-      subscription_data: { metadata: { bubble_user_id: ctx.bubble_user_id } },
+      metadata: { bubble_user_id: ctx.bubble_user_id, plan: selectedPlan.plan_code, interval: selectedPlan.interval },
+      subscription_data: { metadata: { bubble_user_id: ctx.bubble_user_id, plan: selectedPlan.plan_code, interval: selectedPlan.interval } },
       allow_promotion_codes: true,
     });
     return json(res, 200, { ok: true, url: session.url });
