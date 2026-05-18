@@ -199,6 +199,7 @@ export default function PlaylistManager() {
   const [flexSlots, setFlexSlots] = useState([]);
   const [flexReference, setFlexReference] = useState("");
   const [flexReferenceMeta, setFlexReferenceMeta] = useState(null);
+  const [flexReferenceIssue, setFlexReferenceIssue] = useState(null);
   const [flexInterval, setFlexInterval] = useState("weekly");
   const [flexEnabled, setFlexEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -231,6 +232,7 @@ export default function PlaylistManager() {
       setFlexSettings(null);
       setFlexSlots([]);
       setFlexReferenceMeta(null);
+      setFlexReferenceIssue(null);
     });
 
     return () => listener.subscription.unsubscribe();
@@ -393,6 +395,7 @@ export default function PlaylistManager() {
       setFlexSlots(Array.isArray(slots) ? slots : []);
       setFlexReference(settings?.reference_playlist_url || settings?.reference_playlist_id || "");
       setFlexReferenceMeta(settings?.reference_playlist || null);
+      setFlexReferenceIssue(null);
       setFlexInterval(settings?.interval || "weekly");
       setFlexEnabled(!!settings?.enabled);
       return { detail, items };
@@ -601,16 +604,27 @@ export default function PlaylistManager() {
   async function saveFlexSettings() {
     if (!playlistId) return;
     await run("Flex settings saved", async () => {
-      const result = await api("/api/flex/settings/save", {
-        method: "POST",
-        accessToken: accessToken(),
-        body: {
-          playlist_id: playlistId,
-          reference_playlist: flexReference,
-          interval: flexInterval,
-          enabled: flexEnabled,
-        },
-      });
+      let result;
+      setFlexReferenceIssue(null);
+      try {
+        result = await api("/api/flex/settings/save", {
+          method: "POST",
+          accessToken: accessToken(),
+          body: {
+            playlist_id: playlistId,
+            reference_playlist: flexReference,
+            interval: flexInterval,
+            enabled: flexEnabled,
+          },
+        });
+      } catch (e) {
+        if (e.status === 422 && e.data?.error === "reference_playlist_blocked") {
+          setFlexReferenceIssue(e.data);
+          setFlexReferenceMeta(e.data.reference_playlist || null);
+          throw new Error("Spotify blocks this playlist as a direct flex source.");
+        }
+        throw e;
+      }
       if (result?.settings?.reference_playlist) {
         setFlexReferenceMeta(result.settings.reference_playlist);
       }
@@ -976,7 +990,7 @@ export default function PlaylistManager() {
                       </button>
                     </div>
                     <div className="flexSettings">
-                      <input value={flexReference} onChange={(e) => setFlexReference(e.target.value)} placeholder="Reference playlist link" />
+                      <input value={flexReference} onChange={(e) => { setFlexReference(e.target.value); setFlexReferenceIssue(null); }} placeholder="Reference playlist link" />
                       <select value={flexInterval} onChange={(e) => setFlexInterval(e.target.value)}>
                         <option value="daily">Daily</option>
                         <option value="weekly">Weekly</option>
@@ -1002,6 +1016,18 @@ export default function PlaylistManager() {
                             {flexReferenceMeta.followers !== null && flexReferenceMeta.followers !== undefined ? ` · ${formatNumber(flexReferenceMeta.followers)} followers` : ""}
                           </small>
                         </div>
+                      </div>
+                    ) : null}
+                    {flexReferenceIssue ? (
+                      <div className="referenceIssue">
+                        <strong>Spotify blocks this playlist as a direct source.</strong>
+                        <p>Editorial and personalized Spotify playlists often cannot be read through the official API. Make your own copy, then paste that new playlist link here.</p>
+                        <ol>
+                          <li>Open the playlist in Spotify.</li>
+                          <li>Click the three-dot menu.</li>
+                          <li>Choose “Add to other playlist” and create a new playlist.</li>
+                          <li>Open your new playlist, copy its link, and paste it above.</li>
+                        </ol>
                       </div>
                     ) : null}
                     <div className="flexSlotList">
@@ -1757,6 +1783,26 @@ export default function PlaylistManager() {
         }
         .referencePlaylist small {
           color: #a6adba;
+        }
+        .referenceIssue {
+          display: grid;
+          gap: 8px;
+          padding: 14px;
+          border: 1px solid rgba(255, 189, 74, 0.45);
+          border-radius: 8px;
+          background: rgba(255, 189, 74, 0.08);
+        }
+        .referenceIssue strong {
+          color: #ffbd4a;
+        }
+        .referenceIssue p,
+        .referenceIssue ol {
+          margin: 0;
+          color: #d6dbe4;
+          line-height: 1.45;
+        }
+        .referenceIssue ol {
+          padding-left: 20px;
         }
         .flexSlotList {
           display: grid;

@@ -4746,6 +4746,26 @@ const routes = {
     const referenceRaw = String(body.reference_playlist || body.reference_playlist_url || body.reference_playlist_id || "").trim();
     const reference_playlist_id = referenceRaw ? parseSpotifyPlaylistId(referenceRaw) : null;
     if (referenceRaw && !reference_playlist_id) return bad(res, 400, "invalid_reference_playlist");
+    let reference_playlist = null;
+    if (reference_playlist_id) {
+      const token = await getAccessTokenFromConnection(owned.connection_id);
+      const probe = await fetchJSON(
+        `https://api.spotify.com/v1/playlists/${encodeURIComponent(reference_playlist_id)}/tracks?limit=1&fields=total,items(track(id))`,
+        { headers: { Authorization: `Bearer ${token}` } },
+        20000
+      );
+      reference_playlist = await fetchSpotifyPlaylistMeta(reference_playlist_id, token).catch(() => null);
+      if (!probe.r.ok) {
+        return json(res, 422, {
+          error: "reference_playlist_blocked",
+          status: probe.r.status,
+          spotify_error: probe.json?.error || null,
+          reference_playlist_id,
+          reference_playlist_url: referenceRaw,
+          reference_playlist,
+        });
+      }
+    }
     const enabled = !!body.enabled && !!reference_playlist_id;
     const nowIso = new Date().toISOString();
     const next_rotation_at = enabled
@@ -4773,11 +4793,6 @@ const routes = {
     const rows = await r.json();
     await setPlaylistUpdateCooldown(playlist_id, 300);
     const saved = rows?.[0] || payload;
-    let reference_playlist = null;
-    if (saved.reference_playlist_id) {
-      const token = await getAccessTokenFromConnection(saved.connection_id).catch(() => "");
-      reference_playlist = await fetchSpotifyPlaylistMeta(saved.reference_playlist_id, token).catch(() => null);
-    }
     return json(res, 200, { ok: true, settings: { ...saved, reference_playlist } });
   },
 
