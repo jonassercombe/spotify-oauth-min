@@ -203,6 +203,8 @@ export default function PlaylistManager() {
   const [playlistSearch, setPlaylistSearch] = useState("");
   const [trackSearch, setTrackSearch] = useState("");
   const [trackLink, setTrackLink] = useState("");
+  const [trackCandidates, setTrackCandidates] = useState([]);
+  const [trackSearchLoading, setTrackSearchLoading] = useState(false);
   const [trackPosition, setTrackPosition] = useState("1");
   const [trackExpiry, setTrackExpiry] = useState("");
   const [autoWeeks, setAutoWeeks] = useState("4");
@@ -291,6 +293,36 @@ export default function PlaylistManager() {
       )
     );
   }, [tracks, trackSearch]);
+
+  useEffect(() => {
+    const query = trackLink.trim();
+    if (!connectionId || query.length < 3 || query.includes("spotify.com/track/") || query.startsWith("spotify:track:")) {
+      setTrackCandidates([]);
+      setTrackSearchLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    const timeout = setTimeout(async () => {
+      setTrackSearchLoading(true);
+      try {
+        const data = await api(
+          `/api/tracks/search?connection_id=${encodeURIComponent(connectionId)}&q=${encodeURIComponent(query)}&limit=6`,
+          { accessToken: accessToken() }
+        );
+        if (!cancelled) setTrackCandidates(Array.isArray(data?.items) ? data.items : []);
+      } catch {
+        if (!cancelled) setTrackCandidates([]);
+      } finally {
+        if (!cancelled) setTrackSearchLoading(false);
+      }
+    }, 350);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timeout);
+    };
+  }, [trackLink, connectionId, session?.access_token]);
 
   const activeFlexTrackIds = useMemo(
     () => new Set(flexSlots.map((slot) => slot.current_track_id).filter(Boolean)),
@@ -427,8 +459,8 @@ export default function PlaylistManager() {
 
   async function addTrack() {
     if (!playlistId || !trackLink.trim()) return;
+    const previousLink = trackLink;
     await run("Track added; sync dispatched", async () => {
-      const previousLink = trackLink;
       if (ENABLE_OPTIMISTIC_PLAYLIST_UI) setTrackLink("");
       await api("/api/playlist-items/add", {
         method: "POST",
@@ -445,6 +477,11 @@ export default function PlaylistManager() {
     }).then((result) => {
       if (result === null && ENABLE_OPTIMISTIC_PLAYLIST_UI) setTrackLink(previousLink);
     });
+  }
+
+  function selectTrackCandidate(candidate) {
+    setTrackLink(candidate.uri || candidate.id || "");
+    setTrackCandidates([]);
   }
 
   async function moveTrack(track, dir) {
@@ -681,9 +718,16 @@ export default function PlaylistManager() {
   }
 
   async function removeFlexSlot(slot) {
+    if (!slot?.id) return;
+    const previousTracks = tracks;
     const previousSlots = flexSlots;
     if (ENABLE_OPTIMISTIC_PLAYLIST_UI) {
       setFlexSlots(flexSlots.filter((item) => item.id !== slot.id));
+      setTracks(tracks.map((item) =>
+        item.track_id === slot.current_track_id
+          ? { ...item, is_locked: false, locked_position: null }
+          : item
+      ));
     }
     await run("Flex slot removed", async () => {
       await api("/api/flex/slots/remove", {
@@ -693,7 +737,10 @@ export default function PlaylistManager() {
       });
       await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
     }).then((result) => {
-      if (result === null && ENABLE_OPTIMISTIC_PLAYLIST_UI) setFlexSlots(previousSlots);
+      if (result === null && ENABLE_OPTIMISTIC_PLAYLIST_UI) {
+        setTracks(previousTracks);
+        setFlexSlots(previousSlots);
+      }
     });
   }
 
@@ -966,15 +1013,31 @@ export default function PlaylistManager() {
                 {activeTool === "add" ? (
                   <>
                     <h2>Add song</h2>
-                    <p>Add a Spotify track by URL or URI, optionally at a fixed position and with a per-song expiry.</p>
+                    <p>Search Spotify or paste a track URL. Pick a candidate, then add it at an optional position with optional expiry.</p>
                     <div className="toolGrid addToolGrid">
-                      <input value={trackLink} onChange={(e) => setTrackLink(e.target.value)} placeholder="Spotify song link or URI" />
-                      <Field label="Position">
-                        <input value={trackPosition} onChange={(e) => setTrackPosition(e.target.value)} />
-                      </Field>
-                      <Field label="Expiry weeks">
-                        <input value={trackExpiry} onChange={(e) => setTrackExpiry(e.target.value)} />
-                      </Field>
+                      <div className="trackSearchBox">
+                        <input
+                          value={trackLink}
+                          onChange={(e) => setTrackLink(e.target.value)}
+                          placeholder="Search artist - song or paste Spotify track link"
+                        />
+                        {(trackSearchLoading || trackCandidates.length) ? (
+                          <div className="trackCandidates">
+                            {trackSearchLoading ? <span>Searching...</span> : null}
+                            {trackCandidates.map((candidate) => (
+                              <button key={candidate.id} onClick={() => selectTrackCandidate(candidate)}>
+                                <Artwork src={candidate.cover_url} alt="" size="sm" />
+                                <span>
+                                  <strong>{candidate.name}</strong>
+                                  <small>{candidate.artists}{candidate.album ? ` · ${candidate.album}` : ""}</small>
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                      <input value={trackPosition} onChange={(e) => setTrackPosition(e.target.value)} placeholder="Position" inputMode="numeric" />
+                      <input value={trackExpiry} onChange={(e) => setTrackExpiry(e.target.value)} placeholder="Expiry weeks" inputMode="numeric" />
                       <button disabled={busy || !playlistId || !trackLink.trim()} onClick={addTrack}>Add song</button>
                     </div>
                   </>
@@ -1129,9 +1192,12 @@ export default function PlaylistManager() {
                         <TimerReset aria-hidden="true" />
                       </IconButton>
                       <IconButton
-                        tooltip={isFlexTrack ? "This song is already an active flex slot." : "Turn this song into a locked flex slot that rotates from the reference playlist."}
-                        disabled={busy || isFlexTrack}
-                        onClick={() => addFlexSlot(track)}
+                        tooltip={isFlexTrack ? "Convert this flex slot back into a normal song." : "Turn this song into a locked flex slot that rotates from the reference playlist."}
+                        disabled={busy}
+                        onClick={() => isFlexTrack
+                          ? removeFlexSlot(flexSlots.find((slot) => slot.current_track_id === track.track_id))
+                          : addFlexSlot(track)
+                        }
                       >
                         <Shuffle aria-hidden="true" />
                       </IconButton>
@@ -1746,7 +1812,71 @@ export default function PlaylistManager() {
           align-items: end;
         }
         .addToolGrid {
-          grid-template-columns: minmax(220px, 1fr) 88px 110px auto;
+          grid-template-columns: minmax(280px, 1fr) 104px 132px auto;
+          align-items: start;
+        }
+        .trackSearchBox {
+          position: relative;
+          min-width: 0;
+        }
+        .trackCandidates {
+          position: absolute;
+          top: calc(100% + 8px);
+          left: 0;
+          right: 0;
+          z-index: 30;
+          display: grid;
+          gap: 4px;
+          padding: 8px;
+          border: 1px solid #303743;
+          border-radius: 8px;
+          background: #0f1217;
+          box-shadow: 0 18px 40px rgba(0, 0, 0, 0.38);
+        }
+        .trackCandidates > span {
+          padding: 8px;
+          color: #a6adba;
+          font-size: 13px;
+          font-weight: 700;
+        }
+        .trackCandidates button {
+          display: grid;
+          grid-template-columns: 42px minmax(0, 1fr);
+          align-items: center;
+          gap: 10px;
+          width: 100%;
+          min-height: 54px;
+          padding: 6px;
+          border-color: transparent;
+          background: transparent;
+          color: #f4f6fb;
+          text-align: left;
+        }
+        .trackCandidates button:hover,
+        .trackCandidates button:focus-visible {
+          border-color: rgba(24, 224, 111, 0.45);
+          background: rgba(24, 224, 111, 0.08);
+        }
+        .trackCandidates .artwork--sm,
+        .trackCandidates .coverFallback.artwork--sm {
+          width: 42px;
+          height: 42px;
+        }
+        .trackCandidates span,
+        .trackCandidates strong,
+        .trackCandidates small {
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .trackCandidates small {
+          display: block;
+          margin-top: 3px;
+          color: #a6adba;
+        }
+        .addToolGrid > input {
+          width: 100%;
         }
         .expiryToolGrid {
           grid-template-columns: 150px auto auto;
@@ -1956,8 +2086,17 @@ export default function PlaylistManager() {
           border: 1px solid rgba(24, 224, 111, 0.35);
         }
         .flexBadge svg {
-          width: 13px;
-          height: 13px;
+          width: 7px;
+          height: 7px;
+          stroke: currentColor;
+          stroke-width: 2;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+          fill: none;
+        }
+        :global(.flexBadge svg) {
+          width: 7px;
+          height: 7px;
           stroke: currentColor;
           stroke-width: 2;
           stroke-linecap: round;
@@ -1985,9 +2124,9 @@ export default function PlaylistManager() {
           height: 38px;
           min-height: 38px;
           padding: 0;
-          border-color: #18e06f;
+          border: 1px solid #18e06f;
           background: transparent;
-          color: #18e06f;
+          color: #18e06f !important;
           border-radius: 7px;
           line-height: 1;
           box-shadow: none;
@@ -1997,18 +2136,21 @@ export default function PlaylistManager() {
         .actionButton:focus-visible:not(:disabled) {
           background: rgba(24, 224, 111, 0.1);
           border-color: #18e06f;
-          color: #f4fff8;
+          color: #f4fff8 !important;
           transform: translateY(-1px);
         }
         .actionButton svg {
           width: 17px;
           height: 17px;
+          color: currentColor;
+          stroke: currentColor;
+          fill: none;
           stroke-width: 2.15;
         }
         .actionButton.danger {
           border-color: #ff4d4d;
           background: transparent;
-          color: #ff4d4d;
+          color: #ff4d4d !important;
           box-shadow: none;
         }
         .actionButton.danger:hover:not(:disabled),
@@ -2016,6 +2158,50 @@ export default function PlaylistManager() {
           background: rgba(255, 77, 77, 0.18);
           border-color: #ff4d4d;
           color: #fff4f4;
+        }
+        :global(.actionButton) {
+          position: relative;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 38px;
+          height: 38px;
+          min-height: 38px;
+          padding: 0;
+          border: 1px solid #18e06f;
+          background: transparent;
+          color: #18e06f !important;
+          border-radius: 7px;
+          line-height: 1;
+          box-shadow: none;
+          transition: background 120ms ease, border-color 120ms ease, color 120ms ease, transform 120ms ease;
+        }
+        :global(.actionButton:hover:not(:disabled)),
+        :global(.actionButton:focus-visible:not(:disabled)) {
+          background: rgba(24, 224, 111, 0.1);
+          border-color: #18e06f;
+          color: #f4fff8 !important;
+          transform: translateY(-1px);
+        }
+        :global(.actionButton svg) {
+          width: 17px;
+          height: 17px;
+          color: currentColor;
+          stroke: currentColor;
+          fill: none;
+          stroke-width: 2.15;
+        }
+        :global(.actionButton.danger) {
+          border-color: #ff4d4d;
+          background: transparent;
+          color: #ff4d4d !important;
+          box-shadow: none;
+        }
+        :global(.actionButton.danger:hover:not(:disabled)),
+        :global(.actionButton.danger:focus-visible:not(:disabled)) {
+          background: rgba(255, 77, 77, 0.18);
+          border-color: #ff4d4d;
+          color: #fff4f4 !important;
         }
         .tooltipButton {
           position: relative;

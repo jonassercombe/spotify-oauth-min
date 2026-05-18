@@ -3636,26 +3636,49 @@ const routes = {
    
        /* === (B) Locks enforce (Reorder) === */
        if (USER_ALLOW_LOCKS && locksArr.some(x => x.is_locked) && snapshot_id) {
-         const order = items
-           .map(it => it?.track ? { id: it.track.id, uri: it.track.uri } : null)
-           .filter(Boolean);
+        let order = items
+          .map(it => it?.track ? { id: it.track.id, uri: it.track.uri } : null)
+          .filter(Boolean);
    
-         const localMove = (arr, from, to) => { if (from===to) return; const el = arr.splice(from,1)[0]; arr.splice(to,0,el); };
-         const indexOf = (id) => order.findIndex(x => x.id === id);
+        const localMove = (arr, from, to) => { if (from===to) return; const el = arr.splice(from,1)[0]; arr.splice(to,0,el); };
    
-         const desiredLocks = locksArr
-           .filter(l => l.is_locked && Number.isFinite(l.locked_position))
-           .sort((a,b) => a.locked_position - b.locked_position);
+        const desiredLocks = locksArr
+          .filter(l => l.is_locked && Number.isFinite(Number(l.locked_position)))
+          .sort((a,b) => Number(a.locked_position) - Number(b.locked_position));
+
+        const lockedByPosition = new Map();
+        const lockedIds = new Set();
+        for (const l of desiredLocks) {
+          const current = order.find(x => x.id === l.track_id);
+          if (!current) continue;
+          const desired = Math.max(0, Math.min(order.length - 1, Number(l.locked_position)));
+          if (lockedByPosition.has(desired)) continue;
+          lockedByPosition.set(desired, current);
+          lockedIds.add(l.track_id);
+        }
+
+        const floating = order.filter(x => !lockedIds.has(x.id));
+        const targetOrder = [];
+        let floatingIndex = 0;
+        for (let i = 0; i < order.length; i++) {
+          if (lockedByPosition.has(i)) {
+            targetOrder.push(lockedByPosition.get(i));
+          } else {
+            const next = floating[floatingIndex++];
+            if (next) targetOrder.push(next);
+          }
+        }
+        while (floatingIndex < floating.length) targetOrder.push(floating[floatingIndex++]);
+
+        for (let desired = 0; desired < targetOrder.length; desired++) {
+          const target = targetOrder[desired];
+          const cur = order.findIndex(x => x.id === target.id);
+          if (cur < 0 || cur === desired) { await sleep(30); continue; }
+
+          const insert_before = desired > cur ? desired + 1 : desired;
    
-         for (const l of desiredLocks) {
-           const desired = Math.max(0, Math.min(order.length - 1, Number(l.locked_position)));
-           const cur = indexOf(l.track_id);
-           if (cur < 0 || cur === desired) { await sleep(30); continue; }
-   
-           const insert_before = desired > cur ? desired + 1 : desired;
-   
-           let attempt = 0;
-           while (true) {
+          let attempt = 0;
+          while (true) {
              const re = await fetchJSON(
                `https://api.spotify.com/v1/playlists/${encodeURIComponent(p.playlist_id)}/tracks`,
                {
@@ -4345,9 +4368,33 @@ const routes = {
      });
      const txt = await r.text();
      let j = null; try { j = txt ? JSON.parse(txt) : null; } catch {}
-     if (!r.ok) return bad(res, r.status, `rpc_move_failed: ${txt}`);
+    if (!r.ok) return bad(res, r.status, `rpc_move_failed: ${txt}`);
 
-     const cooldownUntil = await setPlaylistUpdateCooldown(playlist_id, 300);
+    const movedPosR = await sb(
+      `/rest/v1/playlist_items?select=position` +
+      `&playlist_id=eq.${encodeURIComponent(playlist_id)}` +
+      `&track_id=eq.${encodeURIComponent(track_id)}` +
+      `&order=position.asc&limit=1`
+    );
+    let movedPosition = null;
+    if (movedPosR.ok) {
+      const movedRow = (await movedPosR.json())?.[0];
+      if (Number.isFinite(Number(movedRow?.position))) movedPosition = Number(movedRow.position);
+    }
+
+    if (movedPosition !== null) {
+      await sb(
+        `/rest/v1/playlist_item_locks?playlist_id=eq.${encodeURIComponent(playlist_id)}` +
+        `&track_id=eq.${encodeURIComponent(track_id)}&is_locked=is.true`,
+        {
+          method: "PATCH",
+          headers: { Prefer: "return=minimal" },
+          body: JSON.stringify({ locked_position: movedPosition, locked_at: new Date().toISOString() })
+        }
+      ).catch(() => {});
+    }
+
+    const cooldownUntil = await setPlaylistUpdateCooldown(playlist_id, 300);
    
      const base = process.env.PUBLIC_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
      if (base) {
@@ -4358,8 +4405,8 @@ const routes = {
        }).catch(() => {});
      }
    
-     return json(res, 200, { ok: true, result: j?.[0] || null, cooldown_until: cooldownUntil });
-   },
+    return json(res, 200, { ok: true, result: j?.[0] || null, moved_position: movedPosition, cooldown_until: cooldownUntil });
+  },
    
   /* ---------- playlist-items/remove (POST, Bubble) ---------- */
    "playlist-items/remove": async (req, res) => {
@@ -4898,8 +4945,8 @@ const routes = {
           method: "PATCH",
           headers: { Prefer: "return=minimal" },
           body: JSON.stringify({
-            is_locked: true,
-            locked_position: Math.max(0, Number(slot.position) || 0),
+            is_locked: false,
+            locked_position: null,
             locked_at: new Date().toISOString()
           })
         }
