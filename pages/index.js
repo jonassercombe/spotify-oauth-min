@@ -204,6 +204,7 @@ export default function PlaylistManager() {
   const [playlistSearch, setPlaylistSearch] = useState("");
   const [trackSearch, setTrackSearch] = useState("");
   const [trackLink, setTrackLink] = useState("");
+  const [selectedTrackCandidate, setSelectedTrackCandidate] = useState(null);
   const [trackCandidates, setTrackCandidates] = useState([]);
   const [trackSearchLoading, setTrackSearchLoading] = useState(false);
   const [trackSearchNotice, setTrackSearchNotice] = useState("");
@@ -534,8 +535,12 @@ export default function PlaylistManager() {
   async function addTrack() {
     if (!playlistId || !trackLink.trim()) return;
     const previousLink = trackLink;
+    const previousSelectedTrack = selectedTrackCandidate;
     await run("Track added; sync dispatched", async () => {
-      if (ENABLE_OPTIMISTIC_PLAYLIST_UI) setTrackLink("");
+      if (ENABLE_OPTIMISTIC_PLAYLIST_UI) {
+        setTrackLink("");
+        setSelectedTrackCandidate(null);
+      }
       await api("/api/playlist-items/add", {
         method: "POST",
         accessToken: accessToken(),
@@ -547,15 +552,21 @@ export default function PlaylistManager() {
         },
       });
       setTrackLink("");
+      setSelectedTrackCandidate(null);
       await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
     }).then((result) => {
-      if (result === null && ENABLE_OPTIMISTIC_PLAYLIST_UI) setTrackLink(previousLink);
+      if (result === null && ENABLE_OPTIMISTIC_PLAYLIST_UI) {
+        setTrackLink(previousLink);
+        setSelectedTrackCandidate(previousSelectedTrack);
+      }
     });
   }
 
   function selectTrackCandidate(candidate) {
     setTrackLink(candidate.uri || candidate.id || "");
+    setSelectedTrackCandidate(candidate);
     setTrackCandidates([]);
+    setTrackSearchNotice("");
   }
 
   async function moveTrack(track, dir) {
@@ -1203,9 +1214,31 @@ export default function PlaylistManager() {
                       <div className="trackSearchBox">
                         <input
                           value={trackLink}
-                          onChange={(e) => setTrackLink(e.target.value)}
+                          onChange={(e) => {
+                            setTrackLink(e.target.value);
+                            setSelectedTrackCandidate(null);
+                          }}
                           placeholder="Search artist - song or paste Spotify track link"
                         />
+                        {selectedTrackCandidate ? (
+                          <div className="selectedTrackCard">
+                            <Artwork src={selectedTrackCandidate.cover_url} alt="" size="sm" />
+                            <span>
+                              <strong>{selectedTrackCandidate.name}</strong>
+                              <small>{selectedTrackCandidate.artists}{selectedTrackCandidate.album ? ` · ${selectedTrackCandidate.album}` : ""}</small>
+                            </span>
+                            <button
+                              className="iconOnlyButton selectedTrackClear"
+                              aria-label="Clear selected song"
+                              onClick={() => {
+                                setTrackLink("");
+                                setSelectedTrackCandidate(null);
+                              }}
+                            >
+                              <X aria-hidden="true" />
+                            </button>
+                          </div>
+                        ) : null}
                         {(trackSearchLoading || trackCandidates.length || trackSearchNotice) ? (
                           <div className="trackCandidates">
                             {trackSearchLoading ? <span>Searching...</span> : null}
@@ -2251,6 +2284,45 @@ export default function PlaylistManager() {
         }
         .trackSearchBox input {
           width: 100%;
+        }
+        .selectedTrackCard {
+          display: grid;
+          grid-template-columns: 42px minmax(0, 1fr) 34px;
+          align-items: center;
+          gap: 10px;
+          margin-top: 8px;
+          padding: 8px;
+          border: 1px solid rgba(24, 224, 111, 0.36);
+          border-radius: 8px;
+          background: rgba(24, 224, 111, 0.07);
+        }
+        .selectedTrackCard .artwork--sm,
+        .selectedTrackCard .coverFallback.artwork--sm {
+          width: 42px;
+          height: 42px;
+        }
+        .selectedTrackCard span,
+        .selectedTrackCard strong,
+        .selectedTrackCard small {
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .selectedTrackCard small {
+          display: block;
+          margin-top: 3px;
+          color: #a6adba;
+        }
+        .selectedTrackClear {
+          width: 34px;
+          height: 34px;
+          min-height: 34px;
+          border-color: rgba(24, 224, 111, 0.42);
+        }
+        .selectedTrackClear svg {
+          width: 15px;
+          height: 15px;
         }
         .trackCandidates {
           position: absolute;
