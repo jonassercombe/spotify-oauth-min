@@ -1,6 +1,8 @@
 // pages/api/[...task].js
 export const config = { api: { bodyParser: false } };
 
+import Stripe from "stripe";
+
 /* ==============================
    Shared Utils (Server-only)
 ============================== */
@@ -148,6 +150,91 @@ async function bubbleUserIdFromRequest(req, explicitValue = "") {
   if (ctx?.bubble_user_id) return ctx.bubble_user_id;
 
   return String(explicitValue || "").trim();
+}
+
+function getStripeClient() {
+  const key = need("STRIPE_SECRET_KEY");
+  return new Stripe(key);
+}
+
+function publicBaseUrl(req = null) {
+  return process.env.PUBLIC_BASE_URL || (req?.headers?.host ? `https://${req.headers.host}` : "https://playlist-pilot.com");
+}
+
+function mapStripePlan(priceId) {
+  const proPrice = process.env.STRIPE_PRICE_PRO || "";
+  if (proPrice && priceId === proPrice) {
+    return { plan_code: "pro", seats_limit: 1, features: { playlist_tools: true, rotator: true, automations: true } };
+  }
+  return { plan_code: "pro", seats_limit: 1, features: { playlist_tools: true, rotator: true, automations: true } };
+}
+
+function isAppSubscriptionActive(row = {}) {
+  if (row.is_active === true) return true;
+  const status = String(row.sub_status || row.subscription_status || "").toLowerCase();
+  if (["active", "trialing"].includes(status)) return true;
+  if (status === "canceled" && row.current_period_end) {
+    return new Date(row.current_period_end).getTime() > Date.now();
+  }
+  if (row.subscription_expires_at) {
+    return new Date(row.subscription_expires_at).getTime() > Date.now();
+  }
+  return false;
+}
+
+async function getBillingState(bubble_user_id) {
+  const r = await sb(
+    `/rest/v1/app_users?select=bubble_user_id,provider,provider_subscription_id,stripe_customer_id,stripe_subscription_id,stripe_price_id,subscription_status,subscription_expires_at,plan_code,sub_status,is_active,seats_limit,seats_used,features,current_period_end,cancel_at_period_end,last_synced_at` +
+    `&limit=1&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}`
+  );
+  const row = r.ok ? (await r.json().catch(() => []))?.[0] : null;
+  return {
+    row,
+    is_active: isAppSubscriptionActive(row || {}),
+    status: row?.sub_status || row?.subscription_status || "none",
+  };
+}
+
+async function upsertStripeSubscriptionState({ bubble_user_id, customer_id, subscription }) {
+  const item = subscription?.items?.data?.[0] || null;
+  const priceId = item?.price?.id || null;
+  const mapped = mapStripePlan(priceId);
+  const status = String(subscription?.status || "unknown");
+  const currentPeriodEnd = subscription?.current_period_end
+    ? new Date(subscription.current_period_end * 1000).toISOString()
+    : null;
+  const active = ["active", "trialing"].includes(status) || (status === "canceled" && currentPeriodEnd && new Date(currentPeriodEnd) > new Date());
+
+  const payload = {
+    bubble_user_id,
+    provider: "stripe",
+    provider_subscription_id: subscription?.id || null,
+    stripe_customer_id: customer_id || subscription?.customer || null,
+    stripe_subscription_id: subscription?.id || null,
+    stripe_price_id: priceId,
+    subscription_status: status,
+    subscription_expires_at: currentPeriodEnd,
+    plan_code: mapped.plan_code,
+    subscription_plan_code: mapped.plan_code,
+    sub_status: status,
+    is_active: active,
+    seats_limit: mapped.seats_limit,
+    features: mapped.features,
+    current_period_end: currentPeriodEnd,
+    cancel_at_period_end: !!subscription?.cancel_at_period_end,
+    last_synced_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+
+  const up = await sb(`/rest/v1/app_users?on_conflict=bubble_user_id`, {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: JSON.stringify([payload]),
+  });
+  const txt = await up.text();
+  if (!up.ok) throw new Error(`stripe_subscription_upsert_failed: ${txt}`);
+  const data = txt ? JSON.parse(txt) : [];
+  return Array.isArray(data) ? data[0] : data;
 }
 
 /* ==============================
@@ -696,6 +783,7 @@ const routes = {
     }
 
     const credentials = await getSpotifyAppCredentialsForUser(ctx.bubble_user_id, { allowFallback: false }).catch(() => null);
+    const billing = await getBillingState(ctx.bubble_user_id).catch(() => ({ row: null, is_active: false, status: "unknown" }));
 
     return json(res, 200, {
       ok: true,
@@ -705,7 +793,138 @@ const routes = {
       role: ctx.role,
       has_spotify_credentials: !!credentials,
       spotify_redirect_uri: `${process.env.PUBLIC_BASE_URL || "https://playlist-pilot.com"}/api/oauth/spotify/callback`,
+      billing: {
+        is_active: billing.is_active,
+        status: billing.status,
+        plan_code: billing.row?.plan_code || billing.row?.subscription_plan_code || null,
+        current_period_end: billing.row?.current_period_end || billing.row?.subscription_expires_at || null,
+        cancel_at_period_end: !!billing.row?.cancel_at_period_end,
+        seats_limit: billing.row?.seats_limit ?? 0,
+        seats_used: billing.row?.seats_used ?? 0,
+        provider: billing.row?.provider || null,
+      },
     });
+  },
+
+  /* ---------- stripe/checkout (POST) ---------- */
+  "stripe/checkout": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await getUserContext(req);
+    if (!ctx?.linked) return bad(res, 401, "not_authenticated");
+    const price = process.env.STRIPE_PRICE_PRO;
+    if (!price) return bad(res, 500, "missing_stripe_price");
+
+    const stripe = getStripeClient();
+    const billing = await getBillingState(ctx.bubble_user_id);
+    let customerId = billing.row?.stripe_customer_id || null;
+
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: ctx.email,
+        metadata: { bubble_user_id: ctx.bubble_user_id },
+      });
+      customerId = customer.id;
+      await sb(`/rest/v1/app_users?on_conflict=bubble_user_id`, {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify([{ bubble_user_id: ctx.bubble_user_id, stripe_customer_id: customerId, updated_at: new Date().toISOString() }]),
+      });
+    }
+
+    const base = publicBaseUrl(req);
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer: customerId,
+      line_items: [{ price, quantity: 1 }],
+      success_url: `${base}/?billing=success`,
+      cancel_url: `${base}/?billing=cancelled`,
+      metadata: { bubble_user_id: ctx.bubble_user_id },
+      subscription_data: { metadata: { bubble_user_id: ctx.bubble_user_id } },
+      allow_promotion_codes: true,
+    });
+    return json(res, 200, { ok: true, url: session.url });
+  },
+
+  /* ---------- stripe/portal (POST) ---------- */
+  "stripe/portal": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await getUserContext(req);
+    if (!ctx?.linked) return bad(res, 401, "not_authenticated");
+    const billing = await getBillingState(ctx.bubble_user_id);
+    const customerId = billing.row?.stripe_customer_id;
+    if (!customerId) return bad(res, 400, "missing_stripe_customer");
+    const stripe = getStripeClient();
+    const portal = await stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: publicBaseUrl(req),
+    });
+    return json(res, 200, { ok: true, url: portal.url });
+  },
+
+  /* ---------- stripe/webhook (POST) ---------- */
+  "stripe/webhook": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const stripe = getStripeClient();
+    const secret = need("STRIPE_WEBHOOK_SECRET");
+    const sig = req.headers["stripe-signature"];
+    const raw = await readRawBody(req);
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(raw, sig, secret);
+    } catch (e) {
+      return bad(res, 400, `stripe_webhook_invalid: ${e.message}`);
+    }
+
+    try {
+      if (event.type === "checkout.session.completed") {
+        const session = event.data.object;
+        if (session.mode === "subscription" && session.subscription) {
+          const subscription = await stripe.subscriptions.retrieve(session.subscription);
+          const bubble_user_id = session.metadata?.bubble_user_id || subscription.metadata?.bubble_user_id;
+          if (bubble_user_id) {
+            await upsertStripeSubscriptionState({
+              bubble_user_id,
+              customer_id: session.customer,
+              subscription,
+            });
+          }
+        }
+      }
+
+      if (event.type === "customer.subscription.created" || event.type === "customer.subscription.updated" || event.type === "customer.subscription.deleted") {
+        const subscription = event.data.object;
+        let bubble_user_id = subscription.metadata?.bubble_user_id || null;
+        if (!bubble_user_id && subscription.customer) {
+          const r = await sb(`/rest/v1/app_users?select=bubble_user_id&limit=1&stripe_customer_id=eq.${encodeURIComponent(subscription.customer)}`);
+          bubble_user_id = r.ok ? (await r.json().catch(() => []))?.[0]?.bubble_user_id : null;
+        }
+        if (bubble_user_id) {
+          await upsertStripeSubscriptionState({
+            bubble_user_id,
+            customer_id: subscription.customer,
+            subscription,
+          });
+        }
+      }
+
+      if (event.type === "invoice.payment_failed" || event.type === "invoice.payment_succeeded") {
+        const invoice = event.data.object;
+        if (invoice.subscription) {
+          const subscription = await stripe.subscriptions.retrieve(invoice.subscription);
+          let bubble_user_id = subscription.metadata?.bubble_user_id || null;
+          if (!bubble_user_id && subscription.customer) {
+            const r = await sb(`/rest/v1/app_users?select=bubble_user_id&limit=1&stripe_customer_id=eq.${encodeURIComponent(subscription.customer)}`);
+            bubble_user_id = r.ok ? (await r.json().catch(() => []))?.[0]?.bubble_user_id : null;
+          }
+          if (bubble_user_id) await upsertStripeSubscriptionState({ bubble_user_id, customer_id: subscription.customer, subscription });
+        }
+      }
+    } catch (e) {
+      console.error("stripe_webhook_handler_failed", { type: event.type, error: String(e?.message || e) });
+      return bad(res, 500, "stripe_webhook_handler_failed");
+    }
+
+    return json(res, 200, { received: true });
   },
 
   /* ---------- spotify/credentials/get (GET) ---------- */
@@ -2615,7 +2834,8 @@ const routes = {
          console.error("oauth/spotify/callback: seats/sub fetch failed", { error: String(e) });
        }
    
-       const subActive = sub_status !== "canceled" && (!sub_expires || new Date(sub_expires) > new Date());
+       const billing = await getBillingState(bubble_user_id).catch(() => null);
+       const subActive = billing ? billing.is_active : (sub_status !== "canceled" && (!sub_expires || new Date(sub_expires) > new Date()));
        if (!subActive) return backWithError(return_to, "subscription_required");
        if (seats_used >= seats_limit) return backWithError(return_to, "seat_limit_reached");
    

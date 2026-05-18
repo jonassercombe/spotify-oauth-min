@@ -233,6 +233,9 @@ export default function PlaylistManager() {
   const [spotifyAppName, setSpotifyAppName] = useState("");
   const [spotifyRedirectUri, setSpotifyRedirectUri] = useState("https://playlist-pilot.com/api/oauth/spotify/callback");
 
+  const billing = userContext?.billing || {};
+  const billingActive = !!billing.is_active;
+
   useEffect(() => {
     const client = getSupabaseBrowserClient();
     setSupabase(client);
@@ -385,6 +388,22 @@ export default function PlaylistManager() {
 
   async function signOut() {
     await supabase.auth.signOut();
+  }
+
+  async function startCheckout() {
+    await run("Opening checkout", async () => {
+      const data = await api("/api/stripe/checkout", { method: "POST", accessToken: accessToken() });
+      if (data?.url) window.location.href = data.url;
+      return data;
+    });
+  }
+
+  async function openBillingPortal() {
+    await run("Opening billing portal", async () => {
+      const data = await api("/api/stripe/portal", { method: "POST", accessToken: accessToken() });
+      if (data?.url) window.location.href = data.url;
+      return data;
+    });
   }
 
   async function loadCurrentUser() {
@@ -975,6 +994,17 @@ export default function PlaylistManager() {
             <strong>{userContext.email}</strong>
           </div>
 
+          <section className={billingActive ? "billingBox billingBox--active" : "billingBox"}>
+            <span>{billingActive ? "Subscription active" : "Subscription required"}</span>
+            <strong>{billing.plan_code || (billingActive ? "Active plan" : "PlaylistPilot Pro")}</strong>
+            {billing.current_period_end ? <small>Renews through {formatShortDate(String(billing.current_period_end).slice(0, 10))}</small> : null}
+            {billingActive ? (
+              <button disabled={busy} onClick={openBillingPortal}>Manage billing</button>
+            ) : (
+              <button disabled={busy} onClick={startCheckout}>Upgrade</button>
+            )}
+          </section>
+
           <section className={`spotifySetup ${spotifyCredsOpen ? "spotifySetup--open" : ""}`}>
             <button className="spotifySetupToggle" onClick={() => setSpotifyCredsOpen(!spotifyCredsOpen)}>
               <span>Spotify API App</span>
@@ -1491,6 +1521,34 @@ export default function PlaylistManager() {
         }
         .accountBox strong {
           overflow-wrap: anywhere;
+        }
+        .billingBox {
+          display: grid;
+          gap: 8px;
+          padding: 14px;
+          border: 1px solid rgba(255, 189, 74, 0.38);
+          border-radius: 8px;
+          background: rgba(255, 189, 74, 0.08);
+        }
+        .billingBox--active {
+          border-color: rgba(24, 224, 111, 0.34);
+          background: rgba(24, 224, 111, 0.07);
+        }
+        .billingBox span {
+          color: #a6adba;
+          font-size: 13px;
+          font-weight: 800;
+        }
+        .billingBox strong {
+          color: #f4f6fb;
+          overflow-wrap: anywhere;
+        }
+        .billingBox small {
+          color: #a6adba;
+        }
+        .billingBox button {
+          width: 100%;
+          margin-top: 4px;
         }
         .spotifySetup {
           border: 1px solid #2a303b;
