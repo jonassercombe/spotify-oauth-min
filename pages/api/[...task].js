@@ -900,7 +900,10 @@ const routes = {
       success_url: `${base}/?billing=success`,
       cancel_url: `${base}/?billing=cancelled`,
       metadata: { bubble_user_id: ctx.bubble_user_id, plan: selectedPlan.plan_code, interval: selectedPlan.interval },
-      subscription_data: { metadata: { bubble_user_id: ctx.bubble_user_id, plan: selectedPlan.plan_code, interval: selectedPlan.interval } },
+      subscription_data: {
+        trial_period_days: 30,
+        metadata: { bubble_user_id: ctx.bubble_user_id, plan: selectedPlan.plan_code, interval: selectedPlan.interval },
+      },
       allow_promotion_codes: true,
     });
     return json(res, 200, { ok: true, url: session.url });
