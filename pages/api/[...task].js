@@ -915,13 +915,46 @@ const routes = {
     const ctx = await getUserContext(req);
     if (!ctx?.linked) return bad(res, 401, "not_authenticated");
     const billing = await getBillingState(ctx.bubble_user_id);
-    const customerId = billing.row?.stripe_customer_id;
-    if (!customerId) return bad(res, 400, "missing_stripe_customer");
+    let customerId = billing.row?.stripe_customer_id || null;
     const stripe = getStripeClient();
-    const portal = await stripe.billingPortal.sessions.create({
-      customer: customerId,
-      return_url: publicBaseUrl(req),
-    });
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: ctx.email,
+        metadata: { bubble_user_id: ctx.bubble_user_id },
+      });
+      customerId = customer.id;
+      await sb(`/rest/v1/app_users?on_conflict=bubble_user_id`, {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify([{ bubble_user_id: ctx.bubble_user_id, stripe_customer_id: customerId, updated_at: new Date().toISOString() }]),
+      });
+    }
+    let portal;
+    try {
+      portal = await stripe.billingPortal.sessions.create({
+        customer: customerId,
+        return_url: publicBaseUrl(req),
+      });
+    } catch (e) {
+      const message = String(e?.message || e);
+      if (!/configuration|No configuration/i.test(message)) throw e;
+      const config = await stripe.billingPortal.configurations.create({
+        business_profile: {
+          headline: "Manage your PlaylistPilot subscription",
+        },
+        features: {
+          customer_update: { enabled: true, allowed_updates: ["email", "tax_id"] },
+          invoice_history: { enabled: true },
+          payment_method_update: { enabled: true },
+          subscription_cancel: { enabled: true, mode: "at_period_end" },
+        },
+      });
+      portal = await stripe.billingPortal.sessions.create({
+        customer: customerId,
+        configuration: config.id,
+        return_url: publicBaseUrl(req),
+      });
+    }
     return json(res, 200, { ok: true, url: portal.url });
   },
 
