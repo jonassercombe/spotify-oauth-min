@@ -2355,13 +2355,13 @@ const routes = {
        const searchResponse = await fetch(url, {
          headers: { Authorization: `Bearer ${token}` },
        });
-       const { json, text } = await parseJsonSafe(searchResponse);
+       const parsed = await parseJsonSafe(searchResponse);
    
        if (!searchResponse.ok) {
-         return bad(res, searchResponse.status, `spotify_search_failed: ${json ? JSON.stringify(json) : text}`);
+         return bad(res, searchResponse.status, `spotify_search_failed: ${parsed.json ? JSON.stringify(parsed.json) : parsed.text}`);
        }
    
-       const items = (json?.tracks?.items || []).map((t) => ({
+       const items = (parsed.json?.tracks?.items || []).map((t) => ({
          id: t.id,
          uri: t.uri,
          name: t.name,
