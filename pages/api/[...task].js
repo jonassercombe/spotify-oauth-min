@@ -260,11 +260,11 @@ function encToken(plain) {
   return Buffer.concat([iv, tag, ct]).toString("base64");
 }
 
-function fallbackSpotifyCredentials() {
+function fallbackSpotifyCredentials({ requireRedirect = false } = {}) {
   const client_id = process.env.SPOTIFY_CLIENT_ID || "";
   const client_secret = process.env.SPOTIFY_CLIENT_SECRET || "";
   const redirect_uri = process.env.SPOTIFY_REDIRECT_URI || "";
-  if (!client_id || !client_secret || !redirect_uri) return null;
+  if (!client_id || !client_secret || (requireRedirect && !redirect_uri)) return null;
   return { id: null, client_id, client_secret, redirect_uri, source: "global" };
 }
 
@@ -288,7 +288,7 @@ async function getSpotifyAppCredentialsForUser(bubble_user_id, { allowFallback =
   }
 
   if (!allowFallback) return null;
-  return fallbackSpotifyCredentials();
+  return fallbackSpotifyCredentials({ requireRedirect: true });
 }
 
 async function getSpotifyAppCredentialsForConnection(connection_id) {
@@ -314,7 +314,7 @@ async function getSpotifyAppCredentialsForConnection(connection_id) {
       };
     }
   }
-  return getSpotifyAppCredentialsForUser(row?.bubble_user_id || "", { allowFallback: true });
+  return fallbackSpotifyCredentials();
 }
 
 async function refreshAccessToken(refresh_token, credentials = null) {

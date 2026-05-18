@@ -206,7 +206,8 @@ export default function PlaylistManager() {
   const [trackLink, setTrackLink] = useState("");
   const [trackCandidates, setTrackCandidates] = useState([]);
   const [trackSearchLoading, setTrackSearchLoading] = useState(false);
-  const [trackPosition, setTrackPosition] = useState("1");
+  const [trackSearchNotice, setTrackSearchNotice] = useState("");
+  const [trackPosition, setTrackPosition] = useState("");
   const [trackExpiry, setTrackExpiry] = useState("");
   const [autoWeeks, setAutoWeeks] = useState("4");
   const [flexSettings, setFlexSettings] = useState(null);
@@ -313,20 +314,29 @@ export default function PlaylistManager() {
     if (!connectionId || query.length < 3 || query.includes("spotify.com/track/") || query.startsWith("spotify:track:")) {
       setTrackCandidates([]);
       setTrackSearchLoading(false);
+      setTrackSearchNotice("");
       return;
     }
 
     let cancelled = false;
     const timeout = setTimeout(async () => {
       setTrackSearchLoading(true);
+      setTrackSearchNotice("");
       try {
         const data = await api(
           `/api/tracks/search?connection_id=${encodeURIComponent(connectionId)}&q=${encodeURIComponent(query)}&limit=6`,
           { accessToken: accessToken() }
         );
-        if (!cancelled) setTrackCandidates(Array.isArray(data?.items) ? data.items : []);
-      } catch {
-        if (!cancelled) setTrackCandidates([]);
+        if (!cancelled) {
+          const items = Array.isArray(data?.items) ? data.items : [];
+          setTrackCandidates(items);
+          setTrackSearchNotice(items.length ? "" : "No tracks found.");
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setTrackCandidates([]);
+          setTrackSearchNotice(e.message || "Spotify search failed.");
+        }
       } finally {
         if (!cancelled) setTrackSearchLoading(false);
       }
@@ -482,7 +492,7 @@ export default function PlaylistManager() {
         body: {
           playlist_id: playlistId,
           link_or_uri: trackLink,
-          position: trackPosition,
+          position: trackPosition.trim() || "1",
           exp_weeks: trackExpiry || undefined,
         },
       });
@@ -1099,9 +1109,10 @@ export default function PlaylistManager() {
                           onChange={(e) => setTrackLink(e.target.value)}
                           placeholder="Search artist - song or paste Spotify track link"
                         />
-                        {(trackSearchLoading || trackCandidates.length) ? (
+                        {(trackSearchLoading || trackCandidates.length || trackSearchNotice) ? (
                           <div className="trackCandidates">
                             {trackSearchLoading ? <span>Searching...</span> : null}
+                            {!trackSearchLoading && trackSearchNotice ? <span>{trackSearchNotice}</span> : null}
                             {trackCandidates.map((candidate) => (
                               <button key={candidate.id} onClick={() => selectTrackCandidate(candidate)}>
                                 <Artwork src={candidate.cover_url} alt="" size="sm" />
@@ -1125,9 +1136,10 @@ export default function PlaylistManager() {
                     <h2>Expiry</h2>
                     <p>Automatically remove unlocked songs after the selected number of weeks. Manual per-song expiry still overrides this.</p>
                     <div className="toolGrid expiryToolGrid">
-                      <Field label="Default expiry weeks">
+                      <label className="compactField">
+                        <span>Default expiry weeks</span>
                         <input type="number" min="1" max="104" value={autoWeeks} onChange={(e) => setAutoWeeks(e.target.value)} />
-                      </Field>
+                      </label>
                       <button disabled={busy || !playlistId} onClick={saveAutoRemoval}>Save expiry</button>
                       <button disabled={busy || !playlistId} onClick={cleanupNow}>Run expiry check now</button>
                     </div>
@@ -2008,7 +2020,23 @@ export default function PlaylistManager() {
           width: 100%;
         }
         .expiryToolGrid {
-          grid-template-columns: 150px auto auto;
+          grid-template-columns: minmax(190px, 240px) auto auto;
+          align-items: end;
+        }
+        .compactField {
+          display: grid;
+          gap: 8px;
+          min-width: 0;
+          color: #f4f6fb;
+          font-weight: 700;
+        }
+        .compactField span {
+          color: #a6adba;
+          font-size: 13px;
+          white-space: nowrap;
+        }
+        .compactField input {
+          width: 100%;
         }
         .flexPanelHeader,
         .flexSettings,
