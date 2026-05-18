@@ -3021,7 +3021,7 @@ const routes = {
          ].join(",") +
        `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
        `&is_owner=is.true&is_public=is.true` +
-       `&order=updated_at.desc`;
+       `&order=followers.desc.nullslast,name.asc`;
    
      if (connection_id) {
        path += `&connection_id=eq.${encodeURIComponent(connection_id)}`;

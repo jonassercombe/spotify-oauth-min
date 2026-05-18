@@ -860,7 +860,8 @@ export default function PlaylistManager() {
             <strong>{userContext.email}</strong>
           </div>
 
-          <Field label="Account" className="accountField">
+          <label className="accountField">
+            <span>Account</span>
             <select value={connectionId} onChange={(e) => setConnectionId(e.target.value)}>
               <option value="">Select account</option>
               {connections.map((c) => (
@@ -869,7 +870,7 @@ export default function PlaylistManager() {
                 </option>
               ))}
             </select>
-          </Field>
+          </label>
 
           <button
             onClick={() => {
@@ -1541,14 +1542,21 @@ export default function PlaylistManager() {
           width: 100%;
         }
         .accountField {
+          display: grid;
           grid-template-columns: auto minmax(0, 1fr);
           align-items: center;
           gap: 18px;
+          width: 100%;
+          color: #f4f6fb;
+          font-weight: 700;
         }
         .accountField span {
+          color: #a6adba;
+          font-size: 14px;
           white-space: nowrap;
         }
         .accountField select {
+          width: 100%;
           justify-self: stretch;
         }
         .sidebar {
