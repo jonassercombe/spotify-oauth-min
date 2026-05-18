@@ -42,6 +42,17 @@ function formatShortDate(value) {
   return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(d);
 }
 
+function sortPlaylistsByFollowers(items = []) {
+  return [...items].sort((a, b) => {
+    const aFollowers = Number(a.followers);
+    const bFollowers = Number(b.followers);
+    const aRank = Number.isFinite(aFollowers) ? aFollowers : -1;
+    const bRank = Number.isFinite(bFollowers) ? bFollowers : -1;
+    if (aRank !== bRank) return bRank - aRank;
+    return String(a.name || "").localeCompare(String(b.name || ""));
+  });
+}
+
 function Field({ label, children, className = "" }) {
   return (
     <label className={`field ${className}`.trim()}>
@@ -353,7 +364,9 @@ export default function PlaylistManager() {
       const qs = new URLSearchParams();
       if (connectionId) qs.set("connection_id", connectionId);
       const query = qs.toString();
-      const data = await api(`/api/playlists/list${query ? `?${query}` : ""}`, { accessToken: accessToken() });
+      const data = sortPlaylistsByFollowers(
+        await api(`/api/playlists/list${query ? `?${query}` : ""}`, { accessToken: accessToken() })
+      );
       setPlaylists(data);
       const stored = readStoredSelection(userContext);
       const storedPlaylistId = stored.playlistId && data.some((p) => p.id === stored.playlistId)
