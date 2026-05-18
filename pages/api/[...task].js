@@ -4788,16 +4788,40 @@ const routes = {
       if (Number.isFinite(Number(movedRow?.position))) movedPosition = Number(movedRow.position);
     }
 
-    if (movedPosition !== null) {
-      await sb(
-        `/rest/v1/playlist_item_locks?playlist_id=eq.${encodeURIComponent(playlist_id)}` +
-        `&track_id=eq.${encodeURIComponent(track_id)}&is_locked=is.true`,
-        {
-          method: "PATCH",
-          headers: { Prefer: "return=minimal" },
-          body: JSON.stringify({ locked_position: movedPosition, locked_at: new Date().toISOString() })
+    try {
+      const locksR = await sb(
+        `/rest/v1/playlist_item_locks?select=track_id&playlist_id=eq.${encodeURIComponent(playlist_id)}&is_locked=is.true`
+      );
+      const locks = locksR.ok ? await locksR.json() : [];
+      const lockedIds = Array.isArray(locks) ? locks.map((x) => x.track_id).filter(Boolean) : [];
+      if (lockedIds.length) {
+        const quotedIds = lockedIds.map((id) => `"${encodeURIComponent(String(id))}"`).join(",");
+        const posR = await sb(
+          `/rest/v1/playlist_items?select=track_id,position` +
+          `&playlist_id=eq.${encodeURIComponent(playlist_id)}` +
+          `&track_id=in.(${quotedIds})`
+        );
+        const positions = posR.ok ? await posR.json() : [];
+        const nowIso = new Date().toISOString();
+        const lockUpdates = (Array.isArray(positions) ? positions : [])
+          .filter((row) => Number.isFinite(Number(row.position)))
+          .map((row) => ({
+            playlist_id,
+            track_id: row.track_id,
+            locked_position: Number(row.position),
+            is_locked: true,
+            locked_at: nowIso,
+          }));
+        if (lockUpdates.length) {
+          await sb(`/rest/v1/playlist_item_locks?on_conflict=playlist_id,track_id`, {
+            method: "POST",
+            headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+            body: JSON.stringify(lockUpdates),
+          });
         }
-      ).catch(() => {});
+      }
+    } catch (e) {
+      console.warn("playlist-items/move:lock_position_resync_failed", String(e?.message || e));
     }
 
     const cooldownUntil = await setPlaylistUpdateCooldown(playlist_id, 300);
