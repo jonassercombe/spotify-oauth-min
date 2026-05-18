@@ -463,6 +463,24 @@ async function fetchText(url, init={}, timeoutMs=20000) {
   } finally { clear(); }
 }
 
+async function refreshAccessTokenDirect(refresh_token, credentials) {
+  const response = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token,
+      client_id: credentials.client_id,
+      client_secret: credentials.client_secret,
+    }),
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok || !payload?.access_token) {
+    throw new Error(`spotify_refresh_failed_${response.status}`);
+  }
+  return payload.access_token;
+}
+
 async function setConnectionCooldown(connection_id, seconds) {
   const until = new Date(Date.now() + Math.max(1, seconds) * 1000).toISOString();
   await sb(`/rest/v1/connection_rl_state`, {
@@ -887,26 +905,8 @@ const routes = {
               customer_id: session.customer,
               subscription,
             });
-  }
-}
-
-async function refreshAccessTokenDirect(refresh_token, credentials) {
-  const response = await fetch("https://accounts.spotify.com/api/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token,
-      client_id: credentials.client_id,
-      client_secret: credentials.client_secret,
-    }),
-  });
-  const payload = await response.json().catch(() => null);
-  if (!response.ok || !payload?.access_token) {
-    throw new Error(`spotify_refresh_failed_${response.status}`);
-  }
-  return payload.access_token;
-}
+          }
+        }
       }
 
       if (event.type === "customer.subscription.created" || event.type === "customer.subscription.updated" || event.type === "customer.subscription.deleted") {
@@ -3707,7 +3707,7 @@ async function refreshAccessTokenDirect(refresh_token, credentials) {
        // Falls nur Spotify-ID kam → Row-ID auflösen
        if (!playlist_row_id && spotify_playlist_id) {
          console.log("sync-items:resolve_row_id_from_spotify_id", { spotify_playlist_id });
-         const r = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id,auto_remove_enabled,auto_remove_weeks&limit=1&playlist_id=eq.${encodeURIComponent(spotify_playlist_id)}`);
+         const r = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id,auto_remove_enabled,auto_remove_weeks,next_check_at&limit=1&playlist_id=eq.${encodeURIComponent(spotify_playlist_id)}`);
          if (!r.ok) { console.timeEnd(timeLabel); return bad(res, 500, `supabase_select_failed: ${await r.text()}`); }
          const arr = await r.json();
          if (!arr[0]) { console.timeEnd(timeLabel); return bad(res, 404, "playlist_not_found_by_spotify_id"); }
@@ -3716,7 +3716,7 @@ async function refreshAccessTokenDirect(refresh_token, credentials) {
        }
    
        // Playlist-Metadaten (+Settings)
-       const pr = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id,auto_remove_enabled,auto_remove_weeks&limit=1&id=eq.${encodeURIComponent(playlist_row_id)}`);
+       const pr = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id,auto_remove_enabled,auto_remove_weeks,next_check_at&limit=1&id=eq.${encodeURIComponent(playlist_row_id)}`);
        if (!pr.ok) { console.timeEnd(timeLabel); return bad(res, 500, `supabase select playlist failed: ${await pr.text()}`); }
        const p = (await pr.json())[0];
        if (!p) { console.timeEnd(timeLabel); return bad(res, 404, "playlist_not_found"); }
@@ -3744,8 +3744,16 @@ async function refreshAccessTokenDirect(refresh_token, credentials) {
          return json(res, 202, { ok:true, paused:true, reason: uf.sync_paused ? "user_paused" : "subscription_inactive" });
        }
    
-       const USER_ALLOW_AUTO  = uf.auto_remove_enabled !== false;     // default true
-       const USER_ALLOW_LOCKS = uf.position_lock_enabled !== false;   // default true
+       const playlistCooldownUntil = p.next_check_at ? new Date(p.next_check_at) : null;
+       const playlistOnCooldown = playlistCooldownUntil && playlistCooldownUntil > new Date();
+       const USER_ALLOW_AUTO  = !playlistOnCooldown && uf.auto_remove_enabled !== false;     // default true
+       const USER_ALLOW_LOCKS = !playlistOnCooldown && uf.position_lock_enabled !== false;   // default true
+       if (playlistOnCooldown) {
+         console.log("sync-items:automation_skipped_playlist_cooldown", {
+           playlist_row_id: p.id,
+           next_check_at: p.next_check_at
+         });
+       }
    
        // Reentrancy-Guard (Claim)
        const claim = await fetch(
