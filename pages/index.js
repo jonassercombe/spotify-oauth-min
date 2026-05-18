@@ -146,23 +146,41 @@ function reorderTracks(list, sourceTrackId, targetPosition) {
   return next.map((track, index) => ({ ...track, position: index }));
 }
 
-function Sparkline({ values = [] }) {
+function GrowthChart({ values = [] }) {
   const points = values.map((v) => Number(v) || 0);
-  if (!points.length) return <div className="sparkline empty"><span>No growth data yet</span></div>;
+  if (!points.length) return <div className="growthChart growthChart--empty"><span>No growth data yet</span></div>;
   const min = Math.min(...points);
   const max = Math.max(...points);
   const span = max - min || 1;
+  const padX = 8;
+  const padTop = 10;
+  const padBottom = 18;
+  const width = 100;
+  const height = 64;
+  const chartHeight = height - padTop - padBottom;
   const d = points.map((v, i) => {
-    const x = points.length === 1 ? 100 : (i / (points.length - 1)) * 100;
-    const y = 54 - ((v - min) / span) * 46;
+    const x = points.length === 1 ? 50 : padX + (i / (points.length - 1)) * (width - padX * 2);
+    const y = padTop + chartHeight - ((v - min) / span) * chartHeight;
     return `${i ? "L" : "M"}${x.toFixed(2)},${y.toFixed(2)}`;
   }).join(" ");
-  const area = `${d} L100,58 L0,58 Z`;
+  const firstX = points.length === 1 ? 50 : padX;
+  const lastX = points.length === 1 ? 50 : width - padX;
+  const area = `${d} L${lastX},${height - padBottom} L${firstX},${height - padBottom} Z`;
+  const gridLines = [padTop, padTop + chartHeight / 2, padTop + chartHeight];
   return (
-    <svg className="sparkline" viewBox="0 0 100 60" preserveAspectRatio="none" aria-hidden="true">
-      <path className="sparklineArea" d={area} />
-      <path d={d} />
-    </svg>
+    <div className="growthChart">
+      <svg viewBox={`0 0 ${width} ${height}`} aria-hidden="true">
+        {gridLines.map((y) => <line key={y} className="chartGridLine" x1="0" x2="100" y1={y} y2={y} />)}
+        <path className="chartArea" d={area} />
+        <path className="chartLine" d={d} />
+        {points.map((v, i) => {
+          if (points.length > 12 && i !== 0 && i !== points.length - 1) return null;
+          const x = points.length === 1 ? 50 : padX + (i / (points.length - 1)) * (width - padX * 2);
+          const y = padTop + chartHeight - ((v - min) / span) * chartHeight;
+          return <circle key={i} className="chartPoint" cx={x} cy={y} r="1.3" />;
+        })}
+      </svg>
+    </div>
   );
 }
 
@@ -1134,7 +1152,7 @@ export default function PlaylistManager() {
                 </select>
               </div>
             </div>
-            <Sparkline values={dashboardSeries?.followers || dashboardSeries?.growth || []} />
+            <GrowthChart values={dashboardSeries?.followers || dashboardSeries?.growth || []} />
             <div className="sparkLabels">
               <span>{dashboardSeries?.labels?.[0] ? formatShortDate(dashboardSeries.labels[0]) : ""}</span>
               <strong>{formatDelta((dashboardSeries?.growth || []).reduce((sum, value) => sum + (Number(value) || 0), 0))}</strong>
@@ -2006,6 +2024,7 @@ export default function PlaylistManager() {
           border: 1px solid #2a303b;
           background: #181c23;
           padding: 18px;
+          border-radius: 8px;
         }
         .metricGrid article {
           display: grid;
@@ -2029,7 +2048,7 @@ export default function PlaylistManager() {
           gap: 14px;
         }
         .growthPanel {
-          min-height: 280px;
+          min-height: 320px;
         }
         .panelHeader {
           display: flex;
@@ -2044,33 +2063,50 @@ export default function PlaylistManager() {
           min-width: 220px;
           max-width: 320px;
         }
-        .sparkline {
+        .growthChart {
           width: 100%;
-          height: 210px;
-          margin-top: 22px;
+          height: 240px;
+          margin-top: 18px;
           border: 1px solid #242b36;
           border-radius: 8px;
           background:
-            linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px),
-            linear-gradient(90deg, rgba(255,255,255,0.035) 1px, transparent 1px),
-            #10141a;
-          background-size: 100% 25%, 12.5% 100%, auto;
+            linear-gradient(180deg, rgba(24, 224, 111, 0.055), rgba(24, 224, 111, 0.01)),
+            #11161d;
+          overflow: hidden;
         }
-        .sparkline path {
-          fill: none;
-          stroke: #18e06f;
-          stroke-width: 3;
+        .growthChart svg {
+          display: block;
+          width: 100%;
+          height: 100%;
+        }
+        .chartGridLine {
+          stroke: rgba(166, 173, 186, 0.16);
+          stroke-width: 0.45;
           vector-effect: non-scaling-stroke;
         }
-        .sparkline .sparklineArea {
-          fill: rgba(24, 224, 111, 0.12);
+        .chartLine {
+          fill: none;
+          stroke: #18e06f;
+          stroke-width: 2.1;
+          vector-effect: non-scaling-stroke;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+        }
+        .chartArea {
+          fill: rgba(24, 224, 111, 0.16);
           stroke: none;
         }
-        .sparkline.empty {
+        .chartPoint {
+          fill: #18e06f;
+          stroke: #11161d;
+          stroke-width: 0.6;
+          vector-effect: non-scaling-stroke;
+        }
+        .growthChart--empty {
           display: grid;
           place-items: center;
           color: #a6adba;
-          background: #10141a;
+          background: #11161d;
         }
         .sparkLabels {
           display: grid;
@@ -2112,15 +2148,26 @@ export default function PlaylistManager() {
         }
         .growthBars {
           display: grid;
-          gap: 12px;
-          margin-top: 18px;
+          gap: 8px;
+          margin-top: 14px;
         }
         .growthBar {
           display: grid;
-          grid-template-columns: 52px minmax(140px, 1fr) minmax(90px, 0.7fr) 70px;
+          grid-template-columns: 42px minmax(0, 1fr) 110px 64px;
           align-items: center;
-          gap: 12px;
+          gap: 10px;
+          min-height: 58px;
+          padding: 7px 0;
+          border-top: 1px solid #202630;
           min-width: 0;
+        }
+        .growthBar:first-child {
+          border-top: 0;
+        }
+        .growthBar .artwork--sm,
+        .growthBar .coverFallback.artwork--sm {
+          width: 42px;
+          height: 42px;
         }
         .growthBar div {
           min-width: 0;
@@ -2135,11 +2182,12 @@ export default function PlaylistManager() {
         .growthBar b {
           text-align: right;
           color: #18e06f;
+          font-size: 14px;
         }
         .barTrack {
-          height: 8px;
+          height: 6px;
           border-radius: 999px;
-          background: #222731;
+          background: #252c37;
           overflow: hidden;
         }
         .barTrack i {
@@ -3000,6 +3048,16 @@ export default function PlaylistManager() {
           .dashboardHero {
             display: grid;
             align-items: stretch;
+          }
+          .panelHeader {
+            display: grid;
+          }
+          .chartFilters {
+            justify-content: stretch;
+          }
+          .chartFilters select {
+            width: 100%;
+            max-width: none;
           }
           .growthBar {
             grid-template-columns: 42px minmax(0, 1fr) 58px;
