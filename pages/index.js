@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowDown, ArrowUp, Lock, Shuffle, TimerReset, Trash2, Unlock } from "lucide-react";
+import { ArrowDown, ArrowUp, GripVertical, Lock, Shuffle, TimerReset, Trash2, Unlock } from "lucide-react";
 import { getSupabaseBrowserClient } from "../lib/supabaseBrowser";
 
 async function api(path, { method = "GET", accessToken, body } = {}) {
@@ -195,6 +195,9 @@ export default function PlaylistManager() {
   const [view, setView] = useState("manager");
   const [dashboardSummary, setDashboardSummary] = useState(null);
   const [dashboardSeries, setDashboardSeries] = useState(null);
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const [activeTool, setActiveTool] = useState("add");
+  const [dragTrackId, setDragTrackId] = useState("");
 
   useEffect(() => {
     const client = getSupabaseBrowserClient();
@@ -412,6 +415,25 @@ export default function PlaylistManager() {
           track_id: track.track_id,
           dir,
           steps: 1,
+        },
+      });
+      await loadSelectedPlaylist();
+    });
+  }
+
+  async function moveTrackTo(track, targetPosition) {
+    const from = Number(track.position);
+    const to = Number(targetPosition);
+    if (!Number.isFinite(from) || !Number.isFinite(to) || from === to) return;
+    await run("Track reordered", async () => {
+      await api("/api/playlist-items/move", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: {
+          playlist_id: playlistId,
+          track_id: track.track_id,
+          dir: to < from ? "up" : "down",
+          steps: Math.abs(to - from),
         },
       });
       await loadSelectedPlaylist();
@@ -798,125 +820,110 @@ export default function PlaylistManager() {
                 {formatNumber(playlist?.tracks_total)} Tracks · {formatNumber(playlist?.followers)} Followers
               </p>
             </div>
-            <div className="headerActions">
-              <Field label="Auto-removal weeks">
-                <input
-                  type="number"
-                  min="1"
-                  max="104"
-                  value={autoWeeks}
-                  onChange={(e) => setAutoWeeks(e.target.value)}
-                />
-              </Field>
-              <button disabled={busy || !playlistId} onClick={saveAutoRemoval}>
-                Set Auto-Removal
-              </button>
-              <button disabled={busy || !playlistId} onClick={cleanupNow}>
-                Trigger Cleanup
-              </button>
-            </div>
           </div>
 
-          <div className="addTrack">
-            <strong>Add Track</strong>
-            <input
-              value={trackLink}
-              onChange={(e) => setTrackLink(e.target.value)}
-              placeholder="...paste song link"
-            />
-            <Field label="pos">
-              <input value={trackPosition} onChange={(e) => setTrackPosition(e.target.value)} />
-            </Field>
-            <Field label="exp">
-              <input value={trackExpiry} onChange={(e) => setTrackExpiry(e.target.value)} />
-            </Field>
-            <button disabled={busy || !playlistId || !trackLink.trim()} onClick={addTrack}>
-              +
+          <section className={`toolsPanel ${toolsOpen ? "toolsPanel--open" : ""}`}>
+            <button className="toolsToggle" onClick={() => setToolsOpen(!toolsOpen)}>
+              <span>Playlist Tools</span>
+              <small>{toolsOpen ? "Hide" : "Show"}</small>
             </button>
-          </div>
-
-          <div className="flexPanel">
-            <div className="flexPanelHeader">
-              <div>
-                <h2>Flex Slots</h2>
-                <p>{flexSlots.length} rotating locked {flexSlots.length === 1 ? "position" : "positions"}</p>
-              </div>
-              <button
-                className="tooltipButton"
-                title="Rotate all flex slots now using the reference playlist."
-                data-tooltip="Rotate all flex slots now using the reference playlist."
-                disabled={busy || !playlistId || !flexSlots.length || !flexReference.trim()}
-                onClick={() => rotateFlex()}
-              >
-                Rotate Now
-              </button>
-            </div>
-            <div className="flexSettings">
-              <input
-                value={flexReference}
-                onChange={(e) => setFlexReference(e.target.value)}
-                placeholder="Reference playlist link"
-              />
-              <select value={flexInterval} onChange={(e) => setFlexInterval(e.target.value)}>
-                <option value="daily">Daily</option>
-                <option value="weekly">Weekly</option>
-                <option value="monthly">Monthly</option>
-              </select>
-              <label className="toggleField">
-                <input type="checkbox" checked={flexEnabled} onChange={(e) => setFlexEnabled(e.target.checked)} />
-                Enabled
-              </label>
-              <button
-                className="tooltipButton"
-                title="Save the reference playlist, rotation interval, and enabled state."
-                data-tooltip="Save the reference playlist, rotation interval, and enabled state."
-                disabled={busy || !playlistId}
-                onClick={saveFlexSettings}
-              >
-                Save
-              </button>
-            </div>
-            {flexReferenceMeta ? (
-              <div className="referencePlaylist">
-                <Artwork src={flexReferenceMeta.image} alt="" size="lg" />
-                <div>
-                  <span>Reference Playlist</span>
-                  <strong>{flexReferenceMeta.name || flexReferenceMeta.id}</strong>
-                  <small>
-                    {formatNumber(flexReferenceMeta.tracks_total)} tracks
-                    {flexReferenceMeta.owner_name ? ` · by ${flexReferenceMeta.owner_name}` : ""}
-                    {flexReferenceMeta.followers !== null && flexReferenceMeta.followers !== undefined ? ` · ${formatNumber(flexReferenceMeta.followers)} followers` : ""}
-                  </small>
-                </div>
-              </div>
-            ) : null}
-            <div className="flexSlotList">
-              {flexSlots.map((slot) => (
-                <div className="flexSlot" key={slot.id}>
-                  <span>#{Number(slot.position) + 1}</span>
-                  <strong>{slot.current_track_name || slot.current_track_id}</strong>
-                  <button
-                    className="tooltipButton"
-                    title="Replace this flex song with a random track from the reference playlist."
-                    data-tooltip="Replace this flex song with a random track from the reference playlist."
-                    disabled={busy || !flexReference.trim()}
-                    onClick={() => rotateFlex(slot.id)}
-                  >
-                    Rotate
+            <div className="toolsBody">
+              <nav className="toolsNav" aria-label="Playlist tools">
+                {[
+                  ["add", "Add song"],
+                  ["expiry", "Expiry"],
+                  ["flex", "Flex"],
+                ].map(([key, label]) => (
+                  <button key={key} className={activeTool === key ? "selected" : ""} onClick={() => setActiveTool(key)}>
+                    {label}
                   </button>
-                  <button
-                    className="danger tooltipButton"
-                    title="Remove this flex slot. The song itself stays in the playlist unless removed separately."
-                    data-tooltip="Remove this flex slot. The song itself stays in the playlist unless removed separately."
-                    disabled={busy}
-                    onClick={() => removeFlexSlot(slot)}
-                  >
-                    Remove
-                  </button>
-                </div>
-              ))}
+                ))}
+              </nav>
+              <div className="toolCard">
+                {activeTool === "add" ? (
+                  <>
+                    <h2>Add song</h2>
+                    <p>Add a Spotify track by URL or URI, optionally at a fixed position and with a per-song expiry.</p>
+                    <div className="toolGrid addToolGrid">
+                      <input value={trackLink} onChange={(e) => setTrackLink(e.target.value)} placeholder="Spotify song link or URI" />
+                      <Field label="Position">
+                        <input value={trackPosition} onChange={(e) => setTrackPosition(e.target.value)} />
+                      </Field>
+                      <Field label="Expiry weeks">
+                        <input value={trackExpiry} onChange={(e) => setTrackExpiry(e.target.value)} />
+                      </Field>
+                      <button disabled={busy || !playlistId || !trackLink.trim()} onClick={addTrack}>Add song</button>
+                    </div>
+                  </>
+                ) : null}
+                {activeTool === "expiry" ? (
+                  <>
+                    <h2>Expiry</h2>
+                    <p>Automatically remove unlocked songs after the selected number of weeks. Manual per-song expiry still overrides this.</p>
+                    <div className="toolGrid expiryToolGrid">
+                      <Field label="Default expiry weeks">
+                        <input type="number" min="1" max="104" value={autoWeeks} onChange={(e) => setAutoWeeks(e.target.value)} />
+                      </Field>
+                      <button disabled={busy || !playlistId} onClick={saveAutoRemoval}>Save expiry</button>
+                      <button disabled={busy || !playlistId} onClick={cleanupNow}>Run expiry check now</button>
+                    </div>
+                  </>
+                ) : null}
+                {activeTool === "flex" ? (
+                  <>
+                    <div className="flexPanelHeader">
+                      <div>
+                        <h2>Flex</h2>
+                        <p>Rotate locked flex slots from a reference playlist on your schedule. Use public/editorial playlists when Spotify allows access.</p>
+                      </div>
+                      <button className="tooltipButton" data-tooltip="Rotate all flex slots now using the reference playlist." disabled={busy || !playlistId || !flexSlots.length || !flexReference.trim()} onClick={() => rotateFlex()}>
+                        Rotate now
+                      </button>
+                    </div>
+                    <div className="flexSettings">
+                      <input value={flexReference} onChange={(e) => setFlexReference(e.target.value)} placeholder="Reference playlist link" />
+                      <select value={flexInterval} onChange={(e) => setFlexInterval(e.target.value)}>
+                        <option value="daily">Daily</option>
+                        <option value="weekly">Weekly</option>
+                        <option value="monthly">Monthly</option>
+                      </select>
+                      <label className="toggleField">
+                        <input type="checkbox" checked={flexEnabled} onChange={(e) => setFlexEnabled(e.target.checked)} />
+                        Enabled
+                      </label>
+                      <button className="tooltipButton" data-tooltip="Save the reference playlist, rotation interval, and enabled state." disabled={busy || !playlistId} onClick={saveFlexSettings}>
+                        Save flex
+                      </button>
+                    </div>
+                    {flexReferenceMeta ? (
+                      <div className="referencePlaylist">
+                        <Artwork src={flexReferenceMeta.image} alt="" size="lg" />
+                        <div>
+                          <span>Reference Playlist</span>
+                          <strong>{flexReferenceMeta.name || flexReferenceMeta.id}</strong>
+                          <small>
+                            {formatNumber(flexReferenceMeta.tracks_total)} tracks
+                            {flexReferenceMeta.owner_name ? ` · by ${flexReferenceMeta.owner_name}` : ""}
+                            {flexReferenceMeta.followers !== null && flexReferenceMeta.followers !== undefined ? ` · ${formatNumber(flexReferenceMeta.followers)} followers` : ""}
+                          </small>
+                        </div>
+                      </div>
+                    ) : null}
+                    <div className="flexSlotList">
+                      {flexSlots.map((slot) => (
+                        <div className="flexSlot" key={slot.id}>
+                          <span>#{Number(slot.position) + 1}</span>
+                          <strong>{slot.current_track_name || slot.current_track_id}</strong>
+                          <button className="tooltipButton" data-tooltip="Replace this flex song with a random track from the reference playlist." disabled={busy || !flexReference.trim()} onClick={() => rotateFlex(slot.id)}>Rotate</button>
+                          <button className="danger tooltipButton" data-tooltip="Remove this flex slot. The song itself stays in the playlist unless removed separately." disabled={busy} onClick={() => removeFlexSlot(slot)}>Remove</button>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                ) : null}
+              </div>
             </div>
-          </div>
+          </section>
 
           <div className="trackPanel">
             <div className="trackPanelHeader">
@@ -931,7 +938,28 @@ export default function PlaylistManager() {
               {filteredTracks.map((track) => {
                 const isFlexTrack = activeFlexTrackIds.has(track.track_id);
                 return (
-                  <article key={`${track.position}-${track.track_id}`} className={`trackRow ${isFlexTrack ? "trackRow--flex" : ""}`}>
+                  <article
+                    key={`${track.position}-${track.track_id}`}
+                    className={`trackRow ${isFlexTrack ? "trackRow--flex" : ""} ${dragTrackId === track.track_id ? "trackRow--dragging" : ""}`}
+                    draggable={!busy}
+                    onDragStart={(e) => {
+                      setDragTrackId(track.track_id);
+                      e.dataTransfer.effectAllowed = "move";
+                      e.dataTransfer.setData("text/plain", track.track_id);
+                    }}
+                    onDragOver={(e) => {
+                      if (!busy) e.preventDefault();
+                    }}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      const sourceId = e.dataTransfer.getData("text/plain");
+                      const source = tracks.find((item) => item.track_id === sourceId);
+                      setDragTrackId("");
+                      if (source) moveTrackTo(source, track.position);
+                    }}
+                    onDragEnd={() => setDragTrackId("")}
+                  >
+                    <div className="dragHandle" aria-hidden="true"><GripVertical /></div>
                     <div className="pos">{Number(track.position) + 1}</div>
                     <Artwork src={track.cover_url} alt="" size="sm" />
                     <div className="trackMeta">
@@ -1448,38 +1476,76 @@ export default function PlaylistManager() {
           margin-top: 10px;
           font-size: 16px;
         }
-        .headerActions {
-          display: flex;
-          align-items: end;
-          gap: 14px;
-          flex-wrap: wrap;
-          justify-content: flex-end;
-        }
-        .headerActions input, .addTrack .field input {
-          width: 72px;
-        }
-        .addTrack {
-          display: grid;
-          grid-template-columns: auto minmax(180px, 1fr) auto auto 52px;
-          align-items: end;
-          gap: 12px;
-        }
-        .addTrack strong {
-          font-size: 18px;
-          padding-bottom: 11px;
-        }
-        .addTrack button {
-          min-height: 48px;
-          font-size: 26px;
-          font-weight: 800;
-          padding: 4px 14px;
-        }
-        .flexPanel {
-          display: grid;
-          gap: 12px;
+        .toolsPanel {
           border: 1px solid #2a303b;
           background: #181c23;
-          padding: 16px 18px;
+        }
+        .toolsToggle {
+          width: 100%;
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          border: 0;
+          border-radius: 0;
+          background: #222831;
+          padding: 14px 18px;
+          text-align: left;
+        }
+        .toolsToggle span {
+          font-size: 18px;
+          font-weight: 800;
+        }
+        .toolsToggle small {
+          color: #a6adba;
+          font-weight: 800;
+        }
+        .toolsBody {
+          display: none;
+          grid-template-columns: 148px minmax(0, 1fr);
+          gap: 16px;
+          padding: 16px 18px 18px;
+        }
+        .toolsPanel--open .toolsBody {
+          display: grid;
+        }
+        .toolsNav {
+          display: grid;
+          align-content: start;
+          gap: 8px;
+        }
+        .toolsNav button {
+          border-color: #303743;
+          background: transparent;
+          color: #a6adba;
+          text-align: left;
+        }
+        .toolsNav button.selected {
+          border-color: #18e06f;
+          color: #18e06f;
+          background: rgba(24, 224, 111, 0.08);
+        }
+        .toolCard {
+          display: grid;
+          gap: 14px;
+          min-width: 0;
+        }
+        .toolCard h2 {
+          font-size: 20px;
+        }
+        .toolCard p {
+          color: #a6adba;
+          line-height: 1.45;
+        }
+        .toolGrid {
+          display: grid;
+          gap: 12px;
+          align-items: end;
+        }
+        .addToolGrid {
+          grid-template-columns: minmax(220px, 1fr) 88px 110px auto;
+        }
+        .expiryToolGrid {
+          grid-template-columns: 150px auto auto;
         }
         .flexPanelHeader,
         .flexSettings,
@@ -1585,12 +1651,28 @@ export default function PlaylistManager() {
         }
         .trackRow {
           display: grid;
-          grid-template-columns: 44px 52px minmax(180px, 1fr) minmax(74px, auto) minmax(330px, auto);
+          grid-template-columns: 28px 44px 52px minmax(180px, 1fr) minmax(74px, auto) minmax(330px, auto);
           align-items: center;
           gap: 12px;
           min-height: 76px;
           padding: 12px 16px;
           border-top: 1px solid #202630;
+        }
+        .trackRow[draggable="true"] {
+          cursor: grab;
+        }
+        .trackRow--dragging {
+          opacity: 0.55;
+        }
+        .dragHandle {
+          color: #637083;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+        }
+        .dragHandle svg {
+          width: 18px;
+          height: 18px;
         }
         .trackRow--flex {
           border-left: 3px solid #18e06f;
@@ -1679,17 +1761,17 @@ export default function PlaylistManager() {
           height: 38px;
           min-height: 38px;
           padding: 0;
-          border-color: #2fdc7c;
-          background: rgba(24, 224, 111, 0.06);
-          color: #2fe881;
+          border-color: #18e06f;
+          background: transparent;
+          color: #18e06f;
           border-radius: 7px;
           line-height: 1;
-          box-shadow: inset 0 0 0 1px rgba(24, 224, 111, 0.08);
+          box-shadow: none;
           transition: background 120ms ease, border-color 120ms ease, color 120ms ease, transform 120ms ease;
         }
         .actionButton:hover:not(:disabled),
         .actionButton:focus-visible:not(:disabled) {
-          background: rgba(24, 224, 111, 0.15);
+          background: rgba(24, 224, 111, 0.1);
           border-color: #18e06f;
           color: #f4fff8;
           transform: translateY(-1px);
@@ -1700,10 +1782,10 @@ export default function PlaylistManager() {
           stroke-width: 2.15;
         }
         .actionButton.danger {
-          border-color: rgba(255, 77, 77, 0.7);
-          background: rgba(255, 77, 77, 0.08);
-          color: #ff6b6b;
-          box-shadow: inset 0 0 0 1px rgba(255, 77, 77, 0.08);
+          border-color: #ff4d4d;
+          background: transparent;
+          color: #ff4d4d;
+          box-shadow: none;
         }
         .actionButton.danger:hover:not(:disabled),
         .actionButton.danger:focus-visible:not(:disabled) {
@@ -1745,7 +1827,7 @@ export default function PlaylistManager() {
           transition-delay: 420ms;
         }
         .trackRow:first-child .tooltipButton::after,
-        .flexPanel .tooltipButton::after {
+        .toolsPanel .tooltipButton::after {
           bottom: auto;
           top: calc(100% + 10px);
         }
@@ -1754,14 +1836,15 @@ export default function PlaylistManager() {
             grid-template-columns: minmax(280px, 330px) minmax(0, 1fr);
           }
           .trackRow {
-            grid-template-columns: 42px 52px minmax(160px, 1fr) minmax(70px, auto);
+            grid-template-columns: 28px 42px 52px minmax(160px, 1fr) minmax(70px, auto);
           }
           .rowActions {
-            grid-column: 3 / -1;
+            grid-column: 4 / -1;
             grid-row: 2;
             justify-content: start;
           }
           .badges {
+            grid-column: 5 / -1;
             justify-content: flex-end;
           }
           .trackMeta small {
@@ -1809,15 +1892,11 @@ export default function PlaylistManager() {
           .playlistHeader {
             grid-template-columns: auto minmax(0, 1fr);
           }
-          .headerActions {
-            grid-column: 1 / -1;
-            justify-content: flex-start;
-          }
           .trackRow {
-            grid-template-columns: 42px 52px minmax(0, 1fr);
+            grid-template-columns: 28px 42px 52px minmax(0, 1fr);
           }
           .badges {
-            grid-column: 3;
+            grid-column: 4;
             justify-content: flex-start;
           }
         }
@@ -1874,19 +1953,10 @@ export default function PlaylistManager() {
             width: 72px;
             height: 72px;
           }
-          .headerActions {
-            display: grid;
+          .toolsBody,
+          .addToolGrid,
+          .expiryToolGrid {
             grid-template-columns: 1fr;
-            align-items: stretch;
-            justify-content: stretch;
-          }
-          .headerActions .field {
-            width: 100%;
-          }
-          .headerActions input,
-          .headerActions button {
-            width: 100%;
-            box-sizing: border-box;
           }
           .flexSettings,
           .flexSlot {
@@ -1896,18 +1966,6 @@ export default function PlaylistManager() {
           .flexPanelHeader {
             display: grid;
             align-items: stretch;
-          }
-          .addTrack {
-            grid-template-columns: 1fr;
-            align-items: stretch;
-          }
-          .addTrack strong {
-            padding-bottom: 0;
-          }
-          .addTrack input,
-          .addTrack button {
-            width: 100%;
-            box-sizing: border-box;
           }
           .playlistHeader h2 {
             font-size: 14px;
@@ -1924,7 +1982,7 @@ export default function PlaylistManager() {
             width: 100%;
           }
           .trackRow {
-            grid-template-columns: 34px minmax(0, 1fr);
+            grid-template-columns: 24px 34px minmax(0, 1fr);
             gap: 10px;
             padding: 12px;
           }
@@ -1932,13 +1990,13 @@ export default function PlaylistManager() {
             display: none;
           }
           .trackMeta {
-            grid-column: 2;
+            grid-column: 3;
           }
           .badges {
-            grid-column: 2;
+            grid-column: 3;
           }
           .rowActions {
-            grid-column: 2;
+            grid-column: 3;
             grid-template-columns: repeat(6, 40px);
             justify-content: stretch;
           }
