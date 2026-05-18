@@ -193,6 +193,7 @@ function GrowthBars({ items = [] }) {
 export default function PlaylistManager() {
   const [supabase, setSupabase] = useState(null);
   const [session, setSession] = useState(null);
+  const [authRefreshTick, setAuthRefreshTick] = useState(0);
   const [userContext, setUserContext] = useState(null);
   const [connections, setConnections] = useState([]);
   const [connectionId, setConnectionId] = useState("");
@@ -239,19 +240,25 @@ export default function PlaylistManager() {
       setSession(data.session || null);
     });
 
-    const { data: listener } = client.auth.onAuthStateChange((_event, nextSession) => {
+    const { data: listener } = client.auth.onAuthStateChange((event, nextSession) => {
       setSession(nextSession || null);
-      setUserContext(null);
-      setConnections([]);
-      setConnectionId("");
-      setPlaylists([]);
-      setPlaylistId("");
-      setPlaylist(null);
-      setTracks([]);
-      setFlexSettings(null);
-      setFlexSlots([]);
-      setFlexReferenceMeta(null);
-      setFlexReferenceIssue(null);
+      if (!nextSession || event === "SIGNED_OUT" || event === "USER_DELETED") {
+        setUserContext(null);
+        setConnections([]);
+        setConnectionId("");
+        setPlaylists([]);
+        setPlaylistId("");
+        setPlaylist(null);
+        setTracks([]);
+        setFlexSettings(null);
+        setFlexSlots([]);
+        setFlexReferenceMeta(null);
+        setFlexReferenceIssue(null);
+        return;
+      }
+      if (event === "SIGNED_IN" || event === "TOKEN_REFRESHED" || event === "INITIAL_SESSION") {
+        setAuthRefreshTick((value) => value + 1);
+      }
     });
 
     return () => listener.subscription.unsubscribe();
@@ -260,7 +267,7 @@ export default function PlaylistManager() {
   useEffect(() => {
     if (!session?.access_token) return;
     loadCurrentUser();
-  }, [session?.access_token]);
+  }, [session?.access_token, authRefreshTick]);
 
   useEffect(() => {
     if (!userContext?.linked) return;
