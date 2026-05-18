@@ -42,9 +42,9 @@ function formatShortDate(value) {
   return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(d);
 }
 
-function Field({ label, children }) {
+function Field({ label, children, className = "" }) {
   return (
-    <label className="field">
+    <label className={`field ${className}`.trim()}>
       <span>{label}</span>
       {children}
     </label>
@@ -860,7 +860,7 @@ export default function PlaylistManager() {
             <strong>{userContext.email}</strong>
           </div>
 
-          <Field label="Account">
+          <Field label="Account" className="accountField">
             <select value={connectionId} onChange={(e) => setConnectionId(e.target.value)}>
               <option value="">Select account</option>
               {connections.map((c) => (
@@ -1540,8 +1540,16 @@ export default function PlaylistManager() {
         .field input {
           width: 100%;
         }
-        .sidebar .field {
-          grid-template-columns: 1fr;
+        .accountField {
+          grid-template-columns: auto minmax(0, 1fr);
+          align-items: center;
+          gap: 18px;
+        }
+        .accountField span {
+          white-space: nowrap;
+        }
+        .accountField select {
+          justify-self: stretch;
         }
         .sidebar {
           display: grid;
