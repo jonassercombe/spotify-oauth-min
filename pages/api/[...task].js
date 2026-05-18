@@ -2101,15 +2101,34 @@ const routes = {
      const days = Math.max(1, Math.min(365, Number(req.query.days || "30")));
      const gran = (req.query.granularity || "daily").toLowerCase(); // daily|weekly|monthly
      const scope = (req.query.scope || "total").toLowerCase();       // total|by_playlist
+     const connection_id = String(req.query.connection_id || "");
+     const playlist_id = String(req.query.playlist_id || "");
    
      const fromDay = new Date(Date.now() - days*24*3600*1000);
      const fromStr = fromDay.toISOString().slice(0,10);
    
+     let playlistFilter = "";
+     if (playlist_id) {
+       playlistFilter = `&playlist_id=eq.${encodeURIComponent(playlist_id)}`;
+     } else if (connection_id) {
+       const plR = await fetch(
+         SUPABASE_URL +
+           `/rest/v1/playlists?select=id&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+           `&connection_id=eq.${encodeURIComponent(connection_id)}&is_owner=is.true&is_public=is.true`,
+         { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" }
+       );
+       const accountPlaylists = plR.ok ? JSON.parse(await plR.text() || "[]") : [];
+       const ids = accountPlaylists.map((p) => p.id).filter(Boolean);
+       if (!ids.length) return json(res, 200, { ok: true, granularity: gran, labels: [], followers: [], growth: [] });
+       playlistFilter = `&playlist_id=in.(${ids.map((id) => `"${id}"`).join(",")})`;
+     }
+
      const snapPath =
        `/rest/v1/playlist_followers_daily` +
        `?select=playlist_id,day,followers` +
        `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
        `&day=gte.${encodeURIComponent(fromStr)}` +
+       playlistFilter +
        `&order=day.asc`;
      const sResp = await fetch(SUPABASE_URL + snapPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
      if (!sResp.ok) return bad(res, 500, `supabase_error: ${await sResp.text()}`);
@@ -2153,9 +2172,11 @@ const routes = {
      const labels = Array.from(agg.keys()).sort();
      // Growth total:
      const growth = [];
+     const followers = [];
      for (let i = 0; i < labels.length; i++) {
        const curr = agg.get(labels[i]).followersTotal;
        const prev = i ? agg.get(labels[i-1]).followersTotal : curr;
+       followers.push(curr);
        growth.push(curr - prev);
      }
    
@@ -2164,6 +2185,7 @@ const routes = {
          ok: true,
          granularity: gran,
          labels,               // z.B. Tage/Wochen/Monate
+         followers,
          growth,               // Delta followers pro Bucket (gesamt)
        });
      }
@@ -2272,23 +2294,51 @@ const routes = {
       auto_remove_weeks: p.auto_remove_weeks ?? null,
     }));
 
-  // 3) kommende Auto-Removals
-  const playlistIds = playlists.map((p) => p.id).filter(Boolean);
-  const todayStr = new Date().toISOString().slice(0,10);
-  const horizonStr = new Date(Date.now() + 14*24*3600*1000).toISOString().slice(0,10);
-  let upcoming_removals = [];
-  if (playlistIds.length) {
-    const upcPath =
-      `/rest/v1/upcoming_removals_ui` +
-      `?select=playlist_id,playlist_name,position,track_id,track_name,artist_names,added_at,auto_remove_weeks,removes_on` +
-      `&removes_on=gte.${encodeURIComponent(todayStr)}` +
-      `&removes_on=lte.${encodeURIComponent(horizonStr)}` +
-      `&playlist_id=in.(${playlistIds.map((id) => `"${id}"`).join(",")})` +
-      `&order=removes_on.asc,playlist_name.asc,position.asc` +
-      `&limit=${removals_limit}`;
-    const uResp = await fetch(SUPABASE_URL + upcPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
-    upcoming_removals = uResp.ok ? JSON.parse(await uResp.text() || "[]") : [];
-  }
+	  // 3) kommende Auto-Removals
+	  const playlistIds = playlists.map((p) => p.id).filter(Boolean);
+	  const todayStr = new Date().toISOString().slice(0,10);
+	  const horizonStr = new Date(Date.now() + 14*24*3600*1000).toISOString().slice(0,10);
+	  let upcoming_removals = [];
+	  if (playlistIds.length) {
+	    const rpcResp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/dashboard_expiring_next`, {
+	      method: "POST",
+	      headers: { apikey: SRK, Authorization: `Bearer ${SRK}`, "Content-Type": "application/json" },
+	      body: JSON.stringify({ p_bubble_user_id: String(bubble_user_id), p_limit: removals_limit, p_connection_id: null })
+	    });
+	    if (rpcResp.ok) {
+	      const rpcRows = JSON.parse(await rpcResp.text() || "[]");
+	      upcoming_removals = rpcRows.map((row) => {
+	        const daysUntil = Number(row.days_until_remove ?? row.days_until_removal);
+	        const removesOn = row.removes_on || row.remove_on || (Number.isFinite(daysUntil)
+	          ? new Date(Date.now() + Math.max(0, daysUntil) * 24*3600*1000).toISOString().slice(0,10)
+	          : null);
+	        return {
+	          playlist_id: row.playlist_id,
+	          playlist_name: row.playlist_name || row.name,
+	          position: row.position,
+	          track_id: row.track_id,
+	          track_name: row.track_name || row.title,
+	          artist_names: row.artist_names || row.artist,
+	          added_at: row.added_at,
+	          auto_remove_weeks: row.auto_remove_weeks || row.expiry_weeks,
+	          removes_on: removesOn,
+	          days_until_remove: Number.isFinite(daysUntil) ? Math.max(0, daysUntil) : null,
+	        };
+	      }).filter((row) => !row.removes_on || row.removes_on <= horizonStr);
+	    }
+	    if (!upcoming_removals.length) {
+	      const upcPath =
+	        `/rest/v1/upcoming_removals_ui` +
+	        `?select=playlist_id,playlist_name,position,track_id,track_name,artist_names,added_at,auto_remove_weeks,removes_on` +
+	        `&removes_on=gte.${encodeURIComponent(todayStr)}` +
+	        `&removes_on=lte.${encodeURIComponent(horizonStr)}` +
+	        `&playlist_id=in.(${playlistIds.map((id) => `"${id}"`).join(",")})` +
+	        `&order=removes_on.asc,playlist_name.asc,position.asc` +
+	        `&limit=${removals_limit}`;
+	      const uResp = await fetch(SUPABASE_URL + upcPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
+	      upcoming_removals = uResp.ok ? JSON.parse(await uResp.text() || "[]") : [];
+	    }
+	  }
 
   let flex_enabled_count = 0;
   let flex_due_count = 0;

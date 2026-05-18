@@ -148,7 +148,7 @@ function reorderTracks(list, sourceTrackId, targetPosition) {
 
 function Sparkline({ values = [] }) {
   const points = values.map((v) => Number(v) || 0);
-  if (!points.length) return <div className="sparkline empty" />;
+  if (!points.length) return <div className="sparkline empty"><span>No growth data yet</span></div>;
   const min = Math.min(...points);
   const max = Math.max(...points);
   const span = max - min || 1;
@@ -157,8 +157,10 @@ function Sparkline({ values = [] }) {
     const y = 54 - ((v - min) / span) * 46;
     return `${i ? "L" : "M"}${x.toFixed(2)},${y.toFixed(2)}`;
   }).join(" ");
+  const area = `${d} L100,58 L0,58 Z`;
   return (
     <svg className="sparkline" viewBox="0 0 100 60" preserveAspectRatio="none" aria-hidden="true">
+      <path className="sparklineArea" d={area} />
       <path d={d} />
     </svg>
   );
@@ -224,6 +226,9 @@ export default function PlaylistManager() {
   const [view, setView] = useState("manager");
   const [dashboardSummary, setDashboardSummary] = useState(null);
   const [dashboardSeries, setDashboardSeries] = useState(null);
+  const [dashboardRange, setDashboardRange] = useState("month");
+  const [dashboardConnectionId, setDashboardConnectionId] = useState("");
+  const [dashboardPlaylistId, setDashboardPlaylistId] = useState("");
   const [toolsOpen, setToolsOpen] = useState(false);
   const [activeTool, setActiveTool] = useState("add");
   const [dragTrackId, setDragTrackId] = useState("");
@@ -283,10 +288,21 @@ export default function PlaylistManager() {
   }, [userContext?.linked]);
 
   useEffect(() => {
+    if (!userContext?.linked || view !== "dashboard") return;
+    loadDashboard();
+  }, [dashboardRange, dashboardConnectionId, dashboardPlaylistId, view]);
+
+  useEffect(() => {
     if (!userContext?.linked || !connectionId) return;
     writeStoredSelection(userContext, { connectionId });
     loadPlaylists();
   }, [userContext?.linked, connectionId]);
+
+  useEffect(() => {
+    if (!dashboardPlaylistId) return;
+    const stillAvailable = playlists.some((p) => p.id === dashboardPlaylistId);
+    if (!stillAvailable) setDashboardPlaylistId("");
+  }, [playlists, dashboardPlaylistId]);
 
   useEffect(() => {
     if (!playlistId) {
@@ -726,9 +742,18 @@ export default function PlaylistManager() {
   async function loadDashboard() {
     if (!session?.access_token) return;
     return run("Dashboard loaded", async () => {
+      const rangeDays = dashboardRange === "year" ? 365 : dashboardRange === "week" ? 7 : 30;
+      const granularity = dashboardRange === "year" ? "monthly" : dashboardRange === "week" ? "daily" : "daily";
+      const seriesQs = new URLSearchParams({
+        days: String(rangeDays),
+        granularity,
+        scope: "total",
+      });
+      if (dashboardConnectionId) seriesQs.set("connection_id", dashboardConnectionId);
+      if (dashboardPlaylistId) seriesQs.set("playlist_id", dashboardPlaylistId);
       const [summary, series] = await Promise.all([
-        api("/api/dashboard/summary?days=30&removals_limit=12", { accessToken: accessToken() }),
-        api("/api/dashboard/series?days=30&granularity=daily&scope=total", { accessToken: accessToken() }),
+        api(`/api/dashboard/summary?days=${rangeDays}&removals_limit=12`, { accessToken: accessToken() }),
+        api(`/api/dashboard/series?${seriesQs.toString()}`, { accessToken: accessToken() }),
       ]);
       setDashboardSummary(summary);
       setDashboardSeries(series);
@@ -1022,7 +1047,14 @@ export default function PlaylistManager() {
             <h2>Dashboard</h2>
             <p>{dashboardSummary?.totals?.playlists_count || 0} playlists · {formatNumber(dashboardSummary?.totals?.total_followers)} followers · {formatNumber(dashboardSummary?.totals?.total_tracks)} tracks</p>
           </div>
-          <button disabled={busy} onClick={loadDashboard}>Refresh</button>
+          <div className="dashboardActions">
+            <select value={dashboardRange} onChange={(e) => setDashboardRange(e.target.value)} aria-label="Dashboard range">
+              <option value="week">Week</option>
+              <option value="month">Month</option>
+              <option value="year">Year</option>
+            </select>
+            <button disabled={busy} onClick={loadDashboard}>Refresh</button>
+          </div>
         </div>
         <div className="metricGrid">
           <article>
@@ -1060,13 +1092,33 @@ export default function PlaylistManager() {
         </div>
         <div className="dashboardGrid">
           <section className="dashboardPanel growthPanel">
-            <div>
-              <h2>Growth Trend</h2>
-              <p>Daily follower delta over the last 30 days</p>
+            <div className="panelHeader">
+              <div>
+                <h2>Growth Trend</h2>
+                <p>Total follower development for the selected scope</p>
+              </div>
+              <div className="chartFilters">
+                <select value={dashboardConnectionId} onChange={(e) => {
+                  setDashboardConnectionId(e.target.value);
+                  setDashboardPlaylistId("");
+                }} aria-label="Dashboard account">
+                  <option value="">All accounts</option>
+                  {connections.map((c) => (
+                    <option key={c.id} value={c.id}>{c.display_name || c.spotify_user_id}</option>
+                  ))}
+                </select>
+                <select value={dashboardPlaylistId} onChange={(e) => setDashboardPlaylistId(e.target.value)} aria-label="Dashboard playlist">
+                  <option value="">All playlists</option>
+                  {playlists.map((p) => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))}
+                </select>
+              </div>
             </div>
-            <Sparkline values={dashboardSeries?.growth || []} />
+            <Sparkline values={dashboardSeries?.followers || dashboardSeries?.growth || []} />
             <div className="sparkLabels">
               <span>{dashboardSeries?.labels?.[0] ? formatShortDate(dashboardSeries.labels[0]) : ""}</span>
+              <strong>{formatDelta((dashboardSeries?.growth || []).reduce((sum, value) => sum + (Number(value) || 0), 0))}</strong>
               <span>{dashboardSeries?.labels?.at?.(-1) ? formatShortDate(dashboardSeries.labels.at(-1)) : ""}</span>
             </div>
           </section>
@@ -1878,6 +1930,18 @@ export default function PlaylistManager() {
           align-items: end;
           gap: 18px;
         }
+        .dashboardActions,
+        .chartFilters {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          flex-wrap: wrap;
+        }
+        .dashboardActions select,
+        .chartFilters select {
+          min-width: 132px;
+          height: 42px;
+        }
         .dashboardHero h2 {
           font-size: clamp(30px, 4vw, 48px);
           line-height: 1;
@@ -1922,10 +1986,30 @@ export default function PlaylistManager() {
         .growthPanel {
           min-height: 280px;
         }
+        .panelHeader {
+          display: flex;
+          justify-content: space-between;
+          align-items: start;
+          gap: 16px;
+        }
+        .chartFilters {
+          justify-content: flex-end;
+        }
+        .chartFilters select:last-child {
+          min-width: 220px;
+          max-width: 320px;
+        }
         .sparkline {
           width: 100%;
           height: 210px;
           margin-top: 22px;
+          border: 1px solid #242b36;
+          border-radius: 8px;
+          background:
+            linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(255,255,255,0.035) 1px, transparent 1px),
+            #10141a;
+          background-size: 100% 25%, 12.5% 100%, auto;
         }
         .sparkline path {
           fill: none;
@@ -1933,15 +2017,31 @@ export default function PlaylistManager() {
           stroke-width: 3;
           vector-effect: non-scaling-stroke;
         }
+        .sparkline .sparklineArea {
+          fill: rgba(24, 224, 111, 0.12);
+          stroke: none;
+        }
         .sparkline.empty {
-          background: #222731;
+          display: grid;
+          place-items: center;
+          color: #a6adba;
+          background: #10141a;
         }
         .sparkLabels {
-          display: flex;
+          display: grid;
+          grid-template-columns: 1fr auto 1fr;
+          align-items: center;
           justify-content: space-between;
           color: #a6adba;
           font-size: 13px;
           margin-top: 8px;
+        }
+        .sparkLabels strong {
+          color: #18e06f;
+          font-size: 14px;
+        }
+        .sparkLabels span:last-child {
+          text-align: right;
         }
         .topGrowing {
           display: grid;
