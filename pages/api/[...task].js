@@ -2384,6 +2384,27 @@ const routes = {
 	      const uResp = await fetch(SUPABASE_URL + upcPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
 	      upcoming_removals = uResp.ok ? JSON.parse(await uResp.text() || "[]") : [];
 	    }
+	    if (upcoming_removals.length) {
+	      const removalTrackIds = [...new Set(upcoming_removals.map((row) => row.track_id).filter(Boolean))];
+	      if (removalTrackIds.length) {
+	        const quotedTrackIds = removalTrackIds.map((id) => `"${encodeURIComponent(String(id))}"`).join(",");
+	        const itemsResp = await fetch(
+	          SUPABASE_URL +
+	            `/rest/v1/playlist_items?select=playlist_id,track_id,cover_url` +
+	            `&playlist_id=in.(${playlistIds.map((id) => `"${id}"`).join(",")})` +
+	            `&track_id=in.(${quotedTrackIds})`,
+	          { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" }
+	        );
+	        const itemRows = itemsResp.ok ? JSON.parse(await itemsResp.text() || "[]") : [];
+	        const coverByKey = new Map(itemRows.map((row) => [`${row.playlist_id}:${row.track_id}`, row.cover_url]));
+	        const playlistImageById = new Map(playlists.map((p) => [p.id, p.image]));
+	        upcoming_removals = upcoming_removals.map((row) => ({
+	          ...row,
+	          cover_url: row.cover_url || coverByKey.get(`${row.playlist_id}:${row.track_id}`) || null,
+	          playlist_image: playlistImageById.get(row.playlist_id) || null,
+	        }));
+	      }
+	    }
 	  }
 
   let flex_enabled_count = 0;

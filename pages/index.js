@@ -185,7 +185,7 @@ function GrowthChart({ values = [] }) {
   );
 }
 
-function GrowthBars({ items = [] }) {
+function GrowthBars({ items = [], selectedId = "", onSelect }) {
   const max = Math.max(1, ...items.map((item) => Math.abs(Number(item.delta) || 0)));
   return (
     <div className="growthBars">
@@ -193,7 +193,12 @@ function GrowthBars({ items = [] }) {
         const delta = Number(item.delta) || 0;
         const width = Math.max(4, Math.round((Math.abs(delta) / max) * 100));
         return (
-          <div className="growthBar" key={item.playlist_id}>
+          <button
+            type="button"
+            className={`growthBar ${selectedId === item.playlist_id ? "selected" : ""}`}
+            key={item.playlist_id}
+            onClick={() => onSelect?.(item.playlist_id)}
+          >
             <Artwork src={item.image} alt="" size="sm" />
             <div>
               <strong>{item.name || "Untitled playlist"}</strong>
@@ -203,7 +208,7 @@ function GrowthBars({ items = [] }) {
               <i style={{ width: `${width}%` }} />
             </div>
             <b>{formatDelta(delta)}</b>
-          </div>
+          </button>
         );
       })}
       {!items.length ? <p>No growth data yet.</p> : null}
@@ -1146,7 +1151,7 @@ export default function PlaylistManager() {
             <small>older than 24h</small>
           </article>
         </div>
-        <div className="dashboardGrid">
+        <div className="dashboardFocusGrid">
           <section className="dashboardPanel growthPanel">
             <div className="panelHeader">
               <div>
@@ -1178,25 +1183,19 @@ export default function PlaylistManager() {
               <span>{dashboardSeries?.labels?.at?.(-1) ? formatShortDate(dashboardSeries.labels.at(-1)) : ""}</span>
             </div>
           </section>
-          <section className="dashboardPanel">
-            <h2>Top Growing</h2>
-            {dashboardSummary?.top_growing ? (
-              <div className="topGrowing">
-                <Artwork src={dashboardSummary.top_growing.image} alt="" size="lg" />
-                <div>
-                  <strong>{dashboardSummary.top_growing.name}</strong>
-                  <span>+{formatNumber(dashboardSummary.top_growing.delta)} · {formatNumber(dashboardSummary.top_growing.followers_now)} followers</span>
-                </div>
-              </div>
-            ) : <p>No growth data yet.</p>}
-          </section>
           <section className="dashboardPanel rankPanel">
             <div>
-              <h2>Growth Ranking</h2>
-              <p>Best movers in the selected 30-day window</p>
+              <h2>Top Movers</h2>
+              <p>Click a playlist to show it in the graph</p>
             </div>
-            <GrowthBars items={dashboardSummary?.growth_rank || []} />
+            <GrowthBars
+              items={dashboardSummary?.growth_rank || []}
+              selectedId={dashboardPlaylistId}
+              onSelect={(id) => setDashboardPlaylistId(id)}
+            />
           </section>
+        </div>
+        <div className="dashboardSplitGrid">
           <section className="dashboardPanel topPlaylistsPanel">
             <div>
               <h2>Playlist Portfolio</h2>
@@ -1223,9 +1222,12 @@ export default function PlaylistManager() {
             <div className="removalList">
               {(dashboardSummary?.upcoming_removals || []).map((item, index) => (
                 <div key={`${item.playlist_id || index}-${item.track_id || index}`}>
-                  <strong>{item.track_name || item.track_id || "Unknown track"}</strong>
-                  <span>{item.artist_names || "Unknown artist"}</span>
-                  <small>{item.playlist_name || "Playlist"} · {formatShortDate(item.removes_on)} · pos {Number(item.position) + 1}</small>
+                  <Artwork src={item.cover_url || item.playlist_image} alt="" size="sm" />
+                  <span>
+                    <strong>{item.track_name || item.track_id || "Unknown track"}</strong>
+                    <em>{item.artist_names || "Unknown artist"}</em>
+                    <small>{item.playlist_name || "Playlist"} · {formatShortDate(item.removes_on)} · pos {Number(item.position) + 1}</small>
+                  </span>
                 </div>
               ))}
               {!dashboardSummary?.upcoming_removals?.length ? <p>No upcoming removals.</p> : null}
@@ -2124,9 +2126,15 @@ export default function PlaylistManager() {
         .metricGrid small {
           font-size: 13px;
         }
-        .dashboardGrid {
+        .dashboardFocusGrid {
           display: grid;
-          grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.8fr);
+          grid-template-columns: minmax(0, 1.65fr) minmax(330px, 0.75fr);
+          gap: 14px;
+          align-items: stretch;
+        }
+        .dashboardSplitGrid {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
           gap: 14px;
         }
         .growthPanel {
@@ -2147,13 +2155,11 @@ export default function PlaylistManager() {
         }
         .growthChart {
           width: 100%;
-          height: 240px;
+          height: 280px;
           margin-top: 18px;
-          border: 1px solid #242b36;
+          border: 1px solid #2a303b;
           border-radius: 8px;
-          background:
-            linear-gradient(180deg, rgba(24, 224, 111, 0.055), rgba(24, 224, 111, 0.01)),
-            #11161d;
+          background: #181c23;
           overflow: hidden;
         }
         .growthChart svg {
@@ -2188,7 +2194,7 @@ export default function PlaylistManager() {
           display: grid;
           place-items: center;
           color: #a6adba;
-          background: #11161d;
+          background: #181c23;
         }
         .sparkLabels {
           display: grid;
@@ -2206,26 +2212,11 @@ export default function PlaylistManager() {
         .sparkLabels span:last-child {
           text-align: right;
         }
-        .topGrowing {
-          display: grid;
-          grid-template-columns: 64px minmax(0, 1fr);
-          align-items: center;
-          gap: 14px;
-          margin-top: 18px;
+        .rankPanel {
+          min-height: 0;
         }
-        .topGrowing div {
-          display: grid;
-          gap: 6px;
-          min-width: 0;
-        }
-        .topGrowing strong,
-        .topGrowing span {
-          overflow: hidden;
-          text-overflow: ellipsis;
-          white-space: nowrap;
-        }
-        .rankPanel,
-        .topPlaylistsPanel {
+        .topPlaylistsPanel,
+        .removalsPanel {
           min-height: 360px;
         }
         .growthBars {
@@ -2241,7 +2232,20 @@ export default function PlaylistManager() {
           min-height: 58px;
           padding: 7px 0;
           border-top: 1px solid #202630;
+          border-left: 0;
+          border-right: 0;
+          border-bottom: 0;
+          border-radius: 0;
+          background: transparent;
+          color: #f4f6fb;
+          text-align: left;
           min-width: 0;
+        }
+        .growthBar:hover,
+        .growthBar:focus-visible,
+        .growthBar.selected {
+          background: rgba(24, 224, 111, 0.07);
+          border-top-color: rgba(24, 224, 111, 0.28);
         }
         .growthBar:first-child {
           border-top: 0;
@@ -2308,28 +2312,39 @@ export default function PlaylistManager() {
           font-size: 13px;
           text-align: right;
         }
-        .removalsPanel {
-          grid-column: 1 / -1;
-        }
         .removalList {
           display: grid;
-          grid-template-columns: repeat(3, minmax(0, 1fr));
-          gap: 10px;
+          gap: 2px;
           margin-top: 14px;
         }
         .removalList div {
           display: grid;
-          gap: 6px;
+          grid-template-columns: 42px minmax(0, 1fr);
+          align-items: center;
+          gap: 10px;
           border-top: 1px solid #202630;
-          padding-top: 10px;
+          padding: 9px 0;
+          min-width: 0;
+        }
+        .removalList div:first-child {
+          border-top: 0;
+        }
+        .removalList span {
+          display: grid;
+          gap: 3px;
           min-width: 0;
         }
         .removalList strong,
-        .removalList span,
+        .removalList em,
         .removalList small {
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
+        }
+        .removalList em {
+          color: #a6adba;
+          font-size: 13px;
+          font-style: normal;
         }
         .workspace {
           display: grid;
@@ -3077,7 +3092,8 @@ export default function PlaylistManager() {
             justify-content: flex-start;
           }
           .metricGrid,
-          .dashboardGrid,
+          .dashboardFocusGrid,
+          .dashboardSplitGrid,
           .removalList {
             grid-template-columns: 1fr;
           }
