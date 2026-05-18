@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import Head from "next/head";
 import { ArrowDown, ArrowUp, GripVertical, Lock, Settings, Shuffle, TimerReset, Trash2, Unlock, X } from "lucide-react";
 import { getSupabaseBrowserClient } from "../lib/supabaseBrowser";
 
@@ -920,6 +921,20 @@ export default function PlaylistManager() {
 
   return (
     <main>
+      <Head>
+        <title>PlaylistPilot | Smart Spotify Playlist Manager</title>
+        <meta name="description" content="Manage Spotify playlists with position locks, expiry timers, track rotation, multi-account workflows, and growth analytics." />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta property="og:title" content="PlaylistPilot" />
+        <meta property="og:description" content="Smart Spotify playlist management for curators." />
+        <meta property="og:type" content="website" />
+        <meta property="og:url" content="https://playlist-pilot.com" />
+        <meta property="og:image" content="https://playlist-pilot.com/playlistpilot-logo-v1.jpg" />
+        <meta name="twitter:card" content="summary" />
+        <link rel="icon" href="/playlistpilot-logo-v1.jpg" />
+        <link rel="apple-touch-icon" href="/playlistpilot-logo-v1.jpg" />
+        <link rel="canonical" href="https://playlist-pilot.com" />
+      </Head>
       <header className="topbar">
         <div className="brand">
           <img className="logo" src="/playlistpilot-logo-v1.jpg" alt="Playlist Pilot" />
@@ -928,15 +943,18 @@ export default function PlaylistManager() {
             <p>Playlist Manager</p>
           </div>
         </div>
-        <nav>
-          <button className={view === "dashboard" ? "navButton active" : "navButton"} onClick={() => setView("dashboard")}>Dashboard</button>
-          <button className={view === "manager" ? "navButton active" : "navButton"} onClick={() => setView("manager")}>Playlist Manager</button>
+        <nav className="mainNav" aria-label="Main navigation">
+          {session ? (
+            <div className="navTabs">
+              <button className={view === "dashboard" ? "navButton active" : "navButton"} onClick={() => setView("dashboard")}>Dashboard</button>
+              <button className={view === "manager" ? "navButton active" : "navButton"} onClick={() => setView("manager")}>Playlist Manager</button>
+            </div>
+          ) : null}
           {session ? (
             <button className="settingsButton topSettingsButton" onClick={() => setSettingsOpen(true)} aria-label="Open settings">
               <Settings aria-hidden="true" />
             </button>
           ) : null}
-          {session ? <button onClick={signOut}>Log Out</button> : null}
         </nav>
       </header>
 
@@ -981,6 +999,7 @@ export default function PlaylistManager() {
             <section className="settingsSection">
               <span>Signed in</span>
               <strong>{userContext.email}</strong>
+              <button className="dangerOutline settingsLogout" onClick={signOut}>Log out</button>
             </section>
 
             <section className="settingsSection">
@@ -1533,6 +1552,19 @@ export default function PlaylistManager() {
       </>
       )}
 
+      <footer className="siteFooter">
+        <div>
+          <strong>Playlist Pilot</strong>
+          <span>Smart Spotify playlist management for curators.</span>
+        </div>
+        <nav aria-label="Legal links">
+          <a href="/legal/imprint">Imprint</a>
+          <a href="/legal/privacy">Privacy</a>
+          <a href="/legal/terms">Terms</a>
+          <a href="mailto:hello@playlist-pilot.com">Contact</a>
+        </nav>
+      </footer>
+
       <style jsx>{`
         :global(body) {
           margin: 0;
@@ -1584,14 +1616,19 @@ export default function PlaylistManager() {
           min-height: 100vh;
           width: 100%;
           overflow-x: hidden;
+          display: grid;
+          grid-template-rows: auto 1fr auto;
         }
         .topbar {
-          display: flex;
-          justify-content: space-between;
+          display: grid;
+          grid-template-columns: auto minmax(0, 1fr);
           align-items: center;
           padding: 22px clamp(20px, 3vw, 40px);
           gap: 24px;
-          min-height: 116px;
+          min-height: 108px;
+          border-bottom: 1px solid #202630;
+          background: rgba(18, 21, 26, 0.94);
+          backdrop-filter: blur(10px);
         }
         .brand {
           display: flex;
@@ -1615,24 +1652,38 @@ export default function PlaylistManager() {
         .brand p, .playlistHeader p, small, .trackMeta span {
           color: #a6adba;
         }
-        nav {
+        .mainNav {
           display: flex;
           align-items: center;
-          gap: 18px;
+          justify-content: flex-end;
+          gap: 12px;
           color: #18e06f;
           font-size: 16px;
         }
-        nav button {
-          min-width: 112px;
+        .navTabs {
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+          padding: 4px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #181c23;
         }
         .navButton {
           border-color: transparent;
           background: transparent;
-          padding: 12px 0;
+          min-width: 128px;
+          padding: 10px 14px;
+          color: #a6adba;
         }
         .topSettingsButton {
           min-width: 40px;
           flex: 0 0 auto;
+        }
+        .navButton.active {
+          border-color: rgba(24, 224, 111, 0.5);
+          background: rgba(24, 224, 111, 0.1);
+          color: #18e06f;
         }
         .loginScreen {
           display: grid;
@@ -1813,6 +1864,10 @@ export default function PlaylistManager() {
         .dangerOutline:focus-visible:not(:disabled) {
           background: rgba(255, 77, 77, 0.14);
         }
+        .settingsLogout {
+          width: fit-content;
+          margin-top: 4px;
+        }
         .iconOnlyButton,
         .settingsButton {
           display: inline-flex;
@@ -1977,10 +2032,37 @@ export default function PlaylistManager() {
           width: 100%;
           min-width: 0;
         }
-        nav .active {
-          border: 1px solid #18e06f;
-          border-radius: 8px;
-          padding: 12px 16px;
+        .siteFooter {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 18px;
+          padding: 22px clamp(20px, 3vw, 40px);
+          border-top: 1px solid #202630;
+          color: #a6adba;
+          background: #101318;
+        }
+        .siteFooter div {
+          display: grid;
+          gap: 4px;
+        }
+        .siteFooter strong {
+          color: #f4f6fb;
+        }
+        .siteFooter nav {
+          display: flex;
+          align-items: center;
+          gap: 16px;
+          flex-wrap: wrap;
+        }
+        .siteFooter a {
+          color: #a6adba;
+          text-decoration: none;
+          font-size: 14px;
+        }
+        .siteFooter a:hover,
+        .siteFooter a:focus-visible {
+          color: #18e06f;
         }
         .dashboard {
           display: grid;
@@ -2983,15 +3065,16 @@ export default function PlaylistManager() {
           }
         }
         @media (max-width: 1100px) {
-          .topbar, nav, .playlistHeader, .sectionTitle {
+          .topbar, .mainNav, .playlistHeader, .sectionTitle {
             align-items: flex-start;
           }
           .topbar, .playlistHeader {
-            flex-direction: column;
+            grid-template-columns: 1fr;
           }
-          nav {
+          .mainNav {
             flex-wrap: wrap;
             gap: 14px;
+            justify-content: flex-start;
           }
           .metricGrid,
           .dashboardGrid,
@@ -3040,10 +3123,14 @@ export default function PlaylistManager() {
             height: 70px;
             flex: 0 0 auto;
           }
-          nav {
+          .mainNav,
+          .navTabs {
             display: grid;
             grid-template-columns: 1fr;
             width: 100%;
+          }
+          .topSettingsButton {
+            justify-self: end;
           }
           .dashboardHero {
             display: grid;
@@ -3071,8 +3158,12 @@ export default function PlaylistManager() {
           .playlistTable span {
             grid-column: 2;
           }
-          nav .active {
-            width: fit-content;
+          .siteFooter {
+            display: grid;
+            align-items: start;
+          }
+          .siteFooter nav {
+            justify-content: flex-start;
           }
           .workspace {
             padding: 22px;
