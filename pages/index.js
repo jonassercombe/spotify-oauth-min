@@ -2158,23 +2158,23 @@ export default function PlaylistManager() {
           min-width: 220px;
           max-width: 320px;
         }
-        .growthChart {
+        :global(.growthChart) {
           width: 100%;
           height: 280px;
           margin-top: 18px;
           padding: 2px 0 0;
         }
-        .growthChart svg {
+        :global(.growthChart) svg {
           display: block;
           width: 100%;
           height: 100%;
         }
-        .chartGridLine {
+        :global(.chartGridLine) {
           stroke: rgba(166, 173, 186, 0.18);
           stroke-width: 0.45;
           vector-effect: non-scaling-stroke;
         }
-        .chartLine {
+        :global(.chartLine) {
           fill: none;
           stroke: #18e06f;
           stroke-width: 2.5;
@@ -2182,17 +2182,17 @@ export default function PlaylistManager() {
           stroke-linecap: round;
           stroke-linejoin: round;
         }
-        .chartArea {
+        :global(.chartArea) {
           fill: rgba(24, 224, 111, 0.1);
           stroke: none;
         }
-        .chartPoint {
+        :global(.chartPoint) {
           fill: #18e06f;
           stroke: #11161d;
           stroke-width: 0.6;
           vector-effect: non-scaling-stroke;
         }
-        .growthChart--empty {
+        :global(.growthChart--empty) {
           display: grid;
           place-items: center;
           color: #a6adba;
@@ -2222,12 +2222,12 @@ export default function PlaylistManager() {
         .removalsPanel {
           min-height: 360px;
         }
-        .growthBars {
+        :global(.growthBars) {
           display: grid;
           gap: 10px;
           margin-top: 14px;
         }
-        .growthBar {
+        :global(.growthBar) {
           display: grid;
           grid-template-columns: 24px 44px minmax(0, 1fr);
           align-items: center;
@@ -2242,13 +2242,13 @@ export default function PlaylistManager() {
           text-align: left;
           min-width: 0;
         }
-        .growthBar:hover,
-        .growthBar:focus-visible,
-        .growthBar.selected {
+        :global(.growthBar):hover,
+        :global(.growthBar):focus-visible,
+        :global(.growthBar).selected {
           background: rgba(24, 224, 111, 0.06);
           border-color: rgba(24, 224, 111, 0.5);
         }
-        .growthRank {
+        :global(.growthRank) {
           display: inline-flex;
           align-items: center;
           justify-content: center;
@@ -2260,26 +2260,26 @@ export default function PlaylistManager() {
           font-size: 12px;
           font-weight: 900;
         }
-        .growthBar .artwork--sm,
-        .growthBar .coverFallback.artwork--sm {
+        :global(.growthBar) .artwork--sm,
+        :global(.growthBar) .coverFallback.artwork--sm {
           width: 44px;
           height: 44px;
         }
-        .growthBar div {
+        :global(.growthBar) div {
           min-width: 0;
         }
-        .growthBar strong,
-        .growthBar span {
+        :global(.growthBar) strong,
+        :global(.growthBar) span {
           display: block;
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
         }
-        .growthBar b {
+        :global(.growthBar) b {
           color: #18e06f;
           font-size: 14px;
         }
-        .growthSignal {
+        :global(.growthSignal) {
           grid-column: 3;
           display: grid;
           grid-template-columns: auto minmax(0, 1fr);
@@ -2287,19 +2287,19 @@ export default function PlaylistManager() {
           gap: 10px;
           min-width: 0;
         }
-        .barTrack {
+        :global(.barTrack) {
           height: 6px;
           border-radius: 999px;
           background: #252c37;
           overflow: hidden;
         }
-        .barTrack i {
+        :global(.barTrack) i {
           display: block;
           height: 100%;
           border-radius: inherit;
           background: #18e06f;
         }
-        .barTrack.negative i {
+        :global(.barTrack).negative i {
           background: #ff4d4d;
         }
         .playlistTable {
@@ -3179,10 +3179,10 @@ export default function PlaylistManager() {
             width: 100%;
             max-width: none;
           }
-          .growthBar {
+          :global(.growthBar) {
             grid-template-columns: 24px 44px minmax(0, 1fr);
           }
-          .growthSignal {
+          :global(.growthSignal) {
             grid-column: 3;
             grid-template-columns: 1fr;
             gap: 6px;
