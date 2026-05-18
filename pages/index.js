@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { ArrowDown, ArrowUp, GripVertical, Lock, Shuffle, TimerReset, Trash2, Unlock } from "lucide-react";
 import { getSupabaseBrowserClient } from "../lib/supabaseBrowser";
 
+const ENABLE_OPTIMISTIC_PLAYLIST_UI = true;
+
 async function api(path, { method = "GET", accessToken, body } = {}) {
   const headers = { "Content-Type": "application/json" };
   if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
@@ -121,6 +123,16 @@ function writeStoredSelection(userContext, nextSelection) {
   if (!key || typeof window === "undefined") return;
   const current = readStoredSelection(userContext);
   window.localStorage.setItem(key, JSON.stringify({ ...current, ...nextSelection }));
+}
+
+function reorderTracks(list, sourceTrackId, targetPosition) {
+  const fromIndex = list.findIndex((track) => track.track_id === sourceTrackId);
+  const toIndex = list.findIndex((track) => Number(track.position) === Number(targetPosition));
+  if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return list;
+  const next = [...list];
+  const [moved] = next.splice(fromIndex, 1);
+  next.splice(toIndex, 0, moved);
+  return next.map((track, index) => ({ ...track, position: index }));
 }
 
 function Sparkline({ values = [] }) {
@@ -387,9 +399,21 @@ export default function PlaylistManager() {
     });
   }
 
+  async function reconcileTracksAndFlex() {
+    if (!playlistId) return;
+    const [items, slots] = await Promise.all([
+      api(`/api/playlist-items/list?playlist_row_id=${encodeURIComponent(playlistId)}`, { accessToken: accessToken() }),
+      api(`/api/flex/slots/list?playlist_id=${encodeURIComponent(playlistId)}`, { accessToken: accessToken() }).catch(() => []),
+    ]);
+    setTracks(items);
+    setFlexSlots(Array.isArray(slots) ? slots : []);
+  }
+
   async function addTrack() {
     if (!playlistId || !trackLink.trim()) return;
     await run("Track added; sync dispatched", async () => {
+      const previousLink = trackLink;
+      if (ENABLE_OPTIMISTIC_PLAYLIST_UI) setTrackLink("");
       await api("/api/playlist-items/add", {
         method: "POST",
         accessToken: accessToken(),
@@ -401,11 +425,16 @@ export default function PlaylistManager() {
         },
       });
       setTrackLink("");
-      await loadSelectedPlaylist();
+      await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
+    }).then((result) => {
+      if (result === null && ENABLE_OPTIMISTIC_PLAYLIST_UI) setTrackLink(previousLink);
     });
   }
 
   async function moveTrack(track, dir) {
+    const previousTracks = tracks;
+    const targetPosition = Number(track.position) + (dir === "up" ? -1 : 1);
+    if (ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(reorderTracks(tracks, track.track_id, targetPosition));
     await run("Track move queued", async () => {
       await api("/api/playlist-items/move", {
         method: "POST",
@@ -417,7 +446,9 @@ export default function PlaylistManager() {
           steps: 1,
         },
       });
-      await loadSelectedPlaylist();
+      await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
+    }).then((result) => {
+      if (result === null && ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(previousTracks);
     });
   }
 
@@ -425,6 +456,8 @@ export default function PlaylistManager() {
     const from = Number(track.position);
     const to = Number(targetPosition);
     if (!Number.isFinite(from) || !Number.isFinite(to) || from === to) return;
+    const previousTracks = tracks;
+    if (ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(reorderTracks(tracks, track.track_id, to));
     await run("Track reordered", async () => {
       await api("/api/playlist-items/move", {
         method: "POST",
@@ -436,11 +469,17 @@ export default function PlaylistManager() {
           steps: Math.abs(to - from),
         },
       });
-      await loadSelectedPlaylist();
+      await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
+    }).then((result) => {
+      if (result === null && ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(previousTracks);
     });
   }
 
   async function removeTrack(track) {
+    const previousTracks = tracks;
+    if (ENABLE_OPTIMISTIC_PLAYLIST_UI) {
+      setTracks(tracks.filter((item) => item.track_id !== track.track_id).map((item, index) => ({ ...item, position: index })));
+    }
     await run("Track removed; sync dispatched", async () => {
       await api("/api/playlist-items/remove", {
         method: "POST",
@@ -451,11 +490,21 @@ export default function PlaylistManager() {
           position0: track.position,
         },
       });
-      await loadSelectedPlaylist();
+      await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
+    }).then((result) => {
+      if (result === null && ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(previousTracks);
     });
   }
 
   async function toggleLock(track) {
+    const previousTracks = tracks;
+    if (ENABLE_OPTIMISTIC_PLAYLIST_UI) {
+      setTracks(tracks.map((item) =>
+        item.track_id === track.track_id
+          ? { ...item, is_locked: !track.is_locked, locked_position: !track.is_locked ? track.position : null }
+          : item
+      ));
+    }
     await run(track.is_locked ? "Lock removed" : "Track locked", async () => {
       if (track.is_locked) {
         await api("/api/locks/unset", {
@@ -476,13 +525,22 @@ export default function PlaylistManager() {
           },
         });
       }
-      await loadSelectedPlaylist();
+      await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
+    }).then((result) => {
+      if (result === null && ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(previousTracks);
     });
   }
 
   async function setSongExpiry(track) {
     const value = window.prompt("Expiry in weeks. Empty clears song expiry.", track.expiry_weeks || "");
     if (value === null) return;
+    const previousTracks = tracks;
+    const nextExpiry = value.trim() === "" ? null : value;
+    if (ENABLE_OPTIMISTIC_PLAYLIST_UI) {
+      setTracks(tracks.map((item) =>
+        item.track_id === track.track_id ? { ...item, expiry_weeks: nextExpiry } : item
+      ));
+    }
     await run("Song expiry updated", async () => {
       await api("/api/locks/set", {
         method: "POST",
@@ -492,10 +550,12 @@ export default function PlaylistManager() {
           track_id: track.track_id,
           locked_position: Number(track.locked_position ?? track.position),
           is_locked: !!track.is_locked,
-          exp_weeks: value.trim() === "" ? null : value,
+          exp_weeks: nextExpiry,
         },
       });
-      await loadSelectedPlaylist();
+      await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
+    }).then((result) => {
+      if (result === null && ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(previousTracks);
     });
   }
 
@@ -559,24 +619,54 @@ export default function PlaylistManager() {
   }
 
   async function addFlexSlot(track) {
+    const previousTracks = tracks;
+    const previousSlots = flexSlots;
+    if (ENABLE_OPTIMISTIC_PLAYLIST_UI) {
+      setTracks(tracks.map((item) =>
+        item.track_id === track.track_id
+          ? { ...item, is_locked: true, locked_position: item.position }
+          : item
+      ));
+      setFlexSlots([
+        ...flexSlots,
+        {
+          id: `optimistic-${track.track_id}`,
+          playlist_id: playlistId,
+          position: track.position,
+          current_track_id: track.track_id,
+          current_track_name: track.track_name,
+        },
+      ]);
+    }
     await run("Flex slot added", async () => {
       await api("/api/flex/slots/add", {
         method: "POST",
         accessToken: accessToken(),
         body: { playlist_id: playlistId, track_id: track.track_id },
       });
-      await loadSelectedPlaylist();
+      await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
+    }).then((result) => {
+      if (result === null && ENABLE_OPTIMISTIC_PLAYLIST_UI) {
+        setTracks(previousTracks);
+        setFlexSlots(previousSlots);
+      }
     });
   }
 
   async function removeFlexSlot(slot) {
+    const previousSlots = flexSlots;
+    if (ENABLE_OPTIMISTIC_PLAYLIST_UI) {
+      setFlexSlots(flexSlots.filter((item) => item.id !== slot.id));
+    }
     await run("Flex slot removed", async () => {
       await api("/api/flex/slots/remove", {
         method: "POST",
         accessToken: accessToken(),
         body: { slot_id: slot.id },
       });
-      await loadSelectedPlaylist();
+      await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
+    }).then((result) => {
+      if (result === null && ENABLE_OPTIMISTIC_PLAYLIST_UI) setFlexSlots(previousSlots);
     });
   }
 
@@ -587,7 +677,7 @@ export default function PlaylistManager() {
         accessToken: accessToken(),
         body: slotId ? { slot_id: slotId } : { playlist_id: playlistId },
       });
-      await loadSelectedPlaylist();
+      await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
     });
   }
 
