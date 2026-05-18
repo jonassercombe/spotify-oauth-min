@@ -2325,7 +2325,12 @@ const routes = {
      if (!q || !connection_id) return bad(res, 400, "missing_q_or_connection_id");
    
      try {
-       const token = await getAccessTokenFromConnection(connection_id);
+       const connR = await sb(`/rest/v1/spotify_connections?select=id,refresh_token_enc&limit=1&id=eq.${encodeURIComponent(connection_id)}`);
+       const conn = connR.ok ? (await connR.json().catch(() => []))?.[0] : null;
+       if (!conn?.refresh_token_enc) return bad(res, 404, "connection_not_found");
+       const credentials = await getSpotifyAppCredentialsForConnection(connection_id);
+       const refreshed = await refreshAccessToken(decryptToken(conn.refresh_token_enc), credentials);
+       const token = refreshed.access_token;
        const url = `https://api.spotify.com/v1/search?type=track&market=from_token&limit=${encodeURIComponent(
          String(limit)
        )}&q=${encodeURIComponent(q)}`;

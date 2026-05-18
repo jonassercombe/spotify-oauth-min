@@ -2013,12 +2013,16 @@ export default function PlaylistManager() {
           align-items: end;
         }
         .addToolGrid {
-          grid-template-columns: minmax(280px, 1fr) 104px 132px auto;
+          grid-template-columns: minmax(420px, 2.4fr) 96px 120px auto;
           align-items: start;
         }
         .trackSearchBox {
           position: relative;
           min-width: 0;
+          width: 100%;
+        }
+        .trackSearchBox input {
+          width: 100%;
         }
         .trackCandidates {
           position: absolute;
