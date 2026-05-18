@@ -189,7 +189,7 @@ function GrowthBars({ items = [], selectedId = "", onSelect }) {
   const max = Math.max(1, ...items.map((item) => Math.abs(Number(item.delta) || 0)));
   return (
     <div className="growthBars">
-      {items.map((item) => {
+      {items.map((item, index) => {
         const delta = Number(item.delta) || 0;
         const width = Math.max(4, Math.round((Math.abs(delta) / max) * 100));
         return (
@@ -199,15 +199,18 @@ function GrowthBars({ items = [], selectedId = "", onSelect }) {
             key={item.playlist_id}
             onClick={() => onSelect?.(item.playlist_id)}
           >
+            <span className="growthRank">{index + 1}</span>
             <Artwork src={item.image} alt="" size="sm" />
             <div>
               <strong>{item.name || "Untitled playlist"}</strong>
               <span>{formatNumber(item.followers_now)} followers</span>
             </div>
-            <div className={delta < 0 ? "barTrack negative" : "barTrack"}>
-              <i style={{ width: `${width}%` }} />
+            <div className="growthSignal">
+              <b>{formatDelta(delta)}</b>
+              <div className={delta < 0 ? "barTrack negative" : "barTrack"}>
+                <i style={{ width: `${width}%` }} />
+              </div>
             </div>
-            <b>{formatDelta(delta)}</b>
           </button>
         );
       })}
@@ -2139,6 +2142,8 @@ export default function PlaylistManager() {
         }
         .growthPanel {
           min-height: 320px;
+          display: grid;
+          align-content: start;
         }
         .panelHeader {
           display: flex;
@@ -2157,10 +2162,7 @@ export default function PlaylistManager() {
           width: 100%;
           height: 280px;
           margin-top: 18px;
-          border: 1px solid #2a303b;
-          border-radius: 8px;
-          background: #181c23;
-          overflow: hidden;
+          padding: 2px 0 0;
         }
         .growthChart svg {
           display: block;
@@ -2168,20 +2170,20 @@ export default function PlaylistManager() {
           height: 100%;
         }
         .chartGridLine {
-          stroke: rgba(166, 173, 186, 0.16);
+          stroke: rgba(166, 173, 186, 0.18);
           stroke-width: 0.45;
           vector-effect: non-scaling-stroke;
         }
         .chartLine {
           fill: none;
           stroke: #18e06f;
-          stroke-width: 2.1;
+          stroke-width: 2.5;
           vector-effect: non-scaling-stroke;
           stroke-linecap: round;
           stroke-linejoin: round;
         }
         .chartArea {
-          fill: rgba(24, 224, 111, 0.16);
+          fill: rgba(24, 224, 111, 0.1);
           stroke: none;
         }
         .chartPoint {
@@ -2194,7 +2196,8 @@ export default function PlaylistManager() {
           display: grid;
           place-items: center;
           color: #a6adba;
-          background: #181c23;
+          border: 1px dashed #303743;
+          border-radius: 8px;
         }
         .sparkLabels {
           display: grid;
@@ -2221,22 +2224,20 @@ export default function PlaylistManager() {
         }
         .growthBars {
           display: grid;
-          gap: 8px;
+          gap: 10px;
           margin-top: 14px;
         }
         .growthBar {
           display: grid;
-          grid-template-columns: 42px minmax(0, 1fr) 110px 64px;
+          grid-template-columns: 24px 44px minmax(0, 1fr);
           align-items: center;
-          gap: 10px;
-          min-height: 58px;
-          padding: 7px 0;
-          border-top: 1px solid #202630;
-          border-left: 0;
-          border-right: 0;
-          border-bottom: 0;
-          border-radius: 0;
-          background: transparent;
+          gap: 11px;
+          width: 100%;
+          min-height: 70px;
+          padding: 10px;
+          border: 1px solid #252c37;
+          border-radius: 8px;
+          background: #12161d;
           color: #f4f6fb;
           text-align: left;
           min-width: 0;
@@ -2244,16 +2245,25 @@ export default function PlaylistManager() {
         .growthBar:hover,
         .growthBar:focus-visible,
         .growthBar.selected {
-          background: rgba(24, 224, 111, 0.07);
-          border-top-color: rgba(24, 224, 111, 0.28);
+          background: rgba(24, 224, 111, 0.06);
+          border-color: rgba(24, 224, 111, 0.5);
         }
-        .growthBar:first-child {
-          border-top: 0;
+        .growthRank {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 24px;
+          height: 24px;
+          border-radius: 999px;
+          background: #202630;
+          color: #a6adba;
+          font-size: 12px;
+          font-weight: 900;
         }
         .growthBar .artwork--sm,
         .growthBar .coverFallback.artwork--sm {
-          width: 42px;
-          height: 42px;
+          width: 44px;
+          height: 44px;
         }
         .growthBar div {
           min-width: 0;
@@ -2266,9 +2276,16 @@ export default function PlaylistManager() {
           white-space: nowrap;
         }
         .growthBar b {
-          text-align: right;
           color: #18e06f;
           font-size: 14px;
+        }
+        .growthSignal {
+          grid-column: 3;
+          display: grid;
+          grid-template-columns: auto minmax(0, 1fr);
+          align-items: center;
+          gap: 10px;
+          min-width: 0;
         }
         .barTrack {
           height: 6px;
@@ -3163,10 +3180,12 @@ export default function PlaylistManager() {
             max-width: none;
           }
           .growthBar {
-            grid-template-columns: 42px minmax(0, 1fr) 58px;
+            grid-template-columns: 24px 44px minmax(0, 1fr);
           }
-          .growthBar .barTrack {
-            grid-column: 2 / -1;
+          .growthSignal {
+            grid-column: 3;
+            grid-template-columns: 1fr;
+            gap: 6px;
           }
           .playlistTable div {
             grid-template-columns: 42px minmax(0, 1fr);
