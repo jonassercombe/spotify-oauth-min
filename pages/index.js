@@ -1504,10 +1504,18 @@ export default function PlaylistManager() {
           gap: 8px;
           color: #f4f6fb;
           font-weight: 700;
+          width: 100%;
         }
         .field span {
           font-size: 14px;
           color: #a6adba;
+        }
+        .field select,
+        .field input {
+          width: 100%;
+        }
+        .sidebar .field {
+          grid-template-columns: 1fr;
         }
         .sidebar {
           display: grid;

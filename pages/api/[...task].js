@@ -1501,7 +1501,7 @@ const routes = {
        `?select=id,name,followers` +
        `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
        `&is_owner=is.true&is_public=is.true` +
-       `&order=updated_at.desc`;
+       `&order=followers.desc.nullslast,name.asc`;
    
      const nowR = await fetch(SUPABASE_URL + pathNow, {
        headers: { apikey: SRK, Authorization: `Bearer ${SRK}` },
