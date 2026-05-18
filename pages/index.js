@@ -712,8 +712,13 @@ export default function PlaylistManager() {
           <button onClick={signOut}>Log Out</button>
         </section>
       ) : !userContext ? (
-        <section className="loginScreen">
+        <section className="loadingScreen" aria-live="polite">
+          <div className="loaderMark">
+            <img src="/playlistpilot-logo-v1.jpg" alt="" />
+            <span />
+          </div>
           <h2>Loading workspace</h2>
+          <p>Syncing your accounts, playlists, and saved position.</p>
           {error ? <strong>{error}</strong> : null}
         </section>
       ) : (
@@ -1227,6 +1232,52 @@ export default function PlaylistManager() {
         }
         .loginScreen strong {
           color: #ff4d4d;
+        }
+        .loadingScreen {
+          display: grid;
+          align-content: center;
+          justify-items: center;
+          gap: 14px;
+          min-height: calc(100vh - 116px);
+          padding: 40px;
+          text-align: center;
+        }
+        .loaderMark {
+          position: relative;
+          width: 96px;
+          height: 96px;
+          display: grid;
+          place-items: center;
+        }
+        .loaderMark img {
+          width: 58px;
+          height: 58px;
+          border-radius: 14px;
+          object-fit: cover;
+          background: #082331;
+        }
+        .loaderMark span {
+          position: absolute;
+          inset: 0;
+          border-radius: 50%;
+          border: 2px solid rgba(24, 224, 111, 0.16);
+          border-top-color: #18e06f;
+          border-right-color: rgba(24, 224, 111, 0.72);
+          animation: spin 900ms linear infinite;
+          box-shadow: 0 0 30px rgba(24, 224, 111, 0.14);
+        }
+        .loadingScreen h2 {
+          font-size: 28px;
+        }
+        .loadingScreen p {
+          color: #a6adba;
+          font-size: 15px;
+        }
+        .loadingScreen strong {
+          color: #ff4d4d;
+        }
+        @keyframes spin {
+          to { transform: rotate(360deg); }
         }
         .accountBox {
           display: grid;
