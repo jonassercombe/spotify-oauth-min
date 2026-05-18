@@ -256,6 +256,7 @@ export default function PlaylistManager() {
   const [dashboardRange, setDashboardRange] = useState("month");
   const [dashboardConnectionId, setDashboardConnectionId] = useState("");
   const [dashboardPlaylistId, setDashboardPlaylistId] = useState("");
+  const [moversPage, setMoversPage] = useState(0);
   const [toolsOpen, setToolsOpen] = useState(false);
   const [activeTool, setActiveTool] = useState("add");
   const [dragTrackId, setDragTrackId] = useState("");
@@ -269,6 +270,11 @@ export default function PlaylistManager() {
 
   const billing = userContext?.billing || {};
   const billingActive = !!billing.is_active;
+  const movers = dashboardSummary?.growth_rank || [];
+  const moversPageSize = 5;
+  const moversPageCount = Math.max(1, Math.ceil(movers.length / moversPageSize));
+  const safeMoversPage = Math.min(moversPage, moversPageCount - 1);
+  const visibleMovers = movers.slice(safeMoversPage * moversPageSize, safeMoversPage * moversPageSize + moversPageSize);
 
   useEffect(() => {
     const client = getSupabaseBrowserClient();
@@ -318,6 +324,10 @@ export default function PlaylistManager() {
     if (!userContext?.linked || view !== "dashboard") return;
     loadDashboard();
   }, [dashboardRange, dashboardConnectionId, dashboardPlaylistId, view]);
+
+  useEffect(() => {
+    setMoversPage(0);
+  }, [dashboardRange, dashboardConnectionId, dashboardSummary?.growth_rank?.length]);
 
   useEffect(() => {
     if (!userContext?.linked || !connectionId) return;
@@ -1192,10 +1202,17 @@ export default function PlaylistManager() {
               <p>Click a playlist to show it in the graph</p>
             </div>
             <GrowthBars
-              items={dashboardSummary?.growth_rank || []}
+              items={visibleMovers}
               selectedId={dashboardPlaylistId}
               onSelect={(id) => setDashboardPlaylistId(id)}
             />
+            {movers.length > moversPageSize ? (
+              <div className="moversPager">
+                <button disabled={safeMoversPage === 0} onClick={() => setMoversPage((page) => Math.max(0, page - 1))}>Prev</button>
+                <span>{safeMoversPage + 1} / {moversPageCount}</span>
+                <button disabled={safeMoversPage >= moversPageCount - 1} onClick={() => setMoversPage((page) => Math.min(moversPageCount - 1, page + 1))}>Next</button>
+              </div>
+            ) : null}
           </section>
         </div>
         <div className="dashboardSplitGrid">
@@ -2301,6 +2318,25 @@ export default function PlaylistManager() {
         }
         :global(.barTrack).negative i {
           background: #ff4d4d;
+        }
+        .moversPager {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 10px;
+          margin-top: 12px;
+          padding-top: 12px;
+          border-top: 1px solid #202630;
+        }
+        .moversPager button {
+          min-width: 72px;
+          padding: 8px 10px;
+          background: transparent;
+        }
+        .moversPager span {
+          color: #a6adba;
+          font-size: 13px;
+          font-weight: 800;
         }
         .playlistTable {
           display: grid;
