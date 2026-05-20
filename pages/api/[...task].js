@@ -2183,8 +2183,11 @@ const routes = {
      const connection_id = String(req.query.connection_id || "");
      const playlist_id = String(req.query.playlist_id || "");
    
+     const fromParam = String(req.query.from || "").slice(0, 10);
+     const toParam = String(req.query.to || "").slice(0, 10);
      const fromDay = new Date(Date.now() - days*24*3600*1000);
-     const fromStr = fromDay.toISOString().slice(0,10);
+     const fromStr = /^\d{4}-\d{2}-\d{2}$/.test(fromParam) ? fromParam : fromDay.toISOString().slice(0,10);
+     const toFilter = /^\d{4}-\d{2}-\d{2}$/.test(toParam) ? `&day=lte.${encodeURIComponent(toParam)}` : "";
    
      let playlistFilter = "";
      if (playlist_id) {
@@ -2207,6 +2210,7 @@ const routes = {
        `?select=playlist_id,day,followers` +
        `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
        `&day=gte.${encodeURIComponent(fromStr)}` +
+       toFilter +
        playlistFilter +
        `&order=day.asc`;
      const sResp = await fetch(SUPABASE_URL + snapPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });

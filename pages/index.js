@@ -139,15 +139,28 @@ function writeStoredSelection(userContext, nextSelection) {
 
 function reorderTracks(list, sourceTrackId, targetPosition) {
   const fromIndex = list.findIndex((track) => track.track_id === sourceTrackId);
-  const toIndex = list.findIndex((track) => Number(track.position) === Number(targetPosition));
+  const toIndex = Math.max(0, Math.min(list.length - 1, Number(targetPosition)));
   if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return list;
   const next = [...list];
   const [moved] = next.splice(fromIndex, 1);
   next.splice(toIndex, 0, moved);
-  return next.map((track, index) => ({ ...track, position: index }));
+  return next.map((track, index) => ({
+    ...track,
+    position: index,
+    locked_position: track.is_locked ? index : track.locked_position,
+  }));
 }
 
-function GrowthChart({ values = [] }) {
+function dropTargetPosition(source, target, placement = "before") {
+  const from = Number(source?.position);
+  const targetPos = Number(target?.position);
+  if (!Number.isFinite(from) || !Number.isFinite(targetPos)) return targetPos;
+  if (placement === "after") return from < targetPos ? targetPos : targetPos + 1;
+  return from < targetPos ? targetPos - 1 : targetPos;
+}
+
+function GrowthChart({ values = [], labels = [], growth = [], granularity = "daily" }) {
+  const [hoverIndex, setHoverIndex] = useState(null);
   const points = values.map((v) => Number(v) || 0);
   if (!points.length) return <div className="growthChart growthChart--empty"><span>No growth data yet</span></div>;
   const min = Math.min(...points);
@@ -168,10 +181,25 @@ function GrowthChart({ values = [] }) {
   const lastX = points.length === 1 ? 50 : width - padX;
   const area = `${d} L${lastX},${height - padBottom} L${firstX},${height - padBottom} Z`;
   const gridLines = [padTop, padTop + chartHeight / 2, padTop + chartHeight];
+  const activeIndex = hoverIndex === null ? points.length - 1 : hoverIndex;
+  const activeX = points.length === 1 ? 50 : padX + (activeIndex / (points.length - 1)) * (width - padX * 2);
+  const activeY = padTop + chartHeight - ((points[activeIndex] - min) / span) * chartHeight;
+  const tooltipTitle = labels?.[activeIndex] ? formatShortDate(labels[activeIndex]) : `${granularity} ${activeIndex + 1}`;
+  const tooltipGrowth = Number(growth?.[activeIndex] || 0);
+  const growthLabel = granularity === "monthly" ? "monthly growth" : granularity === "weekly" ? "weekly growth" : "daily growth";
   return (
-    <div className="growthChart">
+    <div
+      className="growthChart"
+      onMouseLeave={() => setHoverIndex(null)}
+      onMouseMove={(event) => {
+        const rect = event.currentTarget.getBoundingClientRect();
+        const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+        setHoverIndex(Math.round(ratio * (points.length - 1)));
+      }}
+    >
       <svg viewBox={`0 0 ${width} ${height}`} aria-hidden="true">
         {gridLines.map((y) => <line key={y} className="chartGridLine" x1="0" x2="100" y1={y} y2={y} />)}
+        <line className="chartHoverLine" x1={activeX} x2={activeX} y1={padTop} y2={height - padBottom} />
         <path className="chartArea" d={area} />
         <path className="chartLine" d={d} />
         {points.map((v, i) => {
@@ -180,7 +208,13 @@ function GrowthChart({ values = [] }) {
           const y = padTop + chartHeight - ((v - min) / span) * chartHeight;
           return <circle key={i} className="chartPoint" cx={x} cy={y} r="1.3" />;
         })}
+        <circle className="chartActivePoint" cx={activeX} cy={activeY} r="2" />
       </svg>
+      <div className="chartTooltip" style={{ left: `${activeX}%` }}>
+        <strong>{tooltipTitle}</strong>
+        <span>{formatNumber(points[activeIndex])} followers</span>
+        <em>{formatDelta(tooltipGrowth)} {growthLabel}</em>
+      </div>
     </div>
   );
 }
@@ -254,12 +288,16 @@ export default function PlaylistManager() {
   const [dashboardSummary, setDashboardSummary] = useState(null);
   const [dashboardSeries, setDashboardSeries] = useState(null);
   const [dashboardRange, setDashboardRange] = useState("month");
+  const [dashboardGranularity, setDashboardGranularity] = useState("daily");
+  const [dashboardStartDate, setDashboardStartDate] = useState("");
+  const [dashboardEndDate, setDashboardEndDate] = useState("");
   const [dashboardConnectionId, setDashboardConnectionId] = useState("");
   const [dashboardPlaylistId, setDashboardPlaylistId] = useState("");
   const [moversPage, setMoversPage] = useState(0);
   const [toolsOpen, setToolsOpen] = useState(false);
   const [activeTool, setActiveTool] = useState("add");
   const [dragTrackId, setDragTrackId] = useState("");
+  const [dragTarget, setDragTarget] = useState(null);
   const [spotifyCredentials, setSpotifyCredentials] = useState(null);
   const [spotifyCredsOpen, setSpotifyCredsOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -323,7 +361,7 @@ export default function PlaylistManager() {
   useEffect(() => {
     if (!userContext?.linked || view !== "dashboard") return;
     loadDashboard();
-  }, [dashboardRange, dashboardConnectionId, dashboardPlaylistId, view]);
+  }, [dashboardRange, dashboardGranularity, dashboardStartDate, dashboardEndDate, dashboardConnectionId, dashboardPlaylistId, view]);
 
   useEffect(() => {
     setMoversPage(0);
@@ -649,7 +687,7 @@ export default function PlaylistManager() {
 
   async function moveTrackTo(track, targetPosition) {
     const from = Number(track.position);
-    const to = Number(targetPosition);
+    const to = Math.max(0, Math.min(tracks.length - 1, Number(targetPosition)));
     if (!Number.isFinite(from) || !Number.isFinite(to) || from === to) return;
     const previousTracks = tracks;
     if (ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(reorderTracks(tracks, track.track_id, to));
@@ -783,13 +821,22 @@ export default function PlaylistManager() {
   async function loadDashboard() {
     if (!session?.access_token) return;
     return run("Dashboard loaded", async () => {
-      const rangeDays = dashboardRange === "year" ? 365 : dashboardRange === "week" ? 7 : 30;
-      const granularity = dashboardRange === "year" ? "monthly" : dashboardRange === "week" ? "daily" : "daily";
+      const customStart = dashboardRange === "custom" && dashboardStartDate ? new Date(`${dashboardStartDate}T00:00:00`) : null;
+      const customEnd = dashboardRange === "custom" && dashboardEndDate ? new Date(`${dashboardEndDate}T00:00:00`) : new Date();
+      const customDays = customStart && !Number.isNaN(customStart.getTime())
+        ? Math.max(1, Math.ceil((customEnd.getTime() - customStart.getTime()) / (24 * 3600 * 1000)))
+        : null;
+      const rangeDays = customDays || (dashboardRange === "year" ? 365 : dashboardRange === "week" ? 7 : 30);
+      const granularity = dashboardGranularity || (dashboardRange === "year" ? "monthly" : "daily");
       const seriesQs = new URLSearchParams({
         days: String(rangeDays),
         granularity,
         scope: "total",
       });
+      if (dashboardRange === "custom") {
+        if (dashboardStartDate) seriesQs.set("from", dashboardStartDate);
+        if (dashboardEndDate) seriesQs.set("to", dashboardEndDate);
+      }
       if (dashboardConnectionId) seriesQs.set("connection_id", dashboardConnectionId);
       if (dashboardPlaylistId) seriesQs.set("playlist_id", dashboardPlaylistId);
       const [summary, series] = await Promise.all([
@@ -1126,7 +1173,19 @@ export default function PlaylistManager() {
               <option value="week">Week</option>
               <option value="month">Month</option>
               <option value="year">Year</option>
+              <option value="custom">Custom</option>
             </select>
+            <select value={dashboardGranularity} onChange={(e) => setDashboardGranularity(e.target.value)} aria-label="Growth scale">
+              <option value="daily">Day</option>
+              <option value="weekly">Week</option>
+              <option value="monthly">Month</option>
+            </select>
+            {dashboardRange === "custom" ? (
+              <>
+                <input type="date" value={dashboardStartDate} onChange={(e) => setDashboardStartDate(e.target.value)} aria-label="Start date" />
+                <input type="date" value={dashboardEndDate} onChange={(e) => setDashboardEndDate(e.target.value)} aria-label="End date" />
+              </>
+            ) : null}
             <button disabled={busy} onClick={loadDashboard}>Refresh</button>
           </div>
         </div>
@@ -1189,7 +1248,12 @@ export default function PlaylistManager() {
                 </select>
               </div>
             </div>
-            <GrowthChart values={dashboardSeries?.followers || dashboardSeries?.growth || []} />
+            <GrowthChart
+              values={dashboardSeries?.followers || dashboardSeries?.growth || []}
+              labels={dashboardSeries?.labels || []}
+              growth={dashboardSeries?.growth || []}
+              granularity={dashboardSeries?.granularity || dashboardGranularity}
+            />
             <div className="sparkLabels">
               <span>{dashboardSeries?.labels?.[0] ? formatShortDate(dashboardSeries.labels[0]) : ""}</span>
               <strong>{formatDelta((dashboardSeries?.growth || []).reduce((sum, value) => sum + (Number(value) || 0), 0))}</strong>
@@ -1486,27 +1550,40 @@ export default function PlaylistManager() {
               {filteredTracks.map((track) => {
                 const isFlexTrack = activeFlexTrackIds.has(track.track_id);
                 return (
-                  <article
-                    key={`${track.position}-${track.track_id}`}
-                    className={`trackRow ${isFlexTrack ? "trackRow--flex" : ""} ${dragTrackId === track.track_id ? "trackRow--dragging" : ""}`}
-                    draggable={!busy}
-                    onDragStart={(e) => {
-                      setDragTrackId(track.track_id);
-                      e.dataTransfer.effectAllowed = "move";
-                      e.dataTransfer.setData("text/plain", track.track_id);
-                    }}
-                    onDragOver={(e) => {
-                      if (!busy) e.preventDefault();
-                    }}
-                    onDrop={(e) => {
-                      e.preventDefault();
-                      const sourceId = e.dataTransfer.getData("text/plain");
-                      const source = tracks.find((item) => item.track_id === sourceId);
-                      setDragTrackId("");
-                      if (source) moveTrackTo(source, track.position);
-                    }}
-                    onDragEnd={() => setDragTrackId("")}
-                  >
+	                  <article
+	                    key={`${track.position}-${track.track_id}`}
+	                    className={`trackRow ${isFlexTrack ? "trackRow--flex" : ""} ${dragTrackId === track.track_id ? "trackRow--dragging" : ""} ${dragTarget?.trackId === track.track_id ? `trackRow--drop-${dragTarget.placement}` : ""}`}
+	                    draggable={!busy}
+	                    onDragStart={(e) => {
+	                      setDragTrackId(track.track_id);
+	                      setDragTarget(null);
+	                      e.dataTransfer.effectAllowed = "move";
+	                      e.dataTransfer.setData("text/plain", track.track_id);
+	                    }}
+	                    onDragOver={(e) => {
+	                      if (busy || dragTrackId === track.track_id) return;
+	                      e.preventDefault();
+	                      const rect = e.currentTarget.getBoundingClientRect();
+	                      const placement = e.clientY > rect.top + rect.height / 2 ? "after" : "before";
+	                      setDragTarget({ trackId: track.track_id, placement });
+	                    }}
+	                    onDragLeave={() => {
+	                      setDragTarget((current) => current?.trackId === track.track_id ? null : current);
+	                    }}
+	                    onDrop={(e) => {
+	                      e.preventDefault();
+	                      const sourceId = e.dataTransfer.getData("text/plain");
+	                      const source = tracks.find((item) => item.track_id === sourceId);
+	                      const placement = dragTarget?.trackId === track.track_id ? dragTarget.placement : "before";
+	                      setDragTrackId("");
+	                      setDragTarget(null);
+	                      if (source) moveTrackTo(source, dropTargetPosition(source, track, placement));
+	                    }}
+	                    onDragEnd={() => {
+	                      setDragTrackId("");
+	                      setDragTarget(null);
+	                    }}
+	                  >
                     <div className="dragHandle" aria-hidden="true"><GripVertical /></div>
                     <div className="pos">{Number(track.position) + 1}</div>
                     <Artwork src={track.cover_url} alt="" size="sm" />
@@ -2150,7 +2227,7 @@ export default function PlaylistManager() {
           display: grid;
           grid-template-columns: minmax(0, 1.65fr) minmax(330px, 0.75fr);
           gap: 14px;
-          align-items: stretch;
+          align-items: start;
         }
         .dashboardSplitGrid {
           display: grid;
@@ -2158,9 +2235,10 @@ export default function PlaylistManager() {
           gap: 14px;
         }
         .growthPanel {
-          min-height: 320px;
+          min-height: 430px;
           display: grid;
           align-content: start;
+          overflow: visible;
         }
         .panelHeader {
           display: flex;
@@ -2176,15 +2254,18 @@ export default function PlaylistManager() {
           max-width: 320px;
         }
         :global(.growthChart) {
+          position: relative;
           width: 100%;
-          height: 280px;
+          height: 310px;
           margin-top: 18px;
           padding: 2px 0 0;
+          overflow: visible;
         }
         :global(.growthChart) svg {
           display: block;
           width: 100%;
           height: 100%;
+          overflow: visible;
         }
         :global(.chartGridLine) {
           stroke: rgba(166, 173, 186, 0.18);
@@ -2203,11 +2284,61 @@ export default function PlaylistManager() {
           fill: rgba(24, 224, 111, 0.1);
           stroke: none;
         }
+        :global(.chartHoverLine) {
+          stroke: rgba(244, 246, 251, 0.26);
+          stroke-width: 0.6;
+          stroke-dasharray: 2 2;
+          vector-effect: non-scaling-stroke;
+        }
         :global(.chartPoint) {
           fill: #18e06f;
           stroke: #11161d;
           stroke-width: 0.6;
           vector-effect: non-scaling-stroke;
+        }
+        :global(.chartActivePoint) {
+          fill: #f4fff8;
+          stroke: #18e06f;
+          stroke-width: 1.2;
+          vector-effect: non-scaling-stroke;
+        }
+        :global(.chartTooltip) {
+          position: absolute;
+          top: 8px;
+          z-index: 8;
+          min-width: 150px;
+          padding: 9px 10px;
+          border: 1px solid rgba(24, 224, 111, 0.28);
+          border-radius: 8px;
+          background: rgba(15, 18, 23, 0.96);
+          color: #f4f6fb;
+          box-shadow: 0 16px 40px rgba(0, 0, 0, 0.34);
+          pointer-events: none;
+          transform: translateX(-50%);
+          backdrop-filter: blur(8px);
+        }
+        :global(.chartTooltip) strong,
+        :global(.chartTooltip) span,
+        :global(.chartTooltip) em {
+          display: block;
+          line-height: 1.25;
+          white-space: nowrap;
+        }
+        :global(.chartTooltip) strong {
+          font-size: 12px;
+          color: #f4f6fb;
+        }
+        :global(.chartTooltip) span {
+          margin-top: 4px;
+          color: #a6adba;
+          font-size: 12px;
+        }
+        :global(.chartTooltip) em {
+          margin-top: 4px;
+          color: #18e06f;
+          font-size: 13px;
+          font-style: normal;
+          font-weight: 900;
         }
         :global(.growthChart--empty) {
           display: grid;
@@ -2234,6 +2365,7 @@ export default function PlaylistManager() {
         }
         .rankPanel {
           min-height: 0;
+          align-self: start;
         }
         .topPlaylistsPanel,
         .removalsPanel {
@@ -2872,6 +3004,7 @@ export default function PlaylistManager() {
           min-height: 0;
         }
         .trackRow {
+          position: relative;
           display: grid;
           grid-template-columns: 28px 44px 52px minmax(180px, 1fr) minmax(74px, auto) minmax(330px, auto);
           align-items: center;
@@ -2879,18 +3012,48 @@ export default function PlaylistManager() {
           min-height: 76px;
           padding: 12px 16px;
           border-top: 1px solid #202630;
+          transition: background 120ms ease, opacity 120ms ease, box-shadow 120ms ease;
         }
         .trackRow[draggable="true"] {
           cursor: grab;
         }
         .trackRow--dragging {
-          opacity: 0.55;
+          opacity: 0.48;
+          background: rgba(24, 224, 111, 0.06);
+        }
+        .trackRow--drop-before,
+        .trackRow--drop-after {
+          background: rgba(24, 224, 111, 0.075);
+          box-shadow: inset 0 0 0 1px rgba(24, 224, 111, 0.16);
+        }
+        .trackRow--drop-before::before,
+        .trackRow--drop-after::after {
+          content: "";
+          position: absolute;
+          left: 14px;
+          right: 14px;
+          z-index: 4;
+          height: 3px;
+          border-radius: 999px;
+          background: #18e06f;
+          box-shadow: 0 0 0 3px rgba(24, 224, 111, 0.14), 0 8px 20px rgba(24, 224, 111, 0.28);
+          pointer-events: none;
+        }
+        .trackRow--drop-before::before {
+          top: -2px;
+        }
+        .trackRow--drop-after::after {
+          bottom: -2px;
         }
         .dragHandle {
           color: #637083;
           display: inline-flex;
           align-items: center;
           justify-content: center;
+        }
+        .trackRow[draggable="true"]:hover .dragHandle,
+        .trackRow--dragging .dragHandle {
+          color: #18e06f;
         }
         .dragHandle svg {
           width: 18px;
