@@ -282,6 +282,7 @@ export default function PlaylistManager() {
   const [flexInterval, setFlexInterval] = useState("weekly");
   const [flexEnabled, setFlexEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [busyLabel, setBusyLabel] = useState("");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [view, setView] = useState("manager");
@@ -451,6 +452,7 @@ export default function PlaylistManager() {
 
   async function run(label, fn) {
     setBusy(true);
+    setBusyLabel(label);
     setError("");
     setMessage("");
     try {
@@ -462,6 +464,7 @@ export default function PlaylistManager() {
       return null;
     } finally {
       setBusy(false);
+      setBusyLabel("");
     }
   }
 
@@ -1022,6 +1025,12 @@ export default function PlaylistManager() {
           ) : null}
         </nav>
       </header>
+      {busy ? (
+        <div className="operationToast" role="status" aria-live="polite">
+          <span className="miniSpinner" aria-hidden="true" />
+          <strong>{busyLabel || "Working with Spotify"}</strong>
+        </div>
+      ) : null}
 
       {!session ? (
         <section className="loginScreen">
@@ -1160,7 +1169,7 @@ export default function PlaylistManager() {
       {view === "dashboard" ? (
       <section className="dashboard">
         <div className="statusLine">
-          {message ? <span>{message}</span> : <span />}
+          {busy ? <span><i className="miniSpinner" aria-hidden="true" />{busyLabel || "Working with Spotify"}</span> : message ? <span>{message}</span> : <span />}
           {error ? <strong>{error}</strong> : null}
         </div>
         <div className="dashboardHero">
@@ -1367,7 +1376,7 @@ export default function PlaylistManager() {
 
         <section className="content">
           <div className="statusLine">
-            {message ? <span>{message}</span> : <span />}
+            {busy ? <span><i className="miniSpinner" aria-hidden="true" />{busyLabel || "Working with Spotify"}</span> : message ? <span>{message}</span> : <span />}
             {error ? <strong>{error}</strong> : null}
           </div>
 
@@ -1719,6 +1728,9 @@ export default function PlaylistManager() {
           grid-template-rows: auto 1fr auto;
         }
         .topbar {
+          position: sticky;
+          top: 0;
+          z-index: 30;
           display: grid;
           grid-template-columns: auto minmax(0, 1fr);
           align-items: center;
@@ -1728,6 +1740,40 @@ export default function PlaylistManager() {
           border-bottom: 1px solid #202630;
           background: rgba(18, 21, 26, 0.94);
           backdrop-filter: blur(10px);
+        }
+        .operationToast {
+          position: fixed;
+          top: 118px;
+          right: clamp(16px, 3vw, 36px);
+          z-index: 60;
+          display: inline-flex;
+          align-items: center;
+          gap: 10px;
+          max-width: min(360px, calc(100vw - 32px));
+          padding: 11px 14px;
+          border: 1px solid rgba(24, 224, 111, 0.34);
+          border-radius: 999px;
+          background: rgba(15, 18, 23, 0.94);
+          color: #f4f6fb;
+          box-shadow: 0 18px 46px rgba(0, 0, 0, 0.36), 0 0 34px rgba(24, 224, 111, 0.1);
+          backdrop-filter: blur(12px);
+        }
+        .operationToast strong {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          font-size: 13px;
+        }
+        .miniSpinner {
+          display: inline-block;
+          width: 16px;
+          height: 16px;
+          flex: 0 0 auto;
+          border-radius: 50%;
+          border: 2px solid rgba(24, 224, 111, 0.18);
+          border-top-color: #18e06f;
+          border-right-color: rgba(24, 224, 111, 0.72);
+          animation: spin 800ms linear infinite;
         }
         .brand {
           display: flex;
@@ -2659,6 +2705,11 @@ export default function PlaylistManager() {
         .statusLine {
           min-height: 24px;
           color: #18e06f;
+        }
+        .statusLine span {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
         }
         .statusLine strong {
           color: #ff4d4d;
