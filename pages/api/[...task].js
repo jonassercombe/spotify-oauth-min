@@ -4912,9 +4912,70 @@ const routes = {
      const { playlist_id, track_id, dir, steps = 1 } = await readBody(req);
      if (!playlist_id || !track_id || !dir) return bad(res, 400, "Missing playlist_id, track_id or dir");
    
-     // Ownership
-     const own = await sb(`/rest/v1/playlists?select=id&limit=1&id=eq.${encodeURIComponent(String(playlist_id))}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).then(r=>r.json());
-     if (!own?.[0]) return bad(res, 403, "Playlist not owned by user");
+     // Ownership + Spotify target. Moves must hit Spotify immediately, otherwise
+     // the next sync can read the old Spotify order back and make locked tracks jump.
+     const own = await sb(
+       `/rest/v1/playlists?select=id,playlist_id,connection_id,tracks_total&limit=1` +
+       `&id=eq.${encodeURIComponent(String(playlist_id))}` +
+       `&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`
+     ).then(r=>r.json());
+     const playlistRow = own?.[0];
+     if (!playlistRow) return bad(res, 403, "Playlist not owned by user");
+
+     const beforePosR = await sb(
+       `/rest/v1/playlist_items?select=position` +
+       `&playlist_id=eq.${encodeURIComponent(playlist_id)}` +
+       `&track_id=eq.${encodeURIComponent(track_id)}` +
+       `&order=position.asc&limit=1`
+     );
+     const beforeRow = beforePosR.ok ? (await beforePosR.json())?.[0] : null;
+     const beforePosition = Number.isFinite(Number(beforeRow?.position)) ? Number(beforeRow.position) : null;
+     const stepCount = Math.max(1, Number(steps) || 1);
+     const direction = String(dir || "").toLowerCase();
+     const estimatedTarget = beforePosition === null
+       ? null
+       : Math.max(0, beforePosition + (direction === "up" ? -stepCount : stepCount));
+
+     let spotifyMoved = false;
+     let spotifySnapshotId = null;
+     if (playlistRow.playlist_id && playlistRow.connection_id && estimatedTarget !== null) {
+       try {
+         const accessToken = await getAccessTokenFromConnection(playlistRow.connection_id);
+         const spotifyFrom = await findPlaylistTrackPosition(playlistRow.playlist_id, track_id, accessToken, beforePosition);
+         if (spotifyFrom >= 0) {
+           const meta = await fetchJSON(
+             `https://api.spotify.com/v1/playlists/${encodeURIComponent(playlistRow.playlist_id)}?fields=snapshot_id,tracks(total)`,
+             { headers: { Authorization: `Bearer ${accessToken}` } },
+             20000
+           );
+           if (!meta.r.ok) return bad(res, meta.r.status, `spotify_meta_failed: ${meta.text || JSON.stringify(meta.json)}`);
+           const spotifyTotal = Number(meta.json?.tracks?.total);
+           const maxTarget = Number.isFinite(spotifyTotal) && spotifyTotal > 0 ? spotifyTotal - 1 : Math.max(0, Number(playlistRow.tracks_total || 1) - 1);
+           const spotifyTo = Math.max(0, Math.min(maxTarget, estimatedTarget));
+           if (spotifyFrom !== spotifyTo) {
+             const reorder = await fetchJSON(
+               `https://api.spotify.com/v1/playlists/${encodeURIComponent(playlistRow.playlist_id)}/tracks`,
+               {
+                 method: "PUT",
+                 headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+                 body: JSON.stringify({
+                   range_start: spotifyFrom,
+                   insert_before: spotifyTo > spotifyFrom ? spotifyTo + 1 : spotifyTo,
+                   range_length: 1,
+                   ...(meta.json?.snapshot_id ? { snapshot_id: meta.json.snapshot_id } : {})
+                 })
+               },
+               20000
+             );
+             if (!reorder.r.ok) return bad(res, reorder.r.status, `spotify_reorder_failed: ${reorder.r.status} ${reorder.text || JSON.stringify(reorder.json)}`);
+             spotifyMoved = true;
+             spotifySnapshotId = reorder.json?.snapshot_id || meta.json?.snapshot_id || null;
+           }
+         }
+       } catch (e) {
+         return bad(res, 500, `spotify_reorder_exception: ${String(e?.message || e)}`);
+       }
+     }
    
      // RPC call
      const r = await sb(`/rest/v1/rpc/playlist_move_one`, {
@@ -4922,8 +4983,8 @@ const routes = {
        body: JSON.stringify({
          p_playlist_id: playlist_id,
          p_track_id: track_id,
-         p_dir: String(dir || "").toLowerCase(),
-         p_steps: Number(steps) || 1
+         p_dir: direction,
+         p_steps: stepCount
        })
      });
      const txt = await r.text();
@@ -4989,7 +5050,14 @@ const routes = {
        }).catch(() => {});
      }
    
-    return json(res, 200, { ok: true, result: j?.[0] || null, moved_position: movedPosition, cooldown_until: cooldownUntil });
+    return json(res, 200, {
+      ok: true,
+      result: j?.[0] || null,
+      moved_position: movedPosition,
+      spotify_moved: spotifyMoved,
+      spotify_snapshot_id: spotifySnapshotId,
+      cooldown_until: cooldownUntil
+    });
   },
    
   /* ---------- playlist-items/remove (POST, Bubble) ---------- */
