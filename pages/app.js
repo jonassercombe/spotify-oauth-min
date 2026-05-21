@@ -50,6 +50,7 @@ function spotifySetupErrorMessage(code = "") {
   if (code === "spotify_account_already_connected") return "This Spotify account is already connected to another PlaylistPilot workspace.";
   if (code === "missing_spotify_app_credentials") return "Save your Spotify API app credentials before connecting Spotify.";
   if (code === "token_exchange_failed") return "Spotify authorization failed. Check Client ID, Client Secret, and the saved Redirect URI in Spotify.";
+  if (code === "spotify_me_failed_403") return "Spotify rejected this account. Add the Spotify account name and email under Users and Access in your Spotify Developer app, then connect again.";
   if (code === "no_refresh_token_consent_required") return "Spotify did not return a refresh token. Retry Connect Spotify and approve access.";
   return `Spotify connection failed: ${code.replaceAll("_", " ")}`;
 }
@@ -368,6 +369,8 @@ export default function PlaylistManager() {
   const [spotifyClientSecret, setSpotifyClientSecret] = useState("");
   const [spotifyAppName, setSpotifyAppName] = useState("");
   const [spotifyRedirectUri, setSpotifyRedirectUri] = useState("https://playlist-pilot.com/api/oauth/spotify/callback");
+  const [initialSpotifySyncPending, setInitialSpotifySyncPending] = useState(false);
+  const [initialSpotifySyncUser, setInitialSpotifySyncUser] = useState("");
 
   const billing = userContext?.billing || {};
   const billingActive = !!billing.is_active;
@@ -462,6 +465,8 @@ export default function PlaylistManager() {
     }
     if (spotifyLinked) {
       setMessage("Spotify account connected");
+      setInitialSpotifySyncPending(true);
+      setInitialSpotifySyncUser(params.get("spotify_user") || "");
       params.delete("spotify_linked");
       params.delete("spotify_user");
     }
@@ -470,6 +475,13 @@ export default function PlaylistManager() {
       window.history.replaceState({}, "", `${window.location.pathname}${next ? `?${next}` : ""}${window.location.hash}`);
     }
   }, []);
+
+  useEffect(() => {
+    if (!initialSpotifySyncPending || !billingActive || !connectionId || !session?.access_token) return;
+    setInitialSpotifySyncPending(false);
+    setInitialSpotifySyncUser("");
+    importOnboardingPlaylists("New Spotify account connected. Syncing playlists and follower baselines");
+  }, [initialSpotifySyncPending, billingActive, connectionId, session?.access_token]);
 
   useEffect(() => {
     if (!userContext?.linked || view !== "dashboard") return;
@@ -686,10 +698,13 @@ export default function PlaylistManager() {
       const data = await api("/api/connections/list", { accessToken: accessToken() });
       setConnections(data);
       const stored = readStoredSelection(userContext);
+      const connectedConnectionId = initialSpotifySyncUser
+        ? data.find((c) => c.spotify_user_id === initialSpotifySyncUser)?.id || ""
+        : "";
       const storedConnectionId = stored.connectionId && data.some((c) => c.id === stored.connectionId)
         ? stored.connectionId
         : "";
-      const nextConnectionId = storedConnectionId || data[0]?.id || "";
+      const nextConnectionId = connectedConnectionId || storedConnectionId || data[0]?.id || "";
       if (connectionId !== nextConnectionId) setConnectionId(nextConnectionId);
       return data;
     });
@@ -1101,9 +1116,9 @@ export default function PlaylistManager() {
     });
   }
 
-  async function importOnboardingPlaylists() {
+  async function importOnboardingPlaylists(label = "Playlists imported") {
     if (!connectionId) return;
-    await run("Playlists imported", async () => {
+    await run(label, async () => {
       await api("/api/playlists/sync?with_followers=1", {
         method: "POST",
         accessToken: accessToken(),
@@ -1431,6 +1446,7 @@ export default function PlaylistManager() {
                     <li>Open the Spotify Developer Dashboard and create an app.</li>
                     <li>Add this Redirect URI in Spotify app settings.</li>
                     <li>Click Spotify's Save button after adding the Redirect URI.</li>
+                    <li>Add every Spotify account you want to connect under Users and Access.</li>
                     <li>Paste Client ID and Client Secret below.</li>
                   </ol>
                 </div>
@@ -1452,6 +1468,7 @@ export default function PlaylistManager() {
                   <div className="setupNotice">
                     <strong>Before connecting</strong>
                     <p>Spotify must have this exact Redirect URI saved: <code>{spotifyRedirectUri}</code>. If Spotify shows "redirect_uri: Not matching configuration", reopen your Spotify Developer app, add the URI, and press Save.</p>
+                    <p>If Spotify returns a 403 after login, add this Spotify account with its name and email under Users and Access in the same Developer app first.</p>
                   </div>
                 </div>
                 <div className="onboardingActions">
