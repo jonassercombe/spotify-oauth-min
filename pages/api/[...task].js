@@ -518,6 +518,30 @@ async function fetchSpotifyPlaylistSnapshot(playlist, access_token, knownMeta = 
   return { meta, tracks };
 }
 
+async function enrichBackupTracksWithAutomationState(playlist_id, tracks) {
+  const [locksR, slotsR] = await Promise.all([
+    sb(`/rest/v1/playlist_item_locks?select=track_id,is_locked,locked_position,expiry_weeks&playlist_id=eq.${encodeURIComponent(playlist_id)}`).catch(() => null),
+    sb(`/rest/v1/playlist_flex_slots?select=position,current_track_id,last_rotated_at&playlist_id=eq.${encodeURIComponent(playlist_id)}`).catch(() => null)
+  ]);
+  const lockRows = locksR?.ok ? await locksR.json().catch(() => []) : [];
+  const slotRows = slotsR?.ok ? await slotsR.json().catch(() => []) : [];
+  const locksByTrack = new Map((Array.isArray(lockRows) ? lockRows : []).filter(x => x?.track_id).map(x => [x.track_id, x]));
+  const flexByTrack = new Map((Array.isArray(slotRows) ? slotRows : []).filter(x => x?.current_track_id).map(x => [x.current_track_id, x]));
+  return (Array.isArray(tracks) ? tracks : []).map((track) => {
+    const lock = locksByTrack.get(track.track_id);
+    const flex = flexByTrack.get(track.track_id);
+    return {
+      ...track,
+      is_locked: !!lock?.is_locked,
+      locked_position: lock?.locked_position ?? null,
+      expiry_weeks: lock?.expiry_weeks ?? null,
+      is_rotator: !!flex,
+      rotator_position: flex?.position ?? null,
+      rotator_last_rotated_at: flex?.last_rotated_at ?? null
+    };
+  });
+}
+
 async function createPlaylistBackup(playlist, { reason = "manual", onlyIfChanged = false } = {}) {
   const access_token = await getAccessTokenFromConnection(playlist.connection_id);
   const metaR = await fetchJSON(
@@ -538,6 +562,7 @@ async function createPlaylistBackup(playlist, { reason = "manual", onlyIfChanged
     if (last?.snapshot_id === snapshot_id) return { skipped: true, reason: "unchanged_snapshot", snapshot_id };
   }
   const { tracks } = await fetchSpotifyPlaylistSnapshot(playlist, access_token, meta);
+  const enrichedTracks = await enrichBackupTracksWithAutomationState(playlist.id, tracks);
   const payload = {
     playlist_id: playlist.id,
     spotify_playlist_id: playlist.playlist_id,
@@ -547,8 +572,8 @@ async function createPlaylistBackup(playlist, { reason = "manual", onlyIfChanged
     description: meta?.description || null,
     image: meta?.images?.[0]?.url || playlist.image || null,
     followers: meta?.followers?.total ?? playlist.followers ?? null,
-    tracks_total: tracks.length,
-    tracks,
+    tracks_total: enrichedTracks.length,
+    tracks: enrichedTracks,
     bubble_user_id: playlist.bubble_user_id,
     reason
   };
@@ -2788,11 +2813,23 @@ const routes = {
     const owned = await getOwnedPlaylist(playlist_id, bubbleUserId);
     if (!owned) return bad(res, 403, "playlist_not_owned");
     const limit = Math.max(1, Math.min(50, Number(req.query.limit || "10")));
-    const r = await sb(
-      `/rest/v1/playlist_backups?select=id,taken_at,snapshot_id,name,image,followers,tracks_total` +
+    let r = await sb(
+      `/rest/v1/playlist_backups?select=id,taken_at,snapshot_id,name,image,followers,tracks_total,reason` +
       `&playlist_id=eq.${encodeURIComponent(playlist_id)}` +
       `&order=taken_at.desc&limit=${encodeURIComponent(limit)}`
     );
+    if (!r.ok) {
+      const text = await r.text();
+      if (text.includes("reason")) {
+        r = await sb(
+          `/rest/v1/playlist_backups?select=id,taken_at,snapshot_id,name,image,followers,tracks_total` +
+          `&playlist_id=eq.${encodeURIComponent(playlist_id)}` +
+          `&order=taken_at.desc&limit=${encodeURIComponent(limit)}`
+        );
+      } else {
+        return bad(res, 500, `backups_select_failed: ${text}`);
+      }
+    }
     if (!r.ok) return bad(res, 500, `backups_select_failed: ${await r.text()}`);
     return json(res, 200, await r.json());
   },
@@ -4490,7 +4527,20 @@ const routes = {
            meta = await mr.json().catch(() => ({}));
          } catch {/* ignore */}
    
-         const tracksForBackup = items.map((it, i) => {
+         const backupSnapshot = (meta && meta.snapshot_id) || snapshot_id || null;
+         if (backupSnapshot) {
+           const lastBackupR = await sb(
+             `/rest/v1/playlist_backups?select=id` +
+             `&playlist_id=eq.${encodeURIComponent(p.id)}` +
+             `&snapshot_id=eq.${encodeURIComponent(backupSnapshot)}` +
+             `&limit=1`
+           ).catch(() => null);
+           const lastBackups = lastBackupR?.ok ? await lastBackupR.json().catch(() => []) : [];
+           const alreadyBackedUp = Array.isArray(lastBackups) && lastBackups.length > 0;
+           if (alreadyBackedUp) throw new Error("backup_skipped_duplicate_snapshot");
+         }
+
+         const tracksForBackupBase = items.map((it, i) => {
            const t = it?.track || {};
            const album = t?.album || {};
            const artists = Array.isArray(t?.artists) ? t.artists : [];
@@ -4504,14 +4554,12 @@ const routes = {
              added_at: it?.added_at || null
            };
          });
+         const tracksForBackup = await enrichBackupTracksWithAutomationState(p.id, tracksForBackupBase);
    
-         await sb(`/rest/v1/playlist_backups`, {
-           method: "POST",
-           headers: { Prefer: "return=minimal" },
-           body: JSON.stringify([{
+         const backupPayload = {
              playlist_id: p.id,
              spotify_playlist_id: p.playlist_id,
-             snapshot_id: (meta && meta.snapshot_id) || snapshot_id || null,
+             snapshot_id: backupSnapshot,
              taken_at: new Date().toISOString(),
              name: meta?.name || null,
              description: meta?.description || null,
@@ -4519,11 +4567,31 @@ const routes = {
              followers: (meta?.followers && meta.followers.total) ?? null,
              tracks_total: items.length,
              tracks: tracksForBackup,
-             bubble_user_id: p.bubble_user_id
-           }])
-         }).catch(e => console.warn("backup_insert_failed", e?.message || e));
+             bubble_user_id: p.bubble_user_id,
+             reason: "sync"
+           };
+         let backupInsert = await sb(`/rest/v1/playlist_backups`, {
+           method: "POST",
+           headers: { Prefer: "return=minimal" },
+           body: JSON.stringify([backupPayload])
+         });
+         if (!backupInsert.ok) {
+           const text = await backupInsert.text();
+           if (text.includes("reason")) {
+             const { reason: _reason, ...fallbackPayload } = backupPayload;
+             backupInsert = await sb(`/rest/v1/playlist_backups`, {
+               method: "POST",
+               headers: { Prefer: "return=minimal" },
+               body: JSON.stringify([fallbackPayload])
+             });
+           } else {
+             console.warn("backup_insert_failed", text);
+           }
+         }
        } catch (e) {
-         console.warn("backup_block_failed", e?.message || e);
+         if (String(e?.message || e) !== "backup_skipped_duplicate_snapshot") {
+           console.warn("backup_block_failed", e?.message || e);
+         }
        }
    
        /* === (A) Expiry: alte, UNGElOCKTE Items löschen (positionsgenau) === */

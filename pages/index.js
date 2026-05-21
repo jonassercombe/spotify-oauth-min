@@ -680,8 +680,10 @@ export default function PlaylistManager() {
   async function restoreBackup(backup) {
     if (!playlistId || !backup?.id) return;
     const label = formatShortDate(String(backup.taken_at || "").slice(0, 10)) || "this backup";
-    const ok = window.confirm(`Restore ${label}? PlaylistPilot will create a safety backup first, then replace the current Spotify playlist order.`);
-    if (!ok) return;
+    const typed = window.prompt(
+      `WARNING: Restore ${label}?\n\nPlaylistPilot will create a safety backup first, then replace the current Spotify playlist order with this backup.\n\nType ARE YOU SURE to continue.`
+    );
+    if (typed !== "ARE YOU SURE") return;
     setRestoringBackupId(backup.id);
     try {
       await run("Backup restored", async () => {
@@ -1686,7 +1688,7 @@ export default function PlaylistManager() {
                           <Artwork src={backup.image || playlist?.image} alt="" size="sm" />
                           <span>
                             <strong>{formatShortDate(String(backup.taken_at || "").slice(0, 10)) || "Backup"}</strong>
-                            <small>{formatNumber(backup.tracks_total)} tracks · {backup.snapshot_id ? `snapshot ${String(backup.snapshot_id).slice(0, 8)}` : "no snapshot"}</small>
+                            <small>{backup.reason ? `${backup.reason} · ` : ""}{formatNumber(backup.tracks_total)} tracks · {backup.snapshot_id ? `snapshot ${String(backup.snapshot_id).slice(0, 8)}` : "no snapshot"}</small>
                           </span>
                           <button
                             className="smallOutlineButton"
