@@ -6451,7 +6451,7 @@ const routes = {
       `&limit=1&playlist_id=eq.${encodeURIComponent(playlist_id)}&track_id=eq.${encodeURIComponent(track_id)}`
     ).then(r => r.json()).catch(() => []);
     const item = itemRows?.[0] || {};
-    const position = Number.isFinite(Number(lock.locked_position)) ? Number(lock.locked_position) : Number(item.position || 0);
+    const position = Number.isFinite(Number(lock?.locked_position)) ? Number(lock.locked_position) : Number(item.position || 0);
 
     if (!lock?.is_locked) {
       const lockUp = await sb(`/rest/v1/playlist_item_locks?on_conflict=playlist_id,track_id`, {
