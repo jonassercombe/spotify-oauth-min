@@ -5833,8 +5833,10 @@ const routes = {
      if (playlistRow.playlist_id && playlistRow.connection_id && estimatedTarget !== null) {
        try {
          const accessToken = await getAccessTokenFromConnection(playlistRow.connection_id);
-         const spotifyFrom = await findPlaylistTrackPosition(playlistRow.playlist_id, track_id, accessToken, beforePosition);
-         if (spotifyFrom >= 0) {
+         let attempt = 0;
+         while (attempt < 3) {
+           const spotifyFrom = await findPlaylistTrackPosition(playlistRow.playlist_id, track_id, accessToken, beforePosition);
+           if (spotifyFrom < 0) break;
            const meta = await fetchJSON(
              `https://api.spotify.com/v1/playlists/${encodeURIComponent(playlistRow.playlist_id)}?fields=snapshot_id,tracks(total)`,
              { headers: { Authorization: `Bearer ${accessToken}` } },
@@ -5859,10 +5861,15 @@ const routes = {
                },
                20000
              );
+             if (reorder.r.status === 409 && ++attempt < 3) {
+               await sleep(120 + Math.random() * 220);
+               continue;
+             }
              if (!reorder.r.ok) return bad(res, reorder.r.status, `spotify_reorder_failed: ${reorder.r.status} ${reorder.text || JSON.stringify(reorder.json)}`);
              spotifyMoved = true;
              spotifySnapshotId = reorder.json?.snapshot_id || meta.json?.snapshot_id || null;
            }
+           break;
          }
        } catch (e) {
          return bad(res, 500, `spotify_reorder_exception: ${String(e?.message || e)}`);

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Head from "next/head";
 import { ArrowDown, ArrowUp, GripVertical, Lock, Settings, Shuffle, TimerReset, Trash2, Unlock, X } from "lucide-react";
 import { getSupabaseBrowserClient } from "../lib/supabaseBrowser";
@@ -343,6 +343,7 @@ export default function PlaylistManager() {
   const [backupDiff, setBackupDiff] = useState(null);
   const [backupRestoreMode, setBackupRestoreMode] = useState("order");
   const [busy, setBusy] = useState(false);
+  const moveInFlightRef = useRef(false);
   const [busyLabel, setBusyLabel] = useState("");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -951,6 +952,8 @@ export default function PlaylistManager() {
   }
 
   async function moveTrack(track, dir) {
+    if (moveInFlightRef.current) return;
+    moveInFlightRef.current = true;
     const previousTracks = tracks;
     const targetPosition = Number(track.position) + (dir === "up" ? -1 : 1);
     if (ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(reorderTracks(tracks, track.track_id, targetPosition));
@@ -968,13 +971,17 @@ export default function PlaylistManager() {
       await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
     }).then((result) => {
       if (result === null && ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(previousTracks);
+    }).finally(() => {
+      moveInFlightRef.current = false;
     });
   }
 
   async function moveTrackTo(track, targetPosition) {
+    if (moveInFlightRef.current) return;
     const from = Number(track.position);
     const to = Math.max(0, Math.min(tracks.length - 1, Number(targetPosition)));
     if (!Number.isFinite(from) || !Number.isFinite(to) || from === to) return;
+    moveInFlightRef.current = true;
     const previousTracks = tracks;
     if (ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(reorderTracks(tracks, track.track_id, to));
     await run("Track reordered", async () => {
@@ -991,6 +998,8 @@ export default function PlaylistManager() {
       await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
     }).then((result) => {
       if (result === null && ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(previousTracks);
+    }).finally(() => {
+      moveInFlightRef.current = false;
     });
   }
 
