@@ -1284,13 +1284,13 @@ export default function PlaylistManager() {
           </div>
         </div>
         <nav className="mainNav" aria-label="Main navigation">
-          {session ? (
+          {session && userContext?.linked && billingActive ? (
             <div className="navTabs">
               <button className={view === "dashboard" ? "navButton active" : "navButton"} onClick={() => setView("dashboard")}>Dashboard</button>
               <button className={view === "manager" ? "navButton active" : "navButton"} onClick={() => setView("manager")}>Playlist Manager</button>
             </div>
           ) : null}
-          {session ? (
+          {session && userContext?.linked && billingActive ? (
             <button className="settingsButton topSettingsButton" onClick={() => setSettingsOpen(true)} aria-label="Open settings">
               <Settings aria-hidden="true" />
             </button>
@@ -1326,6 +1326,36 @@ export default function PlaylistManager() {
           <h2>Loading workspace</h2>
           <p>Syncing your accounts, playlists, and saved position.</p>
           {error ? <strong>{error}</strong> : null}
+        </section>
+      ) : !billingActive ? (
+        <section className="subscriptionGate" aria-label="PlaylistPilot subscription required">
+          <div className="subscriptionGateCopy">
+            <span>Start</span>
+            <h2>Choose a plan before opening your workspace</h2>
+            <p>PlaylistPilot starts with a 30-day Stripe trial. Your plan controls how many Spotify accounts you can connect and keeps playlist tools behind an active workspace.</p>
+            {error ? <strong>{error}</strong> : null}
+            <button className="secondaryOutline" onClick={signOut}>Log out</button>
+          </div>
+          <div className="subscriptionGatePlans">
+            <article>
+              <span>Economy Class</span>
+              <strong>1 Spotify account seat</strong>
+              <small>Playlist tools, rotation, automations, dashboard.</small>
+              <div>
+                <button disabled={busy} onClick={() => startCheckout("economy", "monthly")}>8 EUR / month</button>
+                <button className="secondaryOutline" disabled={busy} onClick={() => startCheckout("economy", "yearly")}>79 EUR / year</button>
+              </div>
+            </article>
+            <article>
+              <span>Business Class</span>
+              <strong>5 Spotify account seats</strong>
+              <small>For multi-account curator workflows.</small>
+              <div>
+                <button disabled={busy} onClick={() => startCheckout("business", "monthly")}>15 EUR / month</button>
+                <button className="secondaryOutline" disabled={busy} onClick={() => startCheckout("business", "yearly")}>149 EUR / year</button>
+              </div>
+            </article>
+          </div>
         </section>
       ) : (
       <>
@@ -2401,6 +2431,66 @@ export default function PlaylistManager() {
         }
         .loginScreen strong {
           color: #ff4d4d;
+        }
+        .subscriptionGate {
+          width: min(1180px, 100%);
+          margin: auto;
+          display: grid;
+          grid-template-columns: minmax(300px, 0.9fr) minmax(420px, 1fr);
+          align-items: center;
+          gap: clamp(18px, 3vw, 42px);
+          padding: clamp(28px, 5vw, 64px);
+        }
+        .subscriptionGateCopy,
+        .subscriptionGatePlans,
+        .subscriptionGatePlans article,
+        .subscriptionGatePlans article div {
+          display: grid;
+          gap: 12px;
+        }
+        .subscriptionGateCopy > span,
+        .subscriptionGatePlans article > span {
+          color: #18e06f;
+          font-size: 12px;
+          font-weight: 900;
+          text-transform: uppercase;
+        }
+        .subscriptionGateCopy h2 {
+          font-size: clamp(30px, 4vw, 52px);
+          line-height: 1;
+        }
+        .subscriptionGateCopy p,
+        .subscriptionGatePlans small {
+          color: #a6adba;
+          line-height: 1.5;
+        }
+        .subscriptionGateCopy strong {
+          color: #ff6b6b;
+        }
+        .subscriptionGateCopy button {
+          width: fit-content;
+        }
+        .subscriptionGatePlans {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .subscriptionGatePlans article {
+          min-width: 0;
+          min-height: 276px;
+          align-content: start;
+          padding: 20px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #181c23;
+        }
+        .subscriptionGatePlans article strong {
+          min-height: 52px;
+          color: #f4f6fb;
+          font-size: 24px;
+          line-height: 1.15;
+        }
+        .subscriptionGatePlans article div {
+          align-self: end;
+          margin-top: auto;
         }
         .loadingScreen {
           display: grid;
@@ -4449,7 +4539,9 @@ export default function PlaylistManager() {
           .onboardingSteps,
           .onboardingStage,
           .onboardingReady,
-          .onboardingPlanGrid {
+          .onboardingPlanGrid,
+          .subscriptionGate,
+          .subscriptionGatePlans {
             grid-template-columns: 1fr;
           }
           .onboardingHeader {
