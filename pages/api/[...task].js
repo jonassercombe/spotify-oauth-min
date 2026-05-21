@@ -137,7 +137,14 @@ async function getUserContext(req) {
     const userUpsert = await sb(`/rest/v1/app_users?on_conflict=bubble_user_id`, {
       method: "POST",
       headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
-      body: JSON.stringify([{ bubble_user_id }])
+      body: JSON.stringify([{
+        bubble_user_id,
+        subscription_status: "none",
+        sub_status: "none",
+        is_active: false,
+        seats_limit: 0,
+        seats_used: 0,
+      }])
     });
     if (userUpsert.ok) {
       const linkInsert = await sb(`/rest/v1/user_identity_links`, {
@@ -230,7 +237,13 @@ function mapStripePlan(priceId) {
   return { plan_code: "economy", seats_limit: 1, features: { playlist_tools: true, rotator: true, automations: true } };
 }
 
-function isAppSubscriptionActive(row = {}) {
+function isAppSubscriptionActive(row = {}, bubble_user_id = "") {
+  const hasProviderSubscription = !!(
+    row.provider_subscription_id ||
+    row.stripe_subscription_id
+  );
+  // Fresh Supabase-auth workspaces must not inherit legacy app_users defaults.
+  if (String(bubble_user_id || row.bubble_user_id || "").startsWith("auth:") && !hasProviderSubscription) return false;
   if (row.is_active === true) return true;
   const status = String(row.sub_status || row.subscription_status || "").toLowerCase();
   if (["active", "trialing"].includes(status)) return true;
@@ -251,7 +264,7 @@ async function getBillingState(bubble_user_id) {
   const row = r.ok ? (await r.json().catch(() => []))?.[0] : null;
   return {
     row,
-    is_active: isAppSubscriptionActive(row || {}),
+    is_active: isAppSubscriptionActive(row || {}, bubble_user_id),
     status: row?.sub_status || row?.subscription_status || "none",
   };
 }
@@ -1382,8 +1395,8 @@ const routes = {
       mode: "subscription",
       customer: customerId,
       line_items: [{ price, quantity: 1 }],
-      success_url: `${base}/?billing=success`,
-      cancel_url: `${base}/?billing=cancelled`,
+      success_url: `${base}/app?billing=success`,
+      cancel_url: `${base}/app?billing=cancelled`,
       metadata: { bubble_user_id: ctx.bubble_user_id, plan: selectedPlan.plan_code, interval: selectedPlan.interval },
       subscription_data: {
         trial_period_days: 30,
@@ -3564,6 +3577,13 @@ const routes = {
          const base = return_to || "/";
          const sep  = base.includes("?") ? "&" : "?";
          return res.redirect(`${base}${sep}spotify_error=missing_bubble_user_id`);
+       }
+
+       const billing = await getBillingState(bubble_user_id).catch(() => null);
+       if (!billing?.is_active) {
+         const base = return_to || "/";
+         const sep  = base.includes("?") ? "&" : "?";
+         return res.redirect(`${base}${sep}spotify_error=subscription_required`);
        }
 
        const credentials = await getSpotifyAppCredentialsForUser(bubble_user_id, { allowFallback: true });

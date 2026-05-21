@@ -43,6 +43,16 @@ function formatShortDate(value) {
   return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(d);
 }
 
+function spotifySetupErrorMessage(code = "") {
+  if (!code) return "";
+  if (code === "subscription_required") return "Start a plan before connecting Spotify accounts.";
+  if (code === "seat_limit_reached") return "This plan has no free Spotify account seats left.";
+  if (code === "missing_spotify_app_credentials") return "Save your Spotify API app credentials before connecting Spotify.";
+  if (code === "token_exchange_failed") return "Spotify authorization failed. Check Client ID, Client Secret, and the saved Redirect URI in Spotify.";
+  if (code === "no_refresh_token_consent_required") return "Spotify did not return a refresh token. Retry Connect Spotify and approve access.";
+  return `Spotify connection failed: ${code.replaceAll("_", " ")}`;
+}
+
 function sortPlaylistsByFollowers(items = []) {
   return [...items].sort((a, b) => {
     const aFollowers = Number(a.followers);
@@ -366,10 +376,11 @@ export default function PlaylistManager() {
   const safeMoversPage = Math.min(moversPage, moversPageCount - 1);
   const visibleMovers = movers.slice(safeMoversPage * moversPageSize, safeMoversPage * moversPageSize + moversPageSize);
   const growthReady = !!(dashboardSeries?.ready || dashboardSummary?.totals?.growth_ready);
+  const onboardingBillingReady = billingActive;
   const onboardingCredentialsReady = !!spotifyCredentials?.configured;
   const onboardingConnectionsReady = connections.length > 0;
   const onboardingPlaylistsReady = playlists.length > 0;
-  const onboardingStep = !onboardingCredentialsReady ? 1 : !onboardingConnectionsReady ? 2 : !onboardingPlaylistsReady ? 3 : 4;
+  const onboardingStep = !onboardingBillingReady ? 1 : !onboardingCredentialsReady ? 2 : !onboardingConnectionsReady ? 3 : !onboardingPlaylistsReady ? 4 : 5;
   const [isMobileViewport, setIsMobileViewport] = useState(false);
 
   useEffect(() => {
@@ -431,10 +442,31 @@ export default function PlaylistManager() {
     const key = `playlistpilot:onboarding-dismissed:${userContext.bubble_user_id || userContext.email}`;
     const dismissed = typeof window !== "undefined" && window.localStorage.getItem(key) === "1";
     setOnboardingDismissed(dismissed);
-    if (!dismissed && (!onboardingCredentialsReady || !onboardingConnectionsReady || !onboardingPlaylistsReady)) {
+    if (!dismissed && (!onboardingBillingReady || !onboardingCredentialsReady || !onboardingConnectionsReady || !onboardingPlaylistsReady)) {
       setOnboardingOpen(true);
     }
-  }, [userContext?.linked, userContext?.bubble_user_id, userContext?.email, spotifyCredentials, onboardingCredentialsReady, onboardingConnectionsReady, onboardingPlaylistsReady]);
+  }, [userContext?.linked, userContext?.bubble_user_id, userContext?.email, spotifyCredentials, onboardingBillingReady, onboardingCredentialsReady, onboardingConnectionsReady, onboardingPlaylistsReady]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    const spotifyError = params.get("spotify_error");
+    const spotifyLinked = params.get("spotify_linked");
+    if (spotifyError) {
+      setError(spotifySetupErrorMessage(spotifyError));
+      setOnboardingOpen(true);
+      params.delete("spotify_error");
+    }
+    if (spotifyLinked) {
+      setMessage("Spotify account connected");
+      params.delete("spotify_linked");
+      params.delete("spotify_user");
+    }
+    if (spotifyError || spotifyLinked) {
+      const next = params.toString();
+      window.history.replaceState({}, "", `${window.location.pathname}${next ? `?${next}` : ""}${window.location.hash}`);
+    }
+  }, []);
 
   useEffect(() => {
     if (!userContext?.linked || view !== "dashboard") return;
@@ -1303,23 +1335,27 @@ export default function PlaylistManager() {
               <div>
                 <span>Setup</span>
                 <h2>Get your first playlist into PlaylistPilot</h2>
-                <p>Connect the Spotify app credentials you control, authorize Spotify, then import your playlists and baseline stats.</p>
+                <p>Start your plan, connect the Spotify app credentials you control, authorize Spotify, then import your playlists and baseline stats.</p>
               </div>
               <button className="iconOnlyButton" onClick={dismissOnboarding} aria-label="Close onboarding">
                 <X aria-hidden="true" />
               </button>
             </div>
             <ol className="onboardingSteps">
-              <li className={onboardingStep === 1 ? "active" : onboardingCredentialsReady ? "done" : ""}>
+              <li className={onboardingStep === 1 ? "active" : onboardingBillingReady ? "done" : ""}>
                 <b>1</b>
+                <span><strong>Plan</strong><small>{onboardingBillingReady ? "Subscription active" : "Start your trial and choose seats"}</small></span>
+              </li>
+              <li className={onboardingStep === 2 ? "active" : onboardingCredentialsReady ? "done" : ""}>
+                <b>2</b>
                 <span><strong>Spotify API App</strong><small>{onboardingCredentialsReady ? "Credentials saved" : "Create credentials once for your account"}</small></span>
               </li>
-              <li className={onboardingStep === 2 ? "active" : onboardingConnectionsReady ? "done" : ""}>
-                <b>2</b>
+              <li className={onboardingStep === 3 ? "active" : onboardingConnectionsReady ? "done" : ""}>
+                <b>3</b>
                 <span><strong>Connect Spotify</strong><small>{onboardingConnectionsReady ? `${connections.length} account connected` : "Authorize the account to manage"}</small></span>
               </li>
-              <li className={onboardingStep === 3 ? "active" : onboardingPlaylistsReady ? "done" : ""}>
-                <b>3</b>
+              <li className={onboardingStep === 4 ? "active" : onboardingPlaylistsReady ? "done" : ""}>
+                <b>4</b>
                 <span><strong>Import Playlists</strong><small>{onboardingPlaylistsReady ? `${playlists.length} playlists available` : "Load playlists and start follower baselines"}</small></span>
               </li>
             </ol>
@@ -1327,10 +1363,38 @@ export default function PlaylistManager() {
             {onboardingStep === 1 ? (
               <div className="onboardingStage">
                 <div className="onboardingCopy">
+                  <h3>Choose the account capacity you need</h3>
+                  <p>PlaylistPilot starts with a 30-day Stripe trial. Billing comes first so Spotify accounts are only connected to active workspaces.</p>
+                </div>
+                <div className="onboardingPlanGrid">
+                  <article>
+                    <span>Economy Class</span>
+                    <strong>1 Spotify account seat</strong>
+                    <div>
+                      <button disabled={busy} onClick={() => startCheckout("economy", "monthly")}>8 EUR / month</button>
+                      <button className="secondaryOutline" disabled={busy} onClick={() => startCheckout("economy", "yearly")}>79 EUR / year</button>
+                    </div>
+                  </article>
+                  <article>
+                    <span>Business Class</span>
+                    <strong>5 Spotify account seats</strong>
+                    <div>
+                      <button disabled={busy} onClick={() => startCheckout("business", "monthly")}>15 EUR / month</button>
+                      <button className="secondaryOutline" disabled={busy} onClick={() => startCheckout("business", "yearly")}>149 EUR / year</button>
+                    </div>
+                  </article>
+                </div>
+              </div>
+            ) : null}
+
+            {onboardingStep === 2 ? (
+              <div className="onboardingStage">
+                <div className="onboardingCopy">
                   <h3>Create your Spotify Developer app</h3>
                   <ol>
                     <li>Open the Spotify Developer Dashboard and create an app.</li>
                     <li>Add this Redirect URI in Spotify app settings.</li>
+                    <li>Click Spotify's Save button after adding the Redirect URI.</li>
                     <li>Paste Client ID and Client Secret below.</li>
                   </ol>
                 </div>
@@ -1344,11 +1408,15 @@ export default function PlaylistManager() {
               </div>
             ) : null}
 
-            {onboardingStep === 2 ? (
+            {onboardingStep === 3 ? (
               <div className="onboardingStage">
                 <div className="onboardingCopy">
                   <h3>Authorize a Spotify account</h3>
                   <p>The connected Spotify account determines which playlists PlaylistPilot can import and edit.</p>
+                  <div className="setupNotice">
+                    <strong>Before connecting</strong>
+                    <p>Spotify must have this exact Redirect URI saved: <code>{spotifyRedirectUri}</code>. If Spotify shows "redirect_uri: Not matching configuration", reopen your Spotify Developer app, add the URI, and press Save.</p>
+                  </div>
                 </div>
                 <div className="onboardingActions">
                   <button disabled={busy} onClick={startSpotifyConnect}>Connect Spotify</button>
@@ -1357,7 +1425,7 @@ export default function PlaylistManager() {
               </div>
             ) : null}
 
-            {onboardingStep === 3 ? (
+            {onboardingStep === 4 ? (
               <div className="onboardingStage">
                 <div className="onboardingCopy">
                   <h3>Import playlists and start tracking</h3>
@@ -1370,7 +1438,7 @@ export default function PlaylistManager() {
               </div>
             ) : null}
 
-            {onboardingStep === 4 ? (
+            {onboardingStep === 5 ? (
               <div className="onboardingStage onboardingReady">
                 <div>
                   <h3>Your workspace is ready</h3>
@@ -2431,7 +2499,7 @@ export default function PlaylistManager() {
         }
         .onboardingSteps {
           display: grid;
-          grid-template-columns: repeat(3, minmax(0, 1fr));
+          grid-template-columns: repeat(4, minmax(0, 1fr));
           gap: 10px;
           margin: 0;
           padding: 0;
@@ -2503,6 +2571,46 @@ export default function PlaylistManager() {
         .onboardingForm {
           display: grid;
           gap: 10px;
+        }
+        .onboardingPlanGrid {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 10px;
+        }
+        .onboardingPlanGrid article,
+        .setupNotice {
+          display: grid;
+          gap: 8px;
+          min-width: 0;
+          padding: 12px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #181c23;
+        }
+        .onboardingPlanGrid span,
+        .setupNotice strong {
+          color: #18e06f;
+          font-size: 12px;
+          font-weight: 900;
+          text-transform: uppercase;
+        }
+        .onboardingPlanGrid strong {
+          color: #f4f6fb;
+        }
+        .onboardingPlanGrid div {
+          display: grid;
+          gap: 8px;
+        }
+        .setupNotice {
+          border-color: rgba(24, 224, 111, 0.28);
+          background: rgba(24, 224, 111, 0.07);
+        }
+        .setupNotice p {
+          margin: 0;
+        }
+        .setupNotice code {
+          color: #f4f6fb;
+          overflow-wrap: anywhere;
         }
         .onboardingForm label span {
           color: #a6adba;
@@ -4339,7 +4447,8 @@ export default function PlaylistManager() {
           }
           .onboardingSteps,
           .onboardingStage,
-          .onboardingReady {
+          .onboardingReady,
+          .onboardingPlanGrid {
             grid-template-columns: 1fr;
           }
           .onboardingHeader {
