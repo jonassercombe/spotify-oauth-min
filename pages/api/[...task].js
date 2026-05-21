@@ -68,6 +68,34 @@ async function sb(path, init = {}) {
   return fetch(url, { ...init, headers });
 }
 
+async function scopedPlaylistUpsert(batch) {
+  const rows = Array.isArray(batch) ? batch : [batch];
+  const scoped = await sb(`/rest/v1/playlists?on_conflict=connection_id,playlist_id`, {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: JSON.stringify(rows),
+  });
+  if (scoped.ok) return scoped;
+
+  const scopedText = await scoped.text().catch(() => "");
+  const missingScopedConstraint =
+    scoped.status === 400 &&
+    /connection_id|playlist_id|constraint|schema cache|unique/i.test(scopedText);
+  if (!missingScopedConstraint) {
+    return new Response(scopedText, { status: scoped.status, statusText: scoped.statusText });
+  }
+
+  // Compatibility path until the DB migration adding unique(connection_id, playlist_id) is applied.
+  return sb(`/rest/v1/playlists?on_conflict=playlist_id`, {
+    method: "POST",
+    headers: {
+      Prefer: "resolution=merge-duplicates,return=representation",
+      "x-playlistpilot-fallback": "global-playlist-id",
+    },
+    body: JSON.stringify(rows),
+  });
+}
+
 function checkCronAuth(req) {
   const want = process.env.CRON_SECRET || "";
   const gotAuth = req.headers?.authorization || "";
@@ -4138,40 +4166,27 @@ const routes = {
          }
        }
    
-       // --- Helper: lokale Playlist-Zeile sichern/holen (UUID) für (connection_id + spotify_playlist_id)
-       // Erwartetes Schema (typisch):
-       //   playlists(id uuid pk, connection_id uuid, bubble_user_id text, spotify_playlist_id text unique per connection, name text, owner_spotify_id text, ...)
+       // --- Helper: lokale Playlist-Zeile sichern/holen (UUID) für (connection_id + Spotify playlist_id)
        async function ensureLocalPlaylistRow(conn, spPlaylist, accessToken) {
          const spotify_playlist_id = spPlaylist.id;
          const name = spPlaylist.name || null;
-         const owner_spotify_id = spPlaylist.owner?.id || null;
    
-         // Versuche „on_conflict“ (falls Unique-Index existiert: e.g. (connection_id, spotify_playlist_id))
-         const resp = await fetch(
-           `${process.env.SUPABASE_URL}/rest/v1/playlists?on_conflict=connection_id,spotify_playlist_id`,
-           {
-             method: "POST",
-             headers: {
-               apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-               Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-               "Content-Type": "application/json",
-               Prefer: "resolution=merge-duplicates,return=representation",
-             },
-             body: JSON.stringify({
+         const resp = await scopedPlaylistUpsert([{
                connection_id: conn.id,
                bubble_user_id: conn.bubble_user_id,
-               spotify_playlist_id,
+               playlist_id: spotify_playlist_id,
                name,
-               owner_spotify_id,
+               description: spPlaylist.description || null,
+               image: spPlaylist.images?.[0]?.url || null,
+               is_public: !!spPlaylist.public,
+               tracks_total: spPlaylist.tracks?.total ?? 0,
+               snapshot_id: spPlaylist.snapshot_id || null,
                updated_at: new Date().toISOString(),
-             }),
-           }
-         );
+             }]);
    
          if (!resp.ok) {
-           // Fallback: lesen (falls es die Tabelle/Unique-Constraint anders heißt)
            const alt = await sb(
-             `/rest/v1/playlists?select=id&connection_id=eq.${encodeURIComponent(conn.id)}&spotify_playlist_id=eq.${encodeURIComponent(spotify_playlist_id)}&limit=1`
+             `/rest/v1/playlists?select=id&connection_id=eq.${encodeURIComponent(conn.id)}&playlist_id=eq.${encodeURIComponent(spotify_playlist_id)}&limit=1`
            );
            if (!alt.ok) throw new Error(`ensureLocalPlaylistRow_failed_${resp.status}`);
            const jj = await alt.json();
@@ -4182,9 +4197,8 @@ const routes = {
            const jj = await resp.json().catch(()=> []);
            const row = Array.isArray(jj) && jj[0];
            if (!row?.id) {
-             // Manche PostgRESTs geben bei merge-duplicates nichts zurück, dann per SELECT holen
              const alt = await sb(
-               `/rest/v1/playlists?select=id&connection_id=eq.${encodeURIComponent(conn.id)}&spotify_playlist_id=eq.${encodeURIComponent(spotify_playlist_id)}&limit=1`
+               `/rest/v1/playlists?select=id&connection_id=eq.${encodeURIComponent(conn.id)}&playlist_id=eq.${encodeURIComponent(spotify_playlist_id)}&limit=1`
              );
              const a = alt.ok ? await alt.json() : [];
              if (!a?.[0]?.id) throw new Error("playlist_row_missing_after_upsert");
@@ -4649,7 +4663,7 @@ const routes = {
      const isInternal = hasValidAppSecret(req);
    
      const bodyRaw = await readBody(req);
-     let { playlist_row_id, spotify_playlist_id } = bodyRaw;
+     let { playlist_row_id, spotify_playlist_id, connection_id } = bodyRaw;
    
      const timeLabel = `sync-items:${playlist_row_id || spotify_playlist_id || "unknown"}`;
      console.time(timeLabel);
@@ -4672,7 +4686,13 @@ const routes = {
        // Falls nur Spotify-ID kam → Row-ID auflösen
        if (!playlist_row_id && spotify_playlist_id) {
          console.log("sync-items:resolve_row_id_from_spotify_id", { spotify_playlist_id });
-         const r = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id,auto_remove_enabled,auto_remove_weeks,next_check_at&limit=1&playlist_id=eq.${encodeURIComponent(spotify_playlist_id)}`);
+         const requesterBubbleUserId = !isInternal ? await bubbleUserIdFromRequest(req) : "";
+         const scopedFilters = [
+           `playlist_id=eq.${encodeURIComponent(spotify_playlist_id)}`,
+           connection_id ? `connection_id=eq.${encodeURIComponent(connection_id)}` : "",
+           requesterBubbleUserId ? `bubble_user_id=eq.${encodeURIComponent(requesterBubbleUserId)}` : "",
+         ].filter(Boolean).join("&");
+         const r = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id,auto_remove_enabled,auto_remove_weeks,next_check_at&limit=1&${scopedFilters}`);
          if (!r.ok) { console.timeEnd(timeLabel); return bad(res, 500, `supabase_select_failed: ${await r.text()}`); }
          const arr = await r.json();
          if (!arr[0]) { console.timeEnd(timeLabel); return bad(res, 404, "playlist_not_found_by_spotify_id"); }
@@ -5344,11 +5364,7 @@ const routes = {
     let upserts = 0;
     const syncedRows = [];
     for (const batch of chunk(rows, 100)) {
-      const up = await sb(`/rest/v1/playlists?on_conflict=playlist_id`, {
-        method: "POST",
-        headers: { Prefer: "resolution=merge-duplicates,return=representation" },
-        body: JSON.stringify(batch),
-      });
+      const up = await scopedPlaylistUpsert(batch);
       if (!up.ok) return bad(res, 500, `supabase_upsert_failed: ${await up.text()}`);
       const returnedRows = await up.json().catch(() => []);
       if (Array.isArray(returnedRows)) syncedRows.push(...returnedRows);
