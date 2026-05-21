@@ -370,6 +370,7 @@ export default function PlaylistManager() {
   const onboardingConnectionsReady = connections.length > 0;
   const onboardingPlaylistsReady = playlists.length > 0;
   const onboardingStep = !onboardingCredentialsReady ? 1 : !onboardingConnectionsReady ? 2 : !onboardingPlaylistsReady ? 3 : 4;
+  const [isMobileViewport, setIsMobileViewport] = useState(false);
 
   useEffect(() => {
     const client = getSupabaseBrowserClient();
@@ -401,6 +402,15 @@ export default function PlaylistManager() {
     });
 
     return () => listener.subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const media = window.matchMedia("(max-width: 720px)");
+    const update = () => setIsMobileViewport(media.matches);
+    update();
+    media.addEventListener?.("change", update);
+    return () => media.removeEventListener?.("change", update);
   }, []);
 
   useEffect(() => {
@@ -2011,7 +2021,7 @@ export default function PlaylistManager() {
 	                  <article
 	                    key={`${track.position}-${track.track_id}`}
 	                    className={`trackRow ${isFlexTrack ? "trackRow--flex" : ""} ${dragTrackId === track.track_id ? "trackRow--dragging" : ""} ${dragTarget?.trackId === track.track_id ? `trackRow--drop-${dragTarget.placement}` : ""}`}
-	                    draggable={!busy}
+	                    draggable={!busy && !isMobileViewport}
 	                    onDragStart={(e) => {
 	                      setDragTrackId(track.track_id);
 	                      setDragTarget(null);
@@ -2042,7 +2052,7 @@ export default function PlaylistManager() {
 	                      setDragTarget(null);
 	                    }}
 	                  >
-                    <div className="dragHandle" aria-hidden="true"><GripVertical /></div>
+                    {!isMobileViewport ? <div className="dragHandle" aria-hidden="true"><GripVertical /></div> : null}
                     <div className="pos">{Number(track.position) + 1}</div>
                     <Artwork src={track.cover_url} alt="" size="sm" />
                     <div className="trackMeta">
@@ -4256,6 +4266,8 @@ export default function PlaylistManager() {
         }
         @media (max-width: 720px) {
           .topbar {
+            position: relative;
+            grid-template-columns: minmax(0, 1fr);
             padding: 22px;
           }
           .onboardingSteps,
@@ -4268,6 +4280,7 @@ export default function PlaylistManager() {
           }
           .brand {
             align-items: flex-start;
+            padding-right: 52px;
           }
           .logo {
             width: 70px;
@@ -4281,7 +4294,11 @@ export default function PlaylistManager() {
             width: 100%;
           }
           .topSettingsButton {
-            justify-self: end;
+            position: absolute;
+            top: 22px;
+            right: 22px;
+            justify-self: auto;
+            z-index: 2;
           }
           .dashboardHero {
             display: grid;
@@ -4322,10 +4339,21 @@ export default function PlaylistManager() {
             padding: 22px;
             gap: 40px;
           }
+          .sidebar {
+            gap: 18px;
+          }
+          .accountField {
+            grid-template-columns: 1fr;
+            gap: 8px;
+          }
+          .accountField select {
+            min-height: 48px;
+          }
           .sectionTitle {
             display: grid;
             grid-template-columns: 1fr auto;
             align-items: center;
+            margin-top: 4px;
           }
           .playlistHeader {
             grid-template-columns: 72px minmax(0, 1fr);
@@ -4369,27 +4397,49 @@ export default function PlaylistManager() {
             width: 100%;
           }
           .trackRow {
-            grid-template-columns: 24px 34px minmax(0, 1fr);
+            grid-template-columns: 34px 52px minmax(0, 1fr);
             gap: 10px;
+            min-height: 0;
+            margin: 0 0 10px;
             padding: 12px;
+            border: 1px solid #252c37;
+            border-radius: 8px;
+            background: #151a22;
           }
-          .trackRow :global(.artwork--sm) {
-            display: none;
+          .trackRow[draggable="true"] {
+            cursor: default;
           }
           .trackMeta {
             grid-column: 3;
+            gap: 3px;
+          }
+          .trackMeta strong {
+            font-size: 15px;
+          }
+          .trackMeta span,
+          .trackMeta small {
+            white-space: normal;
+            overflow-wrap: anywhere;
           }
           .badges {
             grid-column: 3;
+            justify-content: flex-start;
           }
           .rowActions {
-            grid-column: 3;
+            grid-column: 2 / -1;
             grid-template-columns: repeat(6, 40px);
-            justify-content: stretch;
+            justify-content: start;
           }
           .actionButton {
             width: 40px;
             height: 40px;
+          }
+          .trackRow--drop-before::before,
+          .trackRow--drop-after::after {
+            display: none;
+          }
+          .dragHandle {
+            display: none;
           }
         }
       `}</style>
