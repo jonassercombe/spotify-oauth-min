@@ -575,6 +575,44 @@ async function createPlaylistBackup(playlist, { reason = "manual", onlyIfChanged
   return { skipped: false, backup: rows?.[0] || null, snapshot_id };
 }
 
+async function replaceSpotifyPlaylistTracks(spotify_playlist_id, access_token, uris) {
+  const cleanUris = (Array.isArray(uris) ? uris : []).filter(Boolean);
+  if (!cleanUris.length) throw new Error("backup_has_no_tracks");
+
+  const first = cleanUris.slice(0, 100);
+  const replace = await fetchJSON(
+    `https://api.spotify.com/v1/playlists/${encodeURIComponent(spotify_playlist_id)}/tracks`,
+    {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ uris: first })
+    },
+    30000
+  );
+  if (!replace.r.ok) {
+    throw new Error(`spotify_restore_replace_failed:${replace.r.status}:${replace.text || JSON.stringify(replace.json)}`);
+  }
+
+  let snapshot_id = replace.json?.snapshot_id || null;
+  for (const batch of chunkArray(cleanUris.slice(100), 100)) {
+    const append = await fetchJSON(
+      `https://api.spotify.com/v1/playlists/${encodeURIComponent(spotify_playlist_id)}/tracks`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ uris: batch })
+      },
+      30000
+    );
+    if (!append.r.ok) {
+      throw new Error(`spotify_restore_append_failed:${append.r.status}:${append.text || JSON.stringify(append.json)}`);
+    }
+    snapshot_id = append.json?.snapshot_id || snapshot_id;
+    await sleep(120);
+  }
+  return { snapshot_id, tracks_total: cleanUris.length };
+}
+
 
 // --- resilient fetch helpers ---
 function withTimeout(ms) {
@@ -668,6 +706,12 @@ function releaseDateToTime(value) {
   const text = String(value);
   const normalized = text.length === 4 ? `${text}-01-01` : text.length === 7 ? `${text}-01` : text;
   return Date.parse(`${normalized}T00:00:00Z`);
+}
+
+function chunkArray(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
 }
 
 async function fetchReferencePlaylistTracks(reference_playlist_id, access_token) {
@@ -2767,6 +2811,64 @@ const routes = {
       return json(res, 200, { ok: true, ...result });
     } catch (e) {
       return bad(res, 500, `backup_create_failed: ${String(e?.message || e)}`);
+    }
+  },
+
+  /* ---------- backups/restore (POST) ---------- */
+  "backups/restore": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req);
+    if (!bubbleUserId) return bad(res, 401, "missing_user");
+    const { playlist_id, backup_id } = await readBody(req);
+    if (!playlist_id || !backup_id) return bad(res, 400, "missing_playlist_or_backup_id");
+    const playlist = await getOwnedPlaylist(playlist_id, bubbleUserId);
+    if (!playlist) return bad(res, 403, "playlist_not_owned");
+
+    const backupR = await sb(
+      `/rest/v1/playlist_backups?select=id,playlist_id,snapshot_id,taken_at,name,tracks` +
+      `&id=eq.${encodeURIComponent(String(backup_id))}` +
+      `&playlist_id=eq.${encodeURIComponent(String(playlist_id))}` +
+      `&limit=1`
+    );
+    if (!backupR.ok) return bad(res, 500, `backup_select_failed: ${await backupR.text()}`);
+    const backup = (await backupR.json())?.[0];
+    if (!backup) return bad(res, 404, "backup_not_found");
+
+    const tracks = Array.isArray(backup.tracks) ? backup.tracks : [];
+    const uris = tracks
+      .sort((a, b) => Number(a?.position || 0) - Number(b?.position || 0))
+      .map((track) => track?.track_uri)
+      .filter(Boolean);
+    if (!uris.length) return bad(res, 400, "backup_has_no_restorable_tracks");
+
+    try {
+      const before = await createPlaylistBackup(playlist, { reason: "pre_restore", onlyIfChanged: false }).catch((e) => ({ skipped: true, error: String(e?.message || e) }));
+      const access_token = await getAccessTokenFromConnection(playlist.connection_id);
+      const restored = await replaceSpotifyPlaylistTracks(playlist.playlist_id, access_token, uris);
+      const cooldownUntil = await setPlaylistUpdateCooldown(playlist.id, 300);
+      await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(String(playlist.id))}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({
+          snapshot_id: restored.snapshot_id,
+          tracks_total: restored.tracks_total,
+          needs_sync: true,
+          next_check_at: cooldownUntil
+        })
+      }).catch(() => {});
+
+      const base = process.env.PUBLIC_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
+      if (base) {
+        fetch(`${base}/api/playlists/dispatch-sync`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+          body: JSON.stringify({ playlist_id: playlist.id })
+        }).catch(() => {});
+      }
+
+      return json(res, 200, { ok: true, restored, pre_restore_backup: before, cooldown_until: cooldownUntil });
+    } catch (e) {
+      return bad(res, 500, `backup_restore_failed: ${String(e?.message || e)}`);
     }
   },
 

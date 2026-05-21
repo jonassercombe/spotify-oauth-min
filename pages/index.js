@@ -303,6 +303,7 @@ export default function PlaylistManager() {
   const [flexMaxReleaseAgeWeeks, setFlexMaxReleaseAgeWeeks] = useState("");
   const [flexHistory, setFlexHistory] = useState([]);
   const [backups, setBackups] = useState([]);
+  const [restoringBackupId, setRestoringBackupId] = useState("");
   const [busy, setBusy] = useState(false);
   const [busyLabel, setBusyLabel] = useState("");
   const [message, setMessage] = useState("");
@@ -674,6 +675,26 @@ export default function PlaylistManager() {
       });
       await loadBackups();
     });
+  }
+
+  async function restoreBackup(backup) {
+    if (!playlistId || !backup?.id) return;
+    const label = formatShortDate(String(backup.taken_at || "").slice(0, 10)) || "this backup";
+    const ok = window.confirm(`Restore ${label}? PlaylistPilot will create a safety backup first, then replace the current Spotify playlist order.`);
+    if (!ok) return;
+    setRestoringBackupId(backup.id);
+    try {
+      await run("Backup restored", async () => {
+        await api("/api/backups/restore", {
+          method: "POST",
+          accessToken: accessToken(),
+          body: { playlist_id: playlistId, backup_id: backup.id },
+        });
+        await Promise.all([loadBackups(), loadSelectedPlaylist()]);
+      });
+    } finally {
+      setRestoringBackupId("");
+    }
   }
 
   async function reconcileTracksAndFlex() {
@@ -1667,6 +1688,13 @@ export default function PlaylistManager() {
                             <strong>{formatShortDate(String(backup.taken_at || "").slice(0, 10)) || "Backup"}</strong>
                             <small>{formatNumber(backup.tracks_total)} tracks · {backup.snapshot_id ? `snapshot ${String(backup.snapshot_id).slice(0, 8)}` : "no snapshot"}</small>
                           </span>
+                          <button
+                            className="smallOutlineButton"
+                            disabled={busy || restoringBackupId === backup.id}
+                            onClick={() => restoreBackup(backup)}
+                          >
+                            {restoringBackupId === backup.id ? "Restoring" : "Restore"}
+                          </button>
                         </div>
                       ))}
                       {!backups.length ? <p>No backups stored for this playlist yet.</p> : null}
@@ -3227,7 +3255,7 @@ export default function PlaylistManager() {
         }
         .backupItem {
           display: grid;
-          grid-template-columns: 42px minmax(0, 1fr);
+          grid-template-columns: 42px minmax(0, 1fr) auto;
           align-items: center;
           gap: 10px;
           padding: 10px;
@@ -3248,6 +3276,24 @@ export default function PlaylistManager() {
         }
         .backupItem small {
           color: #a6adba;
+        }
+        .smallOutlineButton {
+          min-height: 34px;
+          padding: 0 12px;
+          border: 1px solid rgba(36, 211, 102, 0.72);
+          border-radius: 8px;
+          background: rgba(36, 211, 102, 0.05);
+          color: #24d366;
+          font-size: 12px;
+          font-weight: 850;
+          cursor: pointer;
+        }
+        .smallOutlineButton:hover:not(:disabled) {
+          background: rgba(36, 211, 102, 0.12);
+        }
+        .smallOutlineButton:disabled {
+          cursor: not-allowed;
+          opacity: 0.55;
         }
         .trackPanel {
           border: 1px solid #2a303b;
@@ -3691,6 +3737,7 @@ export default function PlaylistManager() {
           .flexSettings,
           .rotatorRules,
           .healthGrid,
+          .backupItem,
           .flexSlot {
             grid-template-columns: 1fr;
             align-items: stretch;
