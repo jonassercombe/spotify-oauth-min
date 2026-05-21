@@ -381,6 +381,7 @@ export default function PlaylistManager() {
   const onboardingConnectionsReady = connections.length > 0;
   const onboardingPlaylistsReady = playlists.length > 0;
   const onboardingNeedsBilling = !onboardingBillingReady && !onboardingCredentialsReady && !onboardingConnectionsReady && !onboardingPlaylistsReady;
+  const onboardingMustConnect = billingActive && !onboardingConnectionsReady;
   const onboardingStep = onboardingNeedsBilling ? 1 : !onboardingCredentialsReady ? 2 : !onboardingConnectionsReady ? 3 : !onboardingPlaylistsReady ? 4 : 5;
   const [isMobileViewport, setIsMobileViewport] = useState(false);
 
@@ -441,12 +442,12 @@ export default function PlaylistManager() {
   useEffect(() => {
     if (!userContext?.linked || spotifyCredentials === null) return;
     const key = `playlistpilot:onboarding-dismissed:${userContext.bubble_user_id || userContext.email}`;
-    const dismissed = typeof window !== "undefined" && window.localStorage.getItem(key) === "1";
+    const dismissed = !onboardingMustConnect && typeof window !== "undefined" && window.localStorage.getItem(key) === "1";
     setOnboardingDismissed(dismissed);
-    if (!dismissed && (onboardingNeedsBilling || !onboardingCredentialsReady || !onboardingConnectionsReady || !onboardingPlaylistsReady)) {
+    if (onboardingMustConnect || (!dismissed && (onboardingNeedsBilling || !onboardingCredentialsReady || !onboardingConnectionsReady || !onboardingPlaylistsReady))) {
       setOnboardingOpen(true);
     }
-  }, [userContext?.linked, userContext?.bubble_user_id, userContext?.email, spotifyCredentials, onboardingNeedsBilling, onboardingCredentialsReady, onboardingConnectionsReady, onboardingPlaylistsReady]);
+  }, [userContext?.linked, userContext?.bubble_user_id, userContext?.email, spotifyCredentials, onboardingNeedsBilling, onboardingMustConnect, onboardingCredentialsReady, onboardingConnectionsReady, onboardingPlaylistsReady]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -597,6 +598,7 @@ export default function PlaylistManager() {
   }
 
   function dismissOnboarding() {
+    if (onboardingMustConnect) return;
     const key = userContext?.bubble_user_id || userContext?.email
       ? `playlistpilot:onboarding-dismissed:${userContext.bubble_user_id || userContext.email}`
       : "";
@@ -1284,13 +1286,13 @@ export default function PlaylistManager() {
           </div>
         </div>
         <nav className="mainNav" aria-label="Main navigation">
-          {session && userContext?.linked && billingActive ? (
+          {session && userContext?.linked && billingActive && onboardingConnectionsReady ? (
             <div className="navTabs">
               <button className={view === "dashboard" ? "navButton active" : "navButton"} onClick={() => setView("dashboard")}>Dashboard</button>
               <button className={view === "manager" ? "navButton active" : "navButton"} onClick={() => setView("manager")}>Playlist Manager</button>
             </div>
           ) : null}
-          {session && userContext?.linked && billingActive ? (
+          {session && userContext?.linked && billingActive && onboardingConnectionsReady ? (
             <button className="settingsButton topSettingsButton" onClick={() => setSettingsOpen(true)} aria-label="Open settings">
               <Settings aria-hidden="true" />
             </button>
@@ -1368,9 +1370,11 @@ export default function PlaylistManager() {
                 <h2>Get your first playlist into PlaylistPilot</h2>
                 <p>Start your plan, connect the Spotify app credentials you control, authorize Spotify, then import your playlists and baseline stats.</p>
               </div>
-              <button className="iconOnlyButton" onClick={dismissOnboarding} aria-label="Close onboarding">
-                <X aria-hidden="true" />
-              </button>
+              {!onboardingMustConnect ? (
+                <button className="iconOnlyButton" onClick={dismissOnboarding} aria-label="Close onboarding">
+                  <X aria-hidden="true" />
+                </button>
+              ) : null}
             </div>
             <ol className="onboardingSteps">
               <li className={onboardingStep === 1 ? "active" : onboardingBillingReady ? "done" : ""}>
@@ -1631,7 +1635,14 @@ export default function PlaylistManager() {
         </div>
       ) : null}
 
-      {view === "dashboard" ? (
+      {!onboardingConnectionsReady ? (
+        <section className="setupHold" aria-live="polite">
+          <span>Setup required</span>
+          <h2>Connect your first Spotify account</h2>
+          <p>The Playlist Manager opens after a Spotify account is authorized. Finish the setup guide above or open Settings to edit your Spotify API app details.</p>
+          <button disabled={busy} onClick={() => setOnboardingOpen(true)}>Continue setup</button>
+        </section>
+      ) : view === "dashboard" ? (
       <section className="dashboard">
         <div className="statusLine">
           {busy ? <span><i className="miniSpinner" aria-hidden="true" />{busyLabel || "Working with Spotify"}</span> : message ? <span>{message}</span> : <span />}
@@ -2491,6 +2502,30 @@ export default function PlaylistManager() {
         .subscriptionGatePlans article div {
           align-self: end;
           margin-top: auto;
+        }
+        .setupHold {
+          display: grid;
+          align-content: center;
+          justify-items: start;
+          gap: 14px;
+          min-height: calc(100vh - 210px);
+          width: min(760px, 100%);
+          padding: clamp(28px, 5vw, 64px);
+        }
+        .setupHold span {
+          color: #18e06f;
+          font-size: 12px;
+          font-weight: 900;
+          text-transform: uppercase;
+        }
+        .setupHold h2 {
+          font-size: clamp(30px, 4vw, 48px);
+          line-height: 1;
+        }
+        .setupHold p {
+          color: #a6adba;
+          font-size: 18px;
+          line-height: 1.5;
         }
         .loadingScreen {
           display: grid;
