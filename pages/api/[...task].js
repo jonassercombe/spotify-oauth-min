@@ -4646,10 +4646,7 @@ const routes = {
   /* ---------- playlists/sync-items (POST, secret) ---------- */
    "playlists/sync-items": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
-     if (process.env.APP_WEBHOOK_SECRET) {
-       const got = req.headers["x-app-secret"];
-       if (got !== process.env.APP_WEBHOOK_SECRET) return bad(res, 401, "unauthorized");
-     }
+     const isInternal = hasValidAppSecret(req);
    
      const bodyRaw = await readBody(req);
      let { playlist_row_id, spotify_playlist_id } = bodyRaw;
@@ -4688,6 +4685,11 @@ const routes = {
        if (!pr.ok) { console.timeEnd(timeLabel); return bad(res, 500, `supabase select playlist failed: ${await pr.text()}`); }
        const p = (await pr.json())[0];
        if (!p) { console.timeEnd(timeLabel); return bad(res, 404, "playlist_not_found"); }
+       if (!isInternal) {
+         const bubbleUserId = await bubbleUserIdFromRequest(req);
+         if (!bubbleUserId) { console.timeEnd(timeLabel); return bad(res, 401, "not_authenticated"); }
+         if (p.bubble_user_id !== bubbleUserId) { console.timeEnd(timeLabel); return bad(res, 403, "playlist_not_owned"); }
+       }
        console.log("sync-items:playlist_meta", {
          playlist_row_id: p.id,
          spotify_playlist_id: p.playlist_id,

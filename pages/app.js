@@ -365,6 +365,8 @@ export default function PlaylistManager() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [onboardingOpen, setOnboardingOpen] = useState(false);
   const [onboardingDismissed, setOnboardingDismissed] = useState(false);
+  const [connectionsLoaded, setConnectionsLoaded] = useState(false);
+  const [playlistsLoaded, setPlaylistsLoaded] = useState(false);
   const [healthStatus, setHealthStatus] = useState(null);
   const [spotifyClientId, setSpotifyClientId] = useState("");
   const [spotifyClientSecret, setSpotifyClientSecret] = useState("");
@@ -403,8 +405,10 @@ export default function PlaylistManager() {
       if (!nextSession || event === "SIGNED_OUT" || event === "USER_DELETED") {
         setUserContext(null);
         setConnections([]);
+        setConnectionsLoaded(false);
         setConnectionId("");
         setPlaylists([]);
+        setPlaylistsLoaded(false);
         setPlaylistId("");
         setPlaylist(null);
         setTracks([]);
@@ -438,6 +442,8 @@ export default function PlaylistManager() {
 
   useEffect(() => {
     if (!userContext?.linked) return;
+    setConnectionsLoaded(false);
+    setPlaylistsLoaded(false);
     loadConnections();
     loadDashboard();
     loadSpotifyCredentials();
@@ -445,14 +451,14 @@ export default function PlaylistManager() {
   }, [userContext?.linked]);
 
   useEffect(() => {
-    if (!userContext?.linked || spotifyCredentials === null) return;
+    if (!userContext?.linked || spotifyCredentials === null || !connectionsLoaded || (connectionId && !playlistsLoaded)) return;
     const key = `playlistpilot:onboarding-dismissed:${userContext.bubble_user_id || userContext.email}`;
     const dismissed = !onboardingMustConnect && typeof window !== "undefined" && window.localStorage.getItem(key) === "1";
     setOnboardingDismissed(dismissed);
     if (onboardingMustConnect || (!dismissed && (onboardingNeedsBilling || !onboardingCredentialsReady || !onboardingConnectionsReady || !onboardingPlaylistsReady))) {
       setOnboardingOpen(true);
     }
-  }, [userContext?.linked, userContext?.bubble_user_id, userContext?.email, spotifyCredentials, onboardingNeedsBilling, onboardingMustConnect, onboardingCredentialsReady, onboardingConnectionsReady, onboardingPlaylistsReady]);
+  }, [userContext?.linked, userContext?.bubble_user_id, userContext?.email, spotifyCredentials, connectionsLoaded, playlistsLoaded, connectionId, onboardingNeedsBilling, onboardingMustConnect, onboardingCredentialsReady, onboardingConnectionsReady, onboardingPlaylistsReady]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -495,6 +501,7 @@ export default function PlaylistManager() {
 
   useEffect(() => {
     if (!userContext?.linked || !connectionId) return;
+    setPlaylistsLoaded(false);
     writeStoredSelection(userContext, { connectionId });
     loadPlaylists();
   }, [userContext?.linked, connectionId]);
@@ -711,6 +718,7 @@ export default function PlaylistManager() {
         : "";
       const nextConnectionId = connectedConnectionId || storedConnectionId || data[0]?.id || "";
       if (connectionId !== nextConnectionId) setConnectionId(nextConnectionId);
+      setConnectionsLoaded(true);
       return data;
     });
   }
@@ -730,7 +738,11 @@ export default function PlaylistManager() {
         : "";
       const currentPlaylistIsValid = playlistId && data.some((p) => p.id === playlistId);
       const nextPlaylistId = currentPlaylistIsValid ? playlistId : (storedPlaylistId || data[0]?.id || "");
-      if (playlistId !== nextPlaylistId) setPlaylistId(nextPlaylistId);
+      if (playlistId !== nextPlaylistId) {
+        setPlaylistId(nextPlaylistId);
+        if (userContext?.linked) writeStoredSelection(userContext, { playlistId: nextPlaylistId });
+      }
+      setPlaylistsLoaded(true);
       return data;
     });
   }
@@ -773,6 +785,13 @@ export default function PlaylistManager() {
       setFlexMaxPopularity(settings?.max_popularity ?? "");
       setFlexMaxReleaseAgeWeeks(settings?.max_release_age_weeks ?? "");
       await Promise.all([loadBackups(), loadFlexHistory()]);
+      if (!items.length && Number(detail?.tracks_total || 0) > 0) {
+        api("/api/playlists/sync-items", {
+          method: "POST",
+          accessToken: accessToken(),
+          body: { playlist_row_id: playlistId },
+        }).then(() => loadSelectedPlaylist()).catch(() => {});
+      }
       return { detail, items };
     });
   }
