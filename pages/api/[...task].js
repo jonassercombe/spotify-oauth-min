@@ -4707,8 +4707,6 @@ const routes = {
    
        const playlistCooldownUntil = p.next_check_at ? new Date(p.next_check_at) : null;
        const playlistOnCooldown = playlistCooldownUntil && playlistCooldownUntil > new Date();
-       const USER_ALLOW_AUTO  = !playlistOnCooldown && uf.auto_remove_enabled !== false;     // default true
-       const USER_ALLOW_LOCKS = !playlistOnCooldown && uf.position_lock_enabled !== false;   // default true
        if (playlistOnCooldown) {
          console.log("sync-items:automation_skipped_playlist_cooldown", {
            playlist_row_id: p.id,
@@ -4871,6 +4869,24 @@ const routes = {
        }
    
        console.log("sync-items:spotify_fetched", { total_items: items.length });
+
+       // A manual edit may start while this sync is fetching Spotify pages.
+       // Re-check cooldown before any mutation so an in-flight automation sync
+       // cannot push Spotify back to stale lock targets mid-edit.
+       const liveCooldownR = await sb(
+         `/rest/v1/playlists?select=next_check_at&limit=1&id=eq.${encodeURIComponent(p.id)}`
+       ).catch(() => null);
+       const liveCooldownRows = liveCooldownR?.ok ? await liveCooldownR.json().catch(() => []) : [];
+       const liveCooldownUntil = liveCooldownRows?.[0]?.next_check_at ? new Date(liveCooldownRows[0].next_check_at) : null;
+       const automationOnCooldown = !!(liveCooldownUntil && liveCooldownUntil > new Date());
+       const USER_ALLOW_AUTO = !automationOnCooldown && uf.auto_remove_enabled !== false;
+       const USER_ALLOW_LOCKS = !automationOnCooldown && uf.position_lock_enabled !== false;
+       if (automationOnCooldown && !playlistOnCooldown) {
+         console.log("sync-items:automation_skipped_live_playlist_cooldown", {
+           playlist_row_id: p.id,
+           next_check_at: liveCooldownRows?.[0]?.next_check_at || null
+         });
+       }
    
        /* === (Backup) Zustands-Snapshot speichern – vor Expiry/Locks/Reorder === */
        try {
@@ -5796,6 +5812,7 @@ const routes = {
      ).then(r=>r.json());
      const playlistRow = own?.[0];
      if (!playlistRow) return bad(res, 403, "Playlist not owned by user");
+     const cooldownUntil = await setPlaylistUpdateCooldown(playlist_id, 300);
 
      const beforePosR = await sb(
        `/rest/v1/playlist_items?select=position` +
@@ -5914,8 +5931,6 @@ const routes = {
       console.warn("playlist-items/move:lock_position_resync_failed", String(e?.message || e));
     }
 
-    const cooldownUntil = await setPlaylistUpdateCooldown(playlist_id, 300);
-   
      const base = internalBaseUrl();
      if (base) {
        fetch(`${base}/api/playlists/dispatch-sync`, {
