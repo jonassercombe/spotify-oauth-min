@@ -5363,12 +5363,20 @@ const routes = {
           headers: { Prefer: "return=minimal" },
           body: JSON.stringify({ needs_sync: true, next_check_at: null }),
         }).catch(() => {});
-        fetch(`${base}/api/playlists/dispatch-sync`, {
+        const dispatch = await fetch(`${base}/api/playlists/dispatch-sync`, {
           method: "POST",
           headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
           body: JSON.stringify({ playlist_id: playlist.id }),
-        }).catch(() => {});
-        itemSyncDispatched++;
+        }).catch((error) => ({ ok: false, status: 0, text: async () => String(error?.message || error) }));
+        if (dispatch.ok) {
+          itemSyncDispatched++;
+        } else {
+          console.warn("playlists_sync_item_dispatch_failed", {
+            playlist_id: playlist.id,
+            status: dispatch.status,
+            body: await dispatch.text().catch(() => ""),
+          });
+        }
       }
     }
 
