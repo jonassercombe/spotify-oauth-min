@@ -304,6 +304,10 @@ export default function PlaylistManager() {
   const [flexHistory, setFlexHistory] = useState([]);
   const [backups, setBackups] = useState([]);
   const [restoringBackupId, setRestoringBackupId] = useState("");
+  const [selectedBackupId, setSelectedBackupId] = useState("");
+  const [backupDetail, setBackupDetail] = useState(null);
+  const [backupDiff, setBackupDiff] = useState(null);
+  const [backupRestoreMode, setBackupRestoreMode] = useState("order");
   const [busy, setBusy] = useState(false);
   const [busyLabel, setBusyLabel] = useState("");
   const [message, setMessage] = useState("");
@@ -665,6 +669,20 @@ export default function PlaylistManager() {
     return rows;
   }
 
+  async function openBackupDetails(backup) {
+    if (!playlistId || !backup?.id) return;
+    setSelectedBackupId(backup.id);
+    await run("Backup loaded", async () => {
+      const [detail, diff] = await Promise.all([
+        api(`/api/backups/detail?playlist_id=${encodeURIComponent(playlistId)}&backup_id=${encodeURIComponent(backup.id)}`, { accessToken: accessToken() }),
+        api(`/api/backups/diff?playlist_id=${encodeURIComponent(playlistId)}&backup_id=${encodeURIComponent(backup.id)}`, { accessToken: accessToken() }),
+      ]);
+      setBackupDetail(detail);
+      setBackupDiff(diff);
+      return detail;
+    });
+  }
+
   async function createBackupNow() {
     if (!playlistId) return;
     await run("Backup created", async () => {
@@ -680,8 +698,13 @@ export default function PlaylistManager() {
   async function restoreBackup(backup) {
     if (!playlistId || !backup?.id) return;
     const label = formatShortDate(String(backup.taken_at || "").slice(0, 10)) || "this backup";
+    const modeText = backupRestoreMode === "order_rotator"
+      ? "playlist order, locks and rotator slots"
+      : backupRestoreMode === "order_locks"
+        ? "playlist order and locks"
+        : "playlist order only";
     const typed = window.prompt(
-      `WARNING: Restore ${label}?\n\nPlaylistPilot will create a safety backup first, then replace the current Spotify playlist order with this backup.\n\nType ARE YOU SURE to continue.`
+      `WARNING: Restore ${label}?\n\nPlaylistPilot will create a safety backup first, then restore ${modeText} from this backup.\n\nType ARE YOU SURE to continue.`
     );
     if (typed !== "ARE YOU SURE") return;
     setRestoringBackupId(backup.id);
@@ -690,13 +713,46 @@ export default function PlaylistManager() {
         await api("/api/backups/restore", {
           method: "POST",
           accessToken: accessToken(),
-          body: { playlist_id: playlistId, backup_id: backup.id },
+          body: {
+            playlist_id: playlistId,
+            backup_id: backup.id,
+            restore_locks: backupRestoreMode === "order_locks" || backupRestoreMode === "order_rotator",
+            restore_rotator: backupRestoreMode === "order_rotator",
+          },
         });
         await Promise.all([loadBackups(), loadSelectedPlaylist()]);
       });
     } finally {
       setRestoringBackupId("");
     }
+  }
+
+  async function cleanupDuplicateBackups() {
+    if (!playlistId) return;
+    await run("Duplicate backups cleaned", async () => {
+      const result = await api("/api/backups/cleanup-duplicates", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { playlist_id: playlistId },
+      });
+      await loadBackups();
+      setMessage(`Deleted ${formatNumber(result.deleted)} duplicate backups`);
+      return result;
+    });
+  }
+
+  async function applyBackupRetention() {
+    if (!playlistId) return;
+    await run("Backup retention applied", async () => {
+      const result = await api("/api/backups/apply-retention", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { playlist_id: playlistId, keep_daily_days: 30, keep_weekly_months: 6 },
+      });
+      await loadBackups();
+      setMessage(`Deleted ${formatNumber(result.deleted)} old backups`);
+      return result;
+    });
   }
 
   async function reconcileTracksAndFlex() {
@@ -1682,25 +1738,82 @@ export default function PlaylistManager() {
                         Create backup
                       </button>
                     </div>
+                    <div className="backupActions">
+                      <button className="smallOutlineButton" disabled={busy || !playlistId} onClick={cleanupDuplicateBackups}>Clean duplicates</button>
+                      <button className="smallOutlineButton" disabled={busy || !playlistId} onClick={applyBackupRetention}>Apply retention</button>
+                    </div>
                     <div className="backupList">
                       {backups.map((backup) => (
-                        <div className="backupItem" key={backup.id}>
+                        <button
+                          className={selectedBackupId === backup.id ? "backupItem selected" : "backupItem"}
+                          key={backup.id}
+                          onClick={() => openBackupDetails(backup)}
+                          type="button"
+                        >
                           <Artwork src={backup.image || playlist?.image} alt="" size="sm" />
                           <span>
                             <strong>{formatShortDate(String(backup.taken_at || "").slice(0, 10)) || "Backup"}</strong>
                             <small>{backup.reason ? `${backup.reason} · ` : ""}{formatNumber(backup.tracks_total)} tracks · {backup.snapshot_id ? `snapshot ${String(backup.snapshot_id).slice(0, 8)}` : "no snapshot"}</small>
                           </span>
-                          <button
-                            className="smallOutlineButton"
-                            disabled={busy || restoringBackupId === backup.id}
-                            onClick={() => restoreBackup(backup)}
-                          >
-                            {restoringBackupId === backup.id ? "Restoring" : "Restore"}
-                          </button>
-                        </div>
+                        </button>
                       ))}
                       {!backups.length ? <p>No backups stored for this playlist yet.</p> : null}
                     </div>
+                    {backupDetail ? (
+                      <div className="backupDetail">
+                        <div className="backupDetailHeader">
+                          <div>
+                            <h3>{formatShortDate(String(backupDetail.taken_at || "").slice(0, 10)) || "Backup details"}</h3>
+                            <p>{backupDetail.reason || "backup"} · {formatNumber(backupDetail.summary?.tracks_total)} tracks · {formatNumber(backupDetail.summary?.locked_total)} locks · {formatNumber(backupDetail.summary?.rotator_total)} rotator slots</p>
+                          </div>
+                          <select value={backupRestoreMode} onChange={(event) => setBackupRestoreMode(event.target.value)}>
+                            <option value="order">Restore order only</option>
+                            <option value="order_locks">Restore order + locks</option>
+                            <option value="order_rotator">Restore order + locks + rotator</option>
+                          </select>
+                          <button
+                            className="smallOutlineButton"
+                            disabled={busy || restoringBackupId === backupDetail.id}
+                            onClick={() => restoreBackup(backupDetail)}
+                          >
+                            {restoringBackupId === backupDetail.id ? "Restoring" : "Restore selected"}
+                          </button>
+                        </div>
+                        {backupDiff?.diff ? (
+                          <div className="backupDiffGrid">
+                            <article><span>Moved</span><strong>{formatNumber(backupDiff.diff.moved)}</strong></article>
+                            <article><span>Added back</span><strong>{formatNumber(backupDiff.diff.added)}</strong></article>
+                            <article><span>Removed now</span><strong>{formatNumber(backupDiff.diff.removed)}</strong></article>
+                            <article><span>Lock changes</span><strong>{formatNumber(backupDiff.diff.lock_changes)}</strong></article>
+                            <article><span>Expiry changes</span><strong>{formatNumber(backupDiff.diff.expiry_changes)}</strong></article>
+                            <article><span>Rotator changes</span><strong>{formatNumber(backupDiff.diff.rotator_changes)}</strong></article>
+                          </div>
+                        ) : null}
+                        {backupDiff?.diff?.preview?.length ? (
+                          <div className="backupPreview">
+                            <h3>Restore preview</h3>
+                            {backupDiff.diff.preview.map((item, index) => (
+                              <div key={`${item.type}-${index}`}>
+                                <strong>{item.track_name || "Unknown track"}</strong>
+                                <span>{item.type.replaceAll("_", " ")}{Number.isFinite(item.from_position) ? ` · from ${item.from_position + 1}` : ""}{Number.isFinite(item.to_position) ? ` · to ${item.to_position + 1}` : ""}</span>
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
+                        <div className="backupTracks">
+                          {(backupDetail.tracks || []).slice(0, 12).map((track) => (
+                            <div key={`${track.position}-${track.track_id}`}>
+                              <b>{Number(track.position) + 1}</b>
+                              <span>
+                                <strong>{track.track_name || "Unknown track"}</strong>
+                                <small>{track.artist_names || "Unknown artist"}</small>
+                              </span>
+                              <em>{track.is_rotator ? "rotator" : track.is_locked ? "lock" : track.expiry_weeks ? "expiry" : "track"}</em>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
                   </>
                 ) : null}
               </div>
@@ -3255,15 +3368,28 @@ export default function PlaylistManager() {
           display: grid;
           gap: 8px;
         }
+        .backupActions {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+        }
         .backupItem {
           display: grid;
           grid-template-columns: 42px minmax(0, 1fr) auto;
           align-items: center;
+          width: 100%;
+          text-align: left;
           gap: 10px;
           padding: 10px;
           border: 1px solid #252c37;
           border-radius: 8px;
+          color: #f4f6fb;
           background: #12161d;
+        }
+        .backupItem:hover,
+        .backupItem.selected {
+          border-color: rgba(36, 211, 102, 0.55);
+          background: rgba(36, 211, 102, 0.07);
         }
         .backupItem span {
           display: grid;
@@ -3296,6 +3422,100 @@ export default function PlaylistManager() {
         .smallOutlineButton:disabled {
           cursor: not-allowed;
           opacity: 0.55;
+        }
+        .backupDetail {
+          display: grid;
+          gap: 12px;
+          padding: 14px;
+          border: 1px solid #252c37;
+          border-radius: 8px;
+          background: #12161d;
+        }
+        .backupDetailHeader {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) minmax(180px, auto) auto;
+          align-items: center;
+          gap: 10px;
+        }
+        .backupDetailHeader div {
+          display: grid;
+          gap: 3px;
+          min-width: 0;
+        }
+        .backupDetailHeader h3,
+        .backupPreview h3 {
+          font-size: 15px;
+        }
+        .backupDetailHeader p,
+        .backupPreview span {
+          color: #a6adba;
+          font-size: 12px;
+          font-weight: 800;
+        }
+        .backupDiffGrid {
+          display: grid;
+          grid-template-columns: repeat(6, minmax(0, 1fr));
+          gap: 8px;
+        }
+        .backupDiffGrid article {
+          display: grid;
+          gap: 4px;
+          padding: 10px;
+          border: 1px solid #252c37;
+          border-radius: 8px;
+          background: #181d25;
+        }
+        .backupDiffGrid span {
+          color: #a6adba;
+          font-size: 11px;
+          font-weight: 850;
+          text-transform: uppercase;
+        }
+        .backupDiffGrid strong {
+          font-size: 18px;
+        }
+        .backupPreview,
+        .backupTracks {
+          display: grid;
+          gap: 8px;
+        }
+        .backupPreview div,
+        .backupTracks div {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto;
+          gap: 8px;
+          align-items: center;
+          padding: 8px 0;
+          border-top: 1px solid #202630;
+        }
+        .backupTracks div {
+          grid-template-columns: 34px minmax(0, 1fr) auto;
+        }
+        .backupTracks b,
+        .backupTracks em {
+          color: #24d366;
+          font-style: normal;
+          font-weight: 900;
+        }
+        .backupTracks span {
+          display: grid;
+          gap: 2px;
+          min-width: 0;
+        }
+        .backupTracks strong,
+        .backupTracks small {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .backupTracks small {
+          color: #a6adba;
+        }
+        .backupTracks em {
+          border: 1px solid rgba(36, 211, 102, 0.35);
+          border-radius: 999px;
+          padding: 4px 8px;
+          font-size: 11px;
         }
         .trackPanel {
           border: 1px solid #2a303b;
@@ -3740,6 +3960,8 @@ export default function PlaylistManager() {
           .rotatorRules,
           .healthGrid,
           .backupItem,
+          .backupDetailHeader,
+          .backupDiffGrid,
           .flexSlot {
             grid-template-columns: 1fr;
             align-items: stretch;

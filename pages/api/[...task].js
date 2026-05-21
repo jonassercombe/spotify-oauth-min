@@ -638,6 +638,149 @@ async function replaceSpotifyPlaylistTracks(spotify_playlist_id, access_token, u
   return { snapshot_id, tracks_total: cleanUris.length };
 }
 
+function summarizeBackupTracks(tracks = []) {
+  const rows = Array.isArray(tracks) ? tracks : [];
+  return {
+    tracks_total: rows.length,
+    locked_total: rows.filter((track) => track?.is_locked).length,
+    expiry_total: rows.filter((track) => track?.expiry_weeks !== null && track?.expiry_weeks !== undefined).length,
+    rotator_total: rows.filter((track) => track?.is_rotator).length,
+  };
+}
+
+async function getBackupForPlaylist(playlist_id, backup_id) {
+  const r = await sb(
+    `/rest/v1/playlist_backups?select=*` +
+    `&id=eq.${encodeURIComponent(String(backup_id))}` +
+    `&playlist_id=eq.${encodeURIComponent(String(playlist_id))}` +
+    `&limit=1`
+  );
+  if (!r.ok) throw new Error(`backup_select_failed:${await r.text()}`);
+  return (await r.json())?.[0] || null;
+}
+
+function backupTrackKey(track) {
+  return track?.track_uri || (track?.track_id ? trackUri(track.track_id) : "");
+}
+
+function diffBackupAgainstCurrent(backupTracks = [], currentTracks = []) {
+  const backup = Array.isArray(backupTracks) ? backupTracks : [];
+  const current = Array.isArray(currentTracks) ? currentTracks : [];
+  const currentByUri = new Map(current.map((track, index) => [backupTrackKey(track), { track, index }]).filter(([key]) => key));
+  const backupByUri = new Map(backup.map((track, index) => [backupTrackKey(track), { track, index }]).filter(([key]) => key));
+  let moved = 0, added = 0, removed = 0, lock_changes = 0, expiry_changes = 0, rotator_changes = 0;
+  const preview = [];
+
+  for (let i = 0; i < backup.length; i++) {
+    const target = backup[i];
+    const key = backupTrackKey(target);
+    const currentMatch = key ? currentByUri.get(key) : null;
+    if (!currentMatch) {
+      added++;
+      if (preview.length < 12) preview.push({ type: "restore_add", track_name: target.track_name, to_position: i });
+      continue;
+    }
+    if (currentMatch.index !== i) {
+      moved++;
+      if (preview.length < 12) preview.push({ type: "move", track_name: target.track_name, from_position: currentMatch.index, to_position: i });
+    }
+    const source = currentMatch.track || {};
+    if (!!source.is_locked !== !!target.is_locked || Number(source.locked_position ?? -1) !== Number(target.locked_position ?? -1)) lock_changes++;
+    if (String(source.expiry_weeks ?? "") !== String(target.expiry_weeks ?? "")) expiry_changes++;
+    if (!!source.is_rotator !== !!target.is_rotator || Number(source.rotator_position ?? -1) !== Number(target.rotator_position ?? -1)) rotator_changes++;
+  }
+  for (let i = 0; i < current.length; i++) {
+    const source = current[i];
+    const key = backupTrackKey(source);
+    if (key && !backupByUri.has(key)) {
+      removed++;
+      if (preview.length < 12) preview.push({ type: "remove_current", track_name: source.track_name, from_position: i });
+    }
+  }
+  return { moved, added, removed, lock_changes, expiry_changes, rotator_changes, preview };
+}
+
+async function fetchCurrentPlaylistItemsForBackupDiff(playlist_id) {
+  const r = await sb(
+    `/rest/v1/playlist_items?select=position,track_id,track_name,artist_names,album_name,added_at,is_locked,locked_position,expiry_weeks` +
+    `&playlist_id=eq.${encodeURIComponent(String(playlist_id))}` +
+    `&order=position.asc&limit=2000`
+  );
+  const items = r.ok ? await r.json().catch(() => []) : [];
+  const slotsR = await sb(
+    `/rest/v1/playlist_flex_slots?select=position,current_track_id,last_rotated_at&playlist_id=eq.${encodeURIComponent(String(playlist_id))}`
+  ).catch(() => null);
+  const slots = slotsR?.ok ? await slotsR.json().catch(() => []) : [];
+  const flexByTrack = new Map((Array.isArray(slots) ? slots : []).filter(x => x?.current_track_id).map(x => [x.current_track_id, x]));
+  return (Array.isArray(items) ? items : []).map((item) => {
+    const flex = flexByTrack.get(item.track_id);
+    return {
+      ...item,
+      track_uri: item.track_id ? trackUri(item.track_id) : null,
+      is_rotator: !!flex,
+      rotator_position: flex?.position ?? null,
+      rotator_last_rotated_at: flex?.last_rotated_at ?? null
+    };
+  });
+}
+
+async function restoreBackupAutomationState(playlist, tracks, options = {}) {
+  const rows = Array.isArray(tracks) ? tracks : [];
+  const nowIso = new Date().toISOString();
+  let locks_restored = 0;
+  let rotator_slots_restored = 0;
+
+  if (options.restore_locks) {
+    const lockRows = rows
+      .filter((track) => track?.track_id && (track.is_locked || track.expiry_weeks !== null && track.expiry_weeks !== undefined))
+      .map((track, index) => ({
+        playlist_id: playlist.id,
+        track_id: track.track_id,
+        locked_position: track.is_locked ? Number(track.locked_position ?? index) : null,
+        is_locked: !!track.is_locked,
+        locked_at: track.is_locked ? nowIso : null,
+        expiry_weeks: track.expiry_weeks ?? null,
+      }));
+    if (lockRows.length) {
+      const r = await sb(`/rest/v1/playlist_item_locks?on_conflict=playlist_id,track_id`, {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify(lockRows),
+      });
+      if (!r.ok) throw new Error(`lock_restore_failed:${await r.text()}`);
+      locks_restored = lockRows.length;
+    }
+  }
+
+  if (options.restore_rotator) {
+    const del = await sb(`/rest/v1/playlist_flex_slots?playlist_id=eq.${encodeURIComponent(playlist.id)}`, { method: "DELETE" });
+    if (!del.ok) throw new Error(`rotator_clear_failed:${await del.text()}`);
+    const slotRows = rows
+      .filter((track) => track?.is_rotator && track?.track_id)
+      .map((track, index) => ({
+        playlist_id: playlist.id,
+        bubble_user_id: playlist.bubble_user_id,
+        connection_id: playlist.connection_id,
+        position: Number(track.rotator_position ?? track.locked_position ?? index),
+        current_track_id: track.track_id,
+        current_track_name: track.track_name || null,
+        source_track_id: track.track_id,
+        last_rotated_at: track.rotator_last_rotated_at || null,
+        updated_at: nowIso,
+      }));
+    if (slotRows.length) {
+      const r = await sb(`/rest/v1/playlist_flex_slots`, {
+        method: "POST",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify(slotRows),
+      });
+      if (!r.ok) throw new Error(`rotator_restore_failed:${await r.text()}`);
+      rotator_slots_restored = slotRows.length;
+    }
+  }
+  return { locks_restored, rotator_slots_restored };
+}
+
 
 // --- resilient fetch helpers ---
 function withTimeout(ms) {
@@ -2851,24 +2994,64 @@ const routes = {
     }
   },
 
+  /* ---------- backups/detail (GET) ---------- */
+  "backups/detail": async (req, res) => {
+    if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req, req.query.bubble_user_id);
+    if (!bubbleUserId) return bad(res, 401, "missing_user");
+    const playlist_id = String(req.query.playlist_id || "");
+    const backup_id = String(req.query.backup_id || "");
+    if (!playlist_id || !backup_id) return bad(res, 400, "missing_playlist_or_backup_id");
+    const owned = await getOwnedPlaylist(playlist_id, bubbleUserId);
+    if (!owned) return bad(res, 403, "playlist_not_owned");
+    try {
+      const backup = await getBackupForPlaylist(playlist_id, backup_id);
+      if (!backup) return bad(res, 404, "backup_not_found");
+      const tracks = Array.isArray(backup.tracks) ? backup.tracks : [];
+      return json(res, 200, { ...backup, summary: summarizeBackupTracks(tracks), tracks });
+    } catch (e) {
+      return bad(res, 500, String(e?.message || e));
+    }
+  },
+
+  /* ---------- backups/diff (GET) ---------- */
+  "backups/diff": async (req, res) => {
+    if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req, req.query.bubble_user_id);
+    if (!bubbleUserId) return bad(res, 401, "missing_user");
+    const playlist_id = String(req.query.playlist_id || "");
+    const backup_id = String(req.query.backup_id || "");
+    if (!playlist_id || !backup_id) return bad(res, 400, "missing_playlist_or_backup_id");
+    const owned = await getOwnedPlaylist(playlist_id, bubbleUserId);
+    if (!owned) return bad(res, 403, "playlist_not_owned");
+    try {
+      const backup = await getBackupForPlaylist(playlist_id, backup_id);
+      if (!backup) return bad(res, 404, "backup_not_found");
+      const current = await fetchCurrentPlaylistItemsForBackupDiff(playlist_id);
+      const backupTracks = Array.isArray(backup.tracks) ? backup.tracks : [];
+      return json(res, 200, {
+        backup_id,
+        backup_summary: summarizeBackupTracks(backupTracks),
+        current_summary: summarizeBackupTracks(current),
+        diff: diffBackupAgainstCurrent(backupTracks, current),
+      });
+    } catch (e) {
+      return bad(res, 500, String(e?.message || e));
+    }
+  },
+
   /* ---------- backups/restore (POST) ---------- */
   "backups/restore": async (req, res) => {
     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
     const bubbleUserId = await bubbleUserIdFromRequest(req);
     if (!bubbleUserId) return bad(res, 401, "missing_user");
-    const { playlist_id, backup_id } = await readBody(req);
+    const { playlist_id, backup_id, restore_locks = false, restore_rotator = false } = await readBody(req);
     if (!playlist_id || !backup_id) return bad(res, 400, "missing_playlist_or_backup_id");
     const playlist = await getOwnedPlaylist(playlist_id, bubbleUserId);
     if (!playlist) return bad(res, 403, "playlist_not_owned");
 
-    const backupR = await sb(
-      `/rest/v1/playlist_backups?select=id,playlist_id,snapshot_id,taken_at,name,tracks` +
-      `&id=eq.${encodeURIComponent(String(backup_id))}` +
-      `&playlist_id=eq.${encodeURIComponent(String(playlist_id))}` +
-      `&limit=1`
-    );
-    if (!backupR.ok) return bad(res, 500, `backup_select_failed: ${await backupR.text()}`);
-    const backup = (await backupR.json())?.[0];
+    const backup = await getBackupForPlaylist(playlist_id, backup_id).catch((e) => ({ _error: e }));
+    if (backup?._error) return bad(res, 500, String(backup._error?.message || backup._error));
     if (!backup) return bad(res, 404, "backup_not_found");
 
     const tracks = Array.isArray(backup.tracks) ? backup.tracks : [];
@@ -2882,6 +3065,7 @@ const routes = {
       const before = await createPlaylistBackup(playlist, { reason: "pre_restore", onlyIfChanged: false }).catch((e) => ({ skipped: true, error: String(e?.message || e) }));
       const access_token = await getAccessTokenFromConnection(playlist.connection_id);
       const restored = await replaceSpotifyPlaylistTracks(playlist.playlist_id, access_token, uris);
+      const automation = await restoreBackupAutomationState(playlist, tracks, { restore_locks: !!restore_locks || !!restore_rotator, restore_rotator: !!restore_rotator });
       const cooldownUntil = await setPlaylistUpdateCooldown(playlist.id, 300);
       await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(String(playlist.id))}`, {
         method: "PATCH",
@@ -2903,10 +3087,81 @@ const routes = {
         }).catch(() => {});
       }
 
-      return json(res, 200, { ok: true, restored, pre_restore_backup: before, cooldown_until: cooldownUntil });
+      return json(res, 200, { ok: true, restored, automation, pre_restore_backup: before, cooldown_until: cooldownUntil });
     } catch (e) {
       return bad(res, 500, `backup_restore_failed: ${String(e?.message || e)}`);
     }
+  },
+
+  /* ---------- backups/cleanup-duplicates (POST) ---------- */
+  "backups/cleanup-duplicates": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req);
+    if (!bubbleUserId) return bad(res, 401, "missing_user");
+    const { playlist_id } = await readBody(req);
+    if (!playlist_id) return bad(res, 400, "missing_playlist_id");
+    const owned = await getOwnedPlaylist(playlist_id, bubbleUserId);
+    if (!owned) return bad(res, 403, "playlist_not_owned");
+    const r = await sb(
+      `/rest/v1/playlist_backups?select=id,snapshot_id,taken_at` +
+      `&playlist_id=eq.${encodeURIComponent(String(playlist_id))}` +
+      `&snapshot_id=not.is.null&order=taken_at.desc`
+    );
+    if (!r.ok) return bad(res, 500, `backup_select_failed:${await r.text()}`);
+    const rows = await r.json();
+    const seen = new Set();
+    const deleteIds = [];
+    for (const row of rows || []) {
+      if (!row.snapshot_id) continue;
+      if (seen.has(row.snapshot_id)) deleteIds.push(row.id);
+      else seen.add(row.snapshot_id);
+    }
+    if (deleteIds.length) {
+      const idList = deleteIds.map((id) => encodeURIComponent(String(id))).join(",");
+      const del = await sb(`/rest/v1/playlist_backups?id=in.(${idList})`, { method: "DELETE" });
+      if (!del.ok) return bad(res, 500, `backup_delete_failed:${await del.text()}`);
+    }
+    return json(res, 200, { ok: true, deleted: deleteIds.length, kept_snapshots: seen.size });
+  },
+
+  /* ---------- backups/apply-retention (POST) ---------- */
+  "backups/apply-retention": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req);
+    if (!bubbleUserId) return bad(res, 401, "missing_user");
+    const { playlist_id, keep_daily_days = 30, keep_weekly_months = 6 } = await readBody(req);
+    if (!playlist_id) return bad(res, 400, "missing_playlist_id");
+    const owned = await getOwnedPlaylist(playlist_id, bubbleUserId);
+    if (!owned) return bad(res, 403, "playlist_not_owned");
+    const r = await sb(
+      `/rest/v1/playlist_backups?select=id,taken_at` +
+      `&playlist_id=eq.${encodeURIComponent(String(playlist_id))}` +
+      `&order=taken_at.desc&limit=2000`
+    );
+    if (!r.ok) return bad(res, 500, `backup_select_failed:${await r.text()}`);
+    const rows = await r.json();
+    const dailyCutoff = Date.now() - Math.max(1, Number(keep_daily_days) || 30) * 24 * 3600 * 1000;
+    const weeklyCutoff = Date.now() - Math.max(1, Number(keep_weekly_months) || 6) * 31 * 24 * 3600 * 1000;
+    const keptWeeks = new Set();
+    const deleteIds = [];
+    for (const row of rows || []) {
+      const ts = Date.parse(row.taken_at || "");
+      if (!Number.isFinite(ts) || ts >= dailyCutoff) continue;
+      if (ts < weeklyCutoff) {
+        deleteIds.push(row.id);
+        continue;
+      }
+      const d = new Date(ts);
+      const weekKey = `${d.getUTCFullYear()}-${Math.floor((Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - Date.UTC(d.getUTCFullYear(), 0, 1)) / (7 * 24 * 3600 * 1000))}`;
+      if (keptWeeks.has(weekKey)) deleteIds.push(row.id);
+      else keptWeeks.add(weekKey);
+    }
+    if (deleteIds.length) {
+      const idList = deleteIds.map((id) => encodeURIComponent(String(id))).join(",");
+      const del = await sb(`/rest/v1/playlist_backups?id=in.(${idList})`, { method: "DELETE" });
+      if (!del.ok) return bad(res, 500, `backup_delete_failed:${await del.text()}`);
+    }
+    return json(res, 200, { ok: true, deleted: deleteIds.length, weekly_kept: keptWeeks.size });
   },
 
   /* ---------- backups/cron-weekly (GET/POST) ---------- */
