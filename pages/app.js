@@ -738,7 +738,7 @@ export default function PlaylistManager() {
   async function refreshFromSpotify() {
     if (!connectionId) return;
     await run("Spotify playlists refreshed", async () => {
-      await api("/api/playlists/sync?with_followers=1", {
+      await api("/api/playlists/sync?with_followers=1&with_items=1&items_limit=12", {
         method: "POST",
         accessToken: accessToken(),
         body: { connection_id: connectionId },

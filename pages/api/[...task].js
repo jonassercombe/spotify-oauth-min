@@ -4322,6 +4322,16 @@ const routes = {
 
     const playlist_row_id = req.query.playlist_row_id;
     if (!playlist_row_id) return bad(res, 400, "missing_playlist_row_id");
+    const bubbleUserId = await bubbleUserIdFromRequest(req);
+    if (!bubbleUserId) return bad(res, 401, "not_authenticated");
+
+    const owner = await sb(
+      `/rest/v1/playlists?select=id&limit=1` +
+      `&id=eq.${encodeURIComponent(playlist_row_id)}` +
+      `&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`
+    );
+    const ownerRows = owner.ok ? await owner.json().catch(() => []) : [];
+    if (!ownerRows?.[0]) return bad(res, 403, "playlist_not_owned");
 
     const path =
        `/rest/v1/playlist_items_ui` +
@@ -5326,17 +5336,43 @@ const routes = {
     // batch upsert
     const chunk = (arr,n)=>{const out=[]; for(let i=0;i<arr.length;i+=n) out.push(arr.slice(i,i+n)); return out;};
     let upserts = 0;
+    const syncedRows = [];
     for (const batch of chunk(rows, 100)) {
       const up = await sb(`/rest/v1/playlists?on_conflict=playlist_id`, {
         method: "POST",
-        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        headers: { Prefer: "resolution=merge-duplicates,return=representation" },
         body: JSON.stringify(batch),
       });
       if (!up.ok) return bad(res, 500, `supabase_upsert_failed: ${await up.text()}`);
+      const returnedRows = await up.json().catch(() => []);
+      if (Array.isArray(returnedRows)) syncedRows.push(...returnedRows);
       upserts += batch.length;
     }
 
-    return json(res, 200, { ok:true, upserts, filtered: filtered.length, followers_fetched: followersFetched });
+    const initialItems = String(req.query.with_items || "0") === "1";
+    let itemSyncDispatched = 0;
+    if (initialItems && syncedRows.length) {
+      const base = process.env.PUBLIC_BASE_URL || `https://${process.env.VERCEL_URL}`;
+      const syncCandidates = syncedRows
+        .filter((p) => p?.id && Number(p.tracks_total || 0) > 0)
+        .sort((a, b) => Number(b.followers ?? -1) - Number(a.followers ?? -1));
+      const limit = Math.max(1, Math.min(50, Number(req.query.items_limit || 12) || 12));
+      for (const playlist of syncCandidates.slice(0, limit)) {
+        await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(playlist.id)}`, {
+          method: "PATCH",
+          headers: { Prefer: "return=minimal" },
+          body: JSON.stringify({ needs_sync: true, next_check_at: null }),
+        }).catch(() => {});
+        fetch(`${base}/api/playlists/dispatch-sync`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+          body: JSON.stringify({ playlist_id: playlist.id }),
+        }).catch(() => {});
+        itemSyncDispatched++;
+      }
+    }
+
+    return json(res, 200, { ok:true, upserts, filtered: filtered.length, followers_fetched: followersFetched, item_sync_dispatched: itemSyncDispatched });
   },
 
   /* ---------- watch/check-updates (POST, internal) ---------- */
