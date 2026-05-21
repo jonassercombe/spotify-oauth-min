@@ -269,6 +269,18 @@ async function getBillingState(bubble_user_id) {
   };
 }
 
+async function findActiveSpotifyOwner(spotify_user_id, bubble_user_id) {
+  if (!spotify_user_id) return null;
+  const r = await sb(
+    `/rest/v1/spotify_connections?select=id,bubble_user_id,spotify_user_id,display_name` +
+      `&limit=1&is_active=is.true` +
+      `&spotify_user_id=eq.${encodeURIComponent(spotify_user_id)}` +
+      `&bubble_user_id=neq.${encodeURIComponent(bubble_user_id)}`
+  );
+  const rows = r.ok ? await r.json().catch(() => []) : [];
+  return rows?.[0] || null;
+}
+
 async function upsertStripeSubscriptionState({ bubble_user_id, customer_id, subscription }) {
   const item = subscription?.items?.data?.[0] || null;
   const priceId = item?.price?.id || null;
@@ -2190,13 +2202,16 @@ const routes = {
    
      // Ownership prüfen
      const sel = await sb(
-       `/rest/v1/spotify_connections?select=id,bubble_user_id,is_active&limit=1&id=eq.${encodeURIComponent(connection_id)}`
+       `/rest/v1/spotify_connections?select=id,bubble_user_id,spotify_user_id,is_active&limit=1&id=eq.${encodeURIComponent(connection_id)}`
      );
      const arr = await sel.json().catch(()=>[]);
      if (!sel.ok) return bad(res, 500, `supabase_select_failed: ${JSON.stringify(arr)}`);
      const row = arr[0];
      if (!row) return bad(res, 404, "connection_not_found");
      if (row.bubble_user_id !== bubbleUserId) return bad(res, 403, "forbidden");
+
+     const activeOwner = await findActiveSpotifyOwner(row.spotify_user_id, bubbleUserId);
+     if (activeOwner) return bad(res, 409, "spotify_account_already_connected");
    
      // Aktivieren
      const patch = await sb(`/rest/v1/spotify_connections?id=eq.${encodeURIComponent(connection_id)}`, {
@@ -3726,6 +3741,9 @@ const routes = {
        const spotify_user_id = me.id;
        const display_name    = me.display_name || label || "";
        const avatar_url      = (me.images && me.images[0]?.url) || null;
+
+       const activeOwner = await findActiveSpotifyOwner(spotify_user_id, bubble_user_id);
+       if (activeOwner) return backWithError(return_to, "spotify_account_already_connected");
    
        // app_user idempotent anlegen
        await fetch(`${SB_URL}/rest/v1/app_users?on_conflict=bubble_user_id`, {

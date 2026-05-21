@@ -47,6 +47,7 @@ function spotifySetupErrorMessage(code = "") {
   if (!code) return "";
   if (code === "subscription_required") return "Start a plan before connecting Spotify accounts.";
   if (code === "seat_limit_reached") return "This plan has no free Spotify account seats left.";
+  if (code === "spotify_account_already_connected") return "This Spotify account is already connected to another PlaylistPilot workspace.";
   if (code === "missing_spotify_app_credentials") return "Save your Spotify API app credentials before connecting Spotify.";
   if (code === "token_exchange_failed") return "Spotify authorization failed. Check Client ID, Client Secret, and the saved Redirect URI in Spotify.";
   if (code === "no_refresh_token_consent_required") return "Spotify did not return a refresh token. Retry Connect Spotify and approve access.";
