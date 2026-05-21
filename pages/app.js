@@ -2045,7 +2045,7 @@ export default function PlaylistManager() {
                       </button>
                     </div>
                     <div className="rotatorRules">
-                      <label className="toggleField">
+                      <label className="toggleField rotatorDuplicateToggle">
                         <input type="checkbox" checked={flexAvoidDuplicates} onChange={(e) => setFlexAvoidDuplicates(e.target.checked)} />
                         Skip songs already in target playlist
                       </label>
@@ -3991,7 +3991,7 @@ export default function PlaylistManager() {
         }
         .rotatorRules {
           display: grid;
-          grid-template-columns: minmax(220px, 1.4fr) repeat(4, minmax(120px, 1fr));
+          grid-template-columns: repeat(4, minmax(128px, 1fr));
           gap: 10px;
           align-items: center;
           padding: 12px;
@@ -4005,12 +4005,17 @@ export default function PlaylistManager() {
           gap: 8px;
           color: #a6adba;
           font-weight: 700;
-          white-space: nowrap;
+          min-width: 0;
+          line-height: 1.35;
         }
         .toggleField input {
           width: 18px;
           height: 18px;
           padding: 0;
+          flex: 0 0 auto;
+        }
+        .rotatorDuplicateToggle {
+          grid-column: 1 / -1;
         }
         .referencePlaylist {
           display: grid;
