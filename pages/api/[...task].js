@@ -475,6 +475,106 @@ async function getAccessTokenFromConnection(connection_id) {
   return t.access_token;
 }
 
+async function fetchSpotifyPlaylistSnapshot(playlist, access_token, knownMeta = null) {
+  let meta = knownMeta;
+  if (!meta) {
+    const metaR = await fetchJSON(
+      `https://api.spotify.com/v1/playlists/${encodeURIComponent(playlist.playlist_id)}?fields=name,description,images,snapshot_id,followers(total),tracks(total)`,
+      { headers: { Authorization: `Bearer ${access_token}` } },
+      20000
+    );
+    if (!metaR.r.ok) throw new Error(`spotify_backup_meta_failed:${metaR.r.status}:${metaR.text || JSON.stringify(metaR.json)}`);
+    meta = metaR.json || {};
+  }
+  const tracks = [];
+  let offset = 0;
+  let guard = 0;
+  while (guard++ < 100) {
+    const pageR = await fetchJSON(
+      `https://api.spotify.com/v1/playlists/${encodeURIComponent(playlist.playlist_id)}/tracks?limit=100&offset=${offset}&fields=items(added_at,track(id,uri,name,album(name,images),artists(name))),next`,
+      { headers: { Authorization: `Bearer ${access_token}` } },
+      30000
+    );
+    if (!pageR.r.ok) throw new Error(`spotify_backup_tracks_failed:${pageR.r.status}:${pageR.text || JSON.stringify(pageR.json)}`);
+    const items = Array.isArray(pageR.json?.items) ? pageR.json.items : [];
+    items.forEach((it, index) => {
+      const t = it?.track || {};
+      const album = t?.album || {};
+      const artists = Array.isArray(t?.artists) ? t.artists : [];
+      tracks.push({
+        position: offset + index,
+        track_id: t.id || null,
+        track_uri: t.uri || null,
+        track_name: t.name || null,
+        artist_names: artists.map(a => a?.name).filter(Boolean).join(", "),
+        album_name: album?.name || null,
+        added_at: it?.added_at || null
+      });
+    });
+    if (!pageR.json?.next || !items.length) break;
+    offset += items.length;
+    await sleep(40);
+  }
+  return { meta, tracks };
+}
+
+async function createPlaylistBackup(playlist, { reason = "manual", onlyIfChanged = false } = {}) {
+  const access_token = await getAccessTokenFromConnection(playlist.connection_id);
+  const metaR = await fetchJSON(
+    `https://api.spotify.com/v1/playlists/${encodeURIComponent(playlist.playlist_id)}?fields=name,description,images,snapshot_id,followers(total),tracks(total)`,
+    { headers: { Authorization: `Bearer ${access_token}` } },
+    20000
+  );
+  if (!metaR.r.ok) throw new Error(`spotify_backup_meta_failed:${metaR.r.status}:${metaR.text || JSON.stringify(metaR.json)}`);
+  const meta = metaR.json || {};
+  const snapshot_id = meta?.snapshot_id || null;
+  if (onlyIfChanged && snapshot_id) {
+    const lastR = await sb(
+      `/rest/v1/playlist_backups?select=id,snapshot_id` +
+      `&playlist_id=eq.${encodeURIComponent(playlist.id)}` +
+      `&order=taken_at.desc&limit=1`
+    );
+    const last = lastR.ok ? (await lastR.json())?.[0] : null;
+    if (last?.snapshot_id === snapshot_id) return { skipped: true, reason: "unchanged_snapshot", snapshot_id };
+  }
+  const { tracks } = await fetchSpotifyPlaylistSnapshot(playlist, access_token, meta);
+  const payload = {
+    playlist_id: playlist.id,
+    spotify_playlist_id: playlist.playlist_id,
+    snapshot_id,
+    taken_at: new Date().toISOString(),
+    name: meta?.name || playlist.name || null,
+    description: meta?.description || null,
+    image: meta?.images?.[0]?.url || playlist.image || null,
+    followers: meta?.followers?.total ?? playlist.followers ?? null,
+    tracks_total: tracks.length,
+    tracks,
+    bubble_user_id: playlist.bubble_user_id,
+    reason
+  };
+  let insert = await sb(`/rest/v1/playlist_backups`, {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify([payload])
+  });
+  if (!insert.ok) {
+    const text = await insert.text();
+    if (text.includes("reason")) {
+      const { reason: _reason, ...fallbackPayload } = payload;
+      insert = await sb(`/rest/v1/playlist_backups`, {
+        method: "POST",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify([fallbackPayload])
+      });
+    } else {
+      throw new Error(`backup_insert_failed:${text}`);
+    }
+  }
+  if (!insert.ok) throw new Error(`backup_insert_failed:${await insert.text()}`);
+  const rows = await insert.json();
+  return { skipped: false, backup: rows?.[0] || null, snapshot_id };
+}
+
 
 // --- resilient fetch helpers ---
 function withTimeout(ms) {
@@ -529,12 +629,12 @@ async function setConnectionCooldown(connection_id, seconds) {
   return until;
 }
 
-async function setPlaylistUpdateCooldown(playlist_id, seconds = 300) {
+async function setPlaylistUpdateCooldown(playlist_id, seconds = 90) {
   const until = new Date(Date.now() + Math.max(1, seconds) * 1000).toISOString();
   await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(String(playlist_id))}`, {
     method: "PATCH",
     headers: { Prefer: "return=minimal" },
-    body: JSON.stringify({ next_check_at: until })
+    body: JSON.stringify({ next_check_at: until, needs_sync: true })
   }).catch(() => {});
   return until;
 }
@@ -822,6 +922,33 @@ function normalizePaypalSubscription(json) {
    Route Handlers (map)
 ============================== */
 const routes = {
+
+  /* ---------- image-proxy (GET) ---------- */
+  "image-proxy": async (req, res) => {
+    if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+    const raw = String(req.query.url || "");
+    let target;
+    try {
+      target = new URL(raw);
+    } catch {
+      return bad(res, 400, "invalid_image_url");
+    }
+    const allowed = target.hostname === "i.scdn.co" || target.hostname.endsWith(".spotifycdn.com");
+    if (!allowed) return bad(res, 400, "image_host_not_allowed");
+    const proxied = await fetch(target.toString(), {
+      headers: {
+        Accept: "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
+        "User-Agent": "PlaylistPilot/1.0"
+      }
+    });
+    if (!proxied.ok) return bad(res, proxied.status, "image_fetch_failed");
+    const contentType = proxied.headers.get("content-type") || "image/jpeg";
+    if (!contentType.startsWith("image/")) return bad(res, 415, "unsupported_image_type");
+    const buffer = Buffer.from(await proxied.arrayBuffer());
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "public, max-age=86400, s-maxage=604800, stale-while-revalidate=604800");
+    return res.status(200).send(buffer);
+  },
 
 
   /* ---------- auth/me (GET) ---------- */
@@ -2483,6 +2610,68 @@ const routes = {
     next_day_removals: upcoming_removals.filter((r) => r.removes_on === new Date(Date.now() + 24*3600*1000).toISOString().slice(0,10))
   });
 },
+
+  /* ---------- backups/list (GET) ---------- */
+  "backups/list": async (req, res) => {
+    if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req, req.query.bubble_user_id);
+    if (!bubbleUserId) return bad(res, 401, "missing_user");
+    const playlist_id = String(req.query.playlist_id || "");
+    if (!playlist_id) return bad(res, 400, "missing_playlist_id");
+    const owned = await getOwnedPlaylist(playlist_id, bubbleUserId);
+    if (!owned) return bad(res, 403, "playlist_not_owned");
+    const limit = Math.max(1, Math.min(50, Number(req.query.limit || "10")));
+    const r = await sb(
+      `/rest/v1/playlist_backups?select=id,taken_at,snapshot_id,name,image,followers,tracks_total` +
+      `&playlist_id=eq.${encodeURIComponent(playlist_id)}` +
+      `&order=taken_at.desc&limit=${encodeURIComponent(limit)}`
+    );
+    if (!r.ok) return bad(res, 500, `backups_select_failed: ${await r.text()}`);
+    return json(res, 200, await r.json());
+  },
+
+  /* ---------- backups/create (POST) ---------- */
+  "backups/create": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req);
+    if (!bubbleUserId) return bad(res, 401, "missing_user");
+    const { playlist_id, only_if_changed = false } = await readBody(req);
+    if (!playlist_id) return bad(res, 400, "missing_playlist_id");
+    const playlist = await getOwnedPlaylist(playlist_id, bubbleUserId);
+    if (!playlist) return bad(res, 403, "playlist_not_owned");
+    try {
+      const result = await createPlaylistBackup(playlist, { reason: "manual", onlyIfChanged: !!only_if_changed });
+      return json(res, 200, { ok: true, ...result });
+    } catch (e) {
+      return bad(res, 500, `backup_create_failed: ${String(e?.message || e)}`);
+    }
+  },
+
+  /* ---------- backups/cron-weekly (GET/POST) ---------- */
+  "backups/cron-weekly": async (req, res) => {
+    if (!checkCronAuth(req) && !checkAppSecret(req)) return bad(res, 401, "unauthorized_cron");
+    const qs = Object.fromEntries(new URL(req.url, `http://${req.headers.host}`).searchParams.entries());
+    const limit = Math.max(1, Math.min(20, Number(qs.limit || "10")));
+    const r = await sb(
+      `/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id,name,image,followers,tracks_total,last_checked_at` +
+      `&is_owner=is.true&is_public=is.true&connection_id=not.is.null` +
+      `&order=last_checked_at.asc.nullsfirst&limit=${encodeURIComponent(limit)}`
+    );
+    if (!r.ok) return bad(res, 500, `playlist_select_failed: ${await r.text()}`);
+    const playlists = await r.json();
+    let created = 0, unchanged = 0, failed = 0;
+    for (const playlist of playlists) {
+      try {
+        const result = await createPlaylistBackup(playlist, { reason: "weekly", onlyIfChanged: true });
+        if (result.skipped) unchanged++;
+        else created++;
+      } catch {
+        failed++;
+      }
+      await sleep(120);
+    }
+    return json(res, 200, { ok: true, processed: playlists.length, created, unchanged, failed });
+  },
 
 
 

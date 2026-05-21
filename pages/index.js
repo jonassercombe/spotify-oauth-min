@@ -85,13 +85,27 @@ function normalizeSpotifyImageUrl(url) {
   return value;
 }
 
+function proxiedArtworkUrl(url) {
+  const normalized = normalizeSpotifyImageUrl(url);
+  if (!normalized) return "";
+  try {
+    const parsed = new URL(normalized);
+    if (parsed.hostname === "i.scdn.co" || parsed.hostname.endsWith(".spotifycdn.com")) {
+      return `/api/image-proxy?url=${encodeURIComponent(normalized)}`;
+    }
+  } catch {
+    return normalized;
+  }
+  return normalized;
+}
+
 function Artwork({ src, alt = "", size = "md" }) {
-  const normalized = normalizeSpotifyImageUrl(src);
+  const normalized = proxiedArtworkUrl(src);
   const [currentSrc, setCurrentSrc] = useState(normalized);
   const [failed, setFailed] = useState(!normalized);
 
   useEffect(() => {
-    const next = normalizeSpotifyImageUrl(src);
+    const next = proxiedArtworkUrl(src);
     setCurrentSrc(next);
     setFailed(!next);
   }, [src]);
@@ -108,7 +122,8 @@ function Artwork({ src, alt = "", size = "md" }) {
       referrerPolicy="no-referrer"
       loading="lazy"
       onError={() => {
-        if (currentSrc !== src && src) setCurrentSrc(src);
+        const direct = normalizeSpotifyImageUrl(src);
+        if (currentSrc !== direct && direct) setCurrentSrc(direct);
         else setFailed(true);
       }}
     />
@@ -281,6 +296,7 @@ export default function PlaylistManager() {
   const [flexReferenceIssue, setFlexReferenceIssue] = useState(null);
   const [flexInterval, setFlexInterval] = useState("weekly");
   const [flexEnabled, setFlexEnabled] = useState(false);
+  const [backups, setBackups] = useState([]);
   const [busy, setBusy] = useState(false);
   const [busyLabel, setBusyLabel] = useState("");
   const [message, setMessage] = useState("");
@@ -616,7 +632,27 @@ export default function PlaylistManager() {
       setFlexReferenceIssue(null);
       setFlexInterval(settings?.interval || "weekly");
       setFlexEnabled(!!settings?.enabled);
+      await loadBackups();
       return { detail, items };
+    });
+  }
+
+  async function loadBackups() {
+    if (!playlistId) return [];
+    const rows = await api(`/api/backups/list?playlist_id=${encodeURIComponent(playlistId)}&limit=8`, { accessToken: accessToken() });
+    setBackups(Array.isArray(rows) ? rows : []);
+    return rows;
+  }
+
+  async function createBackupNow() {
+    if (!playlistId) return;
+    await run("Backup created", async () => {
+      await api("/api/backups/create", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { playlist_id: playlistId },
+      });
+      await loadBackups();
     });
   }
 
@@ -1402,6 +1438,7 @@ export default function PlaylistManager() {
                   ["add", "Add song"],
                   ["expiry", "Expiry"],
                   ["flex", "Rotator"],
+                  ["backups", "Backups"],
                 ].map(([key, label]) => (
                   <button key={key} className={activeTool === key ? "selected" : ""} onClick={() => setActiveTool(key)}>
                     {label}
@@ -1539,6 +1576,31 @@ export default function PlaylistManager() {
                           <button className="danger tooltipButton" data-tooltip="Remove this rotation slot. The song becomes a normal playlist item." disabled={busy} onClick={() => removeFlexSlot(slot)}>Remove</button>
                         </div>
                       ))}
+                    </div>
+                  </>
+                ) : null}
+                {activeTool === "backups" ? (
+                  <>
+                    <div className="flexPanelHeader">
+                      <div>
+                        <h2>Backups</h2>
+                        <p>Create a playlist snapshot before bigger edits. Automatic backups already happen during sync; manual backups are useful before risky reorder sessions.</p>
+                      </div>
+                      <button className="tooltipButton" data-tooltip="Fetch the current Spotify order and store it as a restorable snapshot." disabled={busy || !playlistId} onClick={createBackupNow}>
+                        Create backup
+                      </button>
+                    </div>
+                    <div className="backupList">
+                      {backups.map((backup) => (
+                        <div className="backupItem" key={backup.id}>
+                          <Artwork src={backup.image || playlist?.image} alt="" size="sm" />
+                          <span>
+                            <strong>{formatShortDate(String(backup.taken_at || "").slice(0, 10)) || "Backup"}</strong>
+                            <small>{formatNumber(backup.tracks_total)} tracks · {backup.snapshot_id ? `snapshot ${String(backup.snapshot_id).slice(0, 8)}` : "no snapshot"}</small>
+                          </span>
+                        </div>
+                      ))}
+                      {!backups.length ? <p>No backups stored for this playlist yet.</p> : null}
                     </div>
                   </>
                 ) : null}
@@ -3032,6 +3094,34 @@ export default function PlaylistManager() {
         .flexSlot span {
           color: #a6adba;
           font-weight: 800;
+        }
+        .backupList {
+          display: grid;
+          gap: 8px;
+        }
+        .backupItem {
+          display: grid;
+          grid-template-columns: 42px minmax(0, 1fr);
+          align-items: center;
+          gap: 10px;
+          padding: 10px;
+          border: 1px solid #252c37;
+          border-radius: 8px;
+          background: #12161d;
+        }
+        .backupItem span {
+          display: grid;
+          gap: 3px;
+          min-width: 0;
+        }
+        .backupItem strong,
+        .backupItem small {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .backupItem small {
+          color: #a6adba;
         }
         .trackPanel {
           border: 1px solid #2a303b;
