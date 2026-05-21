@@ -964,6 +964,7 @@ export default function PlaylistManager() {
         body: {
           playlist_id: playlistId,
           track_id: track.track_id,
+          from_position: track.position,
           dir,
           steps: 1,
         },
@@ -991,6 +992,7 @@ export default function PlaylistManager() {
         body: {
           playlist_id: playlistId,
           track_id: track.track_id,
+          from_position: track.position,
           dir: to < from ? "up" : "down",
           steps: Math.abs(to - from),
         },

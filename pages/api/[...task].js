@@ -5800,7 +5800,7 @@ const routes = {
      const bubbleUserId = await bubbleUserIdFromRequest(req);
      if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
    
-     const { playlist_id, track_id, dir, steps = 1 } = await readBody(req);
+     const { playlist_id, track_id, from_position, dir, steps = 1 } = await readBody(req);
      if (!playlist_id || !track_id || !dir) return bad(res, 400, "Missing playlist_id, track_id or dir");
    
      // Ownership + Spotify target. Moves must hit Spotify immediately, otherwise
@@ -5821,7 +5821,8 @@ const routes = {
        `&order=position.asc&limit=1`
      );
      const beforeRow = beforePosR.ok ? (await beforePosR.json())?.[0] : null;
-     const beforePosition = Number.isFinite(Number(beforeRow?.position)) ? Number(beforeRow.position) : null;
+     const requestedFromPosition = Number.isFinite(Number(from_position)) ? Number(from_position) : null;
+     const beforePosition = requestedFromPosition ?? (Number.isFinite(Number(beforeRow?.position)) ? Number(beforeRow.position) : null);
      const stepCount = Math.max(1, Number(steps) || 1);
      const direction = String(dir || "").toLowerCase();
      const estimatedTarget = beforePosition === null
@@ -5877,11 +5878,11 @@ const routes = {
      }
    
      // RPC call
-     const r = await sb(`/rest/v1/rpc/playlist_move_one`, {
+     const r = await sb(`/rest/v1/rpc/playlist_move_at_position`, {
        method: "POST",
        body: JSON.stringify({
          p_playlist_id: playlist_id,
-         p_track_id: track_id,
+         p_from_position: beforePosition,
          p_dir: direction,
          p_steps: stepCount
        })
