@@ -86,14 +86,11 @@ function checkCronAuth(req) {
 
   if (want && (gotAuth === `Bearer ${want}` || qpKey === want)) return true;
   if (isVercelCron) return true;
-  return !want;  // falls ohne Secret explizit offen gewünscht
+  return false;
 }
 
 function checkAppSecret(req) {
-  const want = process.env.APP_WEBHOOK_SECRET;
-  const got = req.headers["x-app-secret"];
-  if (want && got !== want) return false;
-  return true;
+  return hasValidAppSecret(req);
 }
 
 function hasValidAppSecret(req) {
@@ -197,13 +194,9 @@ async function getUserContext(req) {
   };
 }
 
-async function bubbleUserIdFromRequest(req, explicitValue = "") {
+async function bubbleUserIdFromRequest(req) {
   const ctx = await getUserContext(req);
   if (ctx?.bubble_user_id) return ctx.bubble_user_id;
-
-  const legacyValue = String(explicitValue || req.headers?.["x-bubble-user-id"] || "").trim();
-  if (legacyValue && hasValidAppSecret(req)) return legacyValue;
-
   return "";
 }
 
@@ -2385,7 +2378,7 @@ const routes = {
    */
    "dashboard/growth": async (req, res) => {
      if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
-     const bubble_user_id = String(req.query.bubble_user_id || "");
+     const bubble_user_id = await bubbleUserIdFromRequest(req);
      const playlist_id    = String(req.query.playlist_id || "");
      const days           = Math.max(1, parseInt(req.query.days || "30", 10) || 30);
    
@@ -2486,7 +2479,7 @@ const routes = {
    "dashboard/cards": async (req, res) => {
      if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
    
-     const bubble_user_id = req.query.bubble_user_id;
+     const bubble_user_id = await bubbleUserIdFromRequest(req);
      const range = String(req.query.range || "d").toLowerCase();
      if (!bubble_user_id) return bad(res, 400, "missing_bubble_user_id");
    
@@ -4410,10 +4403,7 @@ const routes = {
          */
    "playlists/refresh-followers": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
-     if (process.env.APP_WEBHOOK_SECRET) {
-       const got = req.headers["x-app-secret"];
-       if (got !== process.env.APP_WEBHOOK_SECRET) return bad(res, 401, "unauthorized");
-     }
+     if (!checkAppSecret(req)) return bad(res, 401, "unauthorized");
    
      try {
        const body = await readBody(req);
@@ -5258,12 +5248,9 @@ const routes = {
     const conn = (await cr.json())[0];
     if (!conn) return bad(res, 404, "connection_not_found");
 
-    if (process.env.APP_WEBHOOK_SECRET) {
-      const got = req.headers["x-app-secret"];
-      const bubbleUserId = await bubbleUserIdFromRequest(req);
-      const isOwner = bubbleUserId && bubbleUserId === conn.bubble_user_id;
-      if (got !== process.env.APP_WEBHOOK_SECRET && !isOwner) return bad(res, 401, "unauthorized");
-    }
+    const bubbleUserId = await bubbleUserIdFromRequest(req);
+    const isOwner = bubbleUserId && bubbleUserId === conn.bubble_user_id;
+    if (!checkAppSecret(req) && !isOwner) return bad(res, 401, "unauthorized");
 
     const refresh_token = decryptToken(conn.refresh_token_enc);
     const credentials = await getSpotifyAppCredentialsForConnection(conn.id);
@@ -6262,10 +6249,7 @@ const routes = {
   /* ---------- playlists/mark-sync-needed (POST, secret) ---------- */
   "playlists/mark-sync-needed": async (req, res) => {
     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
-    if (process.env.APP_WEBHOOK_SECRET) {
-      const got = req.headers["x-app-secret"];
-      if (got !== process.env.APP_WEBHOOK_SECRET) return bad(res, 401, "unauthorized");
-    }
+    if (!checkAppSecret(req)) return bad(res, 401, "unauthorized");
     const body = await readBody(req);
     const { playlist_id } = body;
     if (!playlist_id) return bad(res, 400, "missing_playlist_id");
@@ -6625,10 +6609,7 @@ const routes = {
   /* ---------- playlists/dispatch-sync (POST, secret) ---------- */
   "playlists/dispatch-sync": async (req, res) => {
     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
-    if (process.env.APP_WEBHOOK_SECRET) {
-      const got = req.headers["x-app-secret"];
-      if (got !== process.env.APP_WEBHOOK_SECRET) return bad(res, 401, "unauthorized");
-    }
+    if (!checkAppSecret(req)) return bad(res, 401, "unauthorized");
     const body = await readBody(req);
     const { playlist_id } = body;
     if (!playlist_id) return bad(res, 400, "missing_playlist_id");
