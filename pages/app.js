@@ -380,7 +380,8 @@ export default function PlaylistManager() {
   const onboardingCredentialsReady = !!spotifyCredentials?.configured;
   const onboardingConnectionsReady = connections.length > 0;
   const onboardingPlaylistsReady = playlists.length > 0;
-  const onboardingStep = !onboardingBillingReady ? 1 : !onboardingCredentialsReady ? 2 : !onboardingConnectionsReady ? 3 : !onboardingPlaylistsReady ? 4 : 5;
+  const onboardingNeedsBilling = !onboardingBillingReady && !onboardingCredentialsReady && !onboardingConnectionsReady && !onboardingPlaylistsReady;
+  const onboardingStep = onboardingNeedsBilling ? 1 : !onboardingCredentialsReady ? 2 : !onboardingConnectionsReady ? 3 : !onboardingPlaylistsReady ? 4 : 5;
   const [isMobileViewport, setIsMobileViewport] = useState(false);
 
   useEffect(() => {
@@ -442,10 +443,10 @@ export default function PlaylistManager() {
     const key = `playlistpilot:onboarding-dismissed:${userContext.bubble_user_id || userContext.email}`;
     const dismissed = typeof window !== "undefined" && window.localStorage.getItem(key) === "1";
     setOnboardingDismissed(dismissed);
-    if (!dismissed && (!onboardingBillingReady || !onboardingCredentialsReady || !onboardingConnectionsReady || !onboardingPlaylistsReady)) {
+    if (!dismissed && (onboardingNeedsBilling || !onboardingCredentialsReady || !onboardingConnectionsReady || !onboardingPlaylistsReady)) {
       setOnboardingOpen(true);
     }
-  }, [userContext?.linked, userContext?.bubble_user_id, userContext?.email, spotifyCredentials, onboardingBillingReady, onboardingCredentialsReady, onboardingConnectionsReady, onboardingPlaylistsReady]);
+  }, [userContext?.linked, userContext?.bubble_user_id, userContext?.email, spotifyCredentials, onboardingNeedsBilling, onboardingCredentialsReady, onboardingConnectionsReady, onboardingPlaylistsReady]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
