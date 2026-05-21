@@ -132,6 +132,29 @@ async function getUserContext(req) {
     }
   }
 
+  if (!link) {
+    const bubble_user_id = `auth:${authUser.id}`;
+    const userUpsert = await sb(`/rest/v1/app_users?on_conflict=bubble_user_id`, {
+      method: "POST",
+      headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
+      body: JSON.stringify([{ bubble_user_id }])
+    });
+    if (userUpsert.ok) {
+      const linkInsert = await sb(`/rest/v1/user_identity_links`, {
+        method: "POST",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify([{
+          auth_user_id: authUser.id,
+          email,
+          bubble_user_id,
+          role: "user",
+        }])
+      });
+      const inserted = linkInsert.ok ? await linkInsert.json().catch(() => []) : [];
+      link = inserted?.[0] || null;
+    }
+  }
+
   if (!link?.bubble_user_id) return { authUser, email, linked: false };
   return {
     authUser,

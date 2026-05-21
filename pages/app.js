@@ -350,6 +350,8 @@ export default function PlaylistManager() {
   const [spotifyCredentials, setSpotifyCredentials] = useState(null);
   const [spotifyCredsOpen, setSpotifyCredsOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [onboardingOpen, setOnboardingOpen] = useState(false);
+  const [onboardingDismissed, setOnboardingDismissed] = useState(false);
   const [healthStatus, setHealthStatus] = useState(null);
   const [spotifyClientId, setSpotifyClientId] = useState("");
   const [spotifyClientSecret, setSpotifyClientSecret] = useState("");
@@ -364,6 +366,10 @@ export default function PlaylistManager() {
   const safeMoversPage = Math.min(moversPage, moversPageCount - 1);
   const visibleMovers = movers.slice(safeMoversPage * moversPageSize, safeMoversPage * moversPageSize + moversPageSize);
   const growthReady = !!(dashboardSeries?.ready || dashboardSummary?.totals?.growth_ready);
+  const onboardingCredentialsReady = !!spotifyCredentials?.configured;
+  const onboardingConnectionsReady = connections.length > 0;
+  const onboardingPlaylistsReady = playlists.length > 0;
+  const onboardingStep = !onboardingCredentialsReady ? 1 : !onboardingConnectionsReady ? 2 : !onboardingPlaylistsReady ? 3 : 4;
 
   useEffect(() => {
     const client = getSupabaseBrowserClient();
@@ -409,6 +415,16 @@ export default function PlaylistManager() {
     loadSpotifyCredentials();
     loadHealthStatus();
   }, [userContext?.linked]);
+
+  useEffect(() => {
+    if (!userContext?.linked || spotifyCredentials === null) return;
+    const key = `playlistpilot:onboarding-dismissed:${userContext.bubble_user_id || userContext.email}`;
+    const dismissed = typeof window !== "undefined" && window.localStorage.getItem(key) === "1";
+    setOnboardingDismissed(dismissed);
+    if (!dismissed && (!onboardingCredentialsReady || !onboardingConnectionsReady || !onboardingPlaylistsReady)) {
+      setOnboardingOpen(true);
+    }
+  }, [userContext?.linked, userContext?.bubble_user_id, userContext?.email, spotifyCredentials, onboardingCredentialsReady, onboardingConnectionsReady, onboardingPlaylistsReady]);
 
   useEffect(() => {
     if (!userContext?.linked || view !== "dashboard") return;
@@ -535,6 +551,24 @@ export default function PlaylistManager() {
 
   async function signOut() {
     await supabase.auth.signOut();
+  }
+
+  function dismissOnboarding() {
+    const key = userContext?.bubble_user_id || userContext?.email
+      ? `playlistpilot:onboarding-dismissed:${userContext.bubble_user_id || userContext.email}`
+      : "";
+    if (key && typeof window !== "undefined") window.localStorage.setItem(key, "1");
+    setOnboardingDismissed(true);
+    setOnboardingOpen(false);
+  }
+
+  function reopenOnboarding() {
+    const key = userContext?.bubble_user_id || userContext?.email
+      ? `playlistpilot:onboarding-dismissed:${userContext.bubble_user_id || userContext.email}`
+      : "";
+    if (key && typeof window !== "undefined") window.localStorage.removeItem(key);
+    setOnboardingDismissed(false);
+    setOnboardingOpen(true);
   }
 
   function startSpotifyConnect() {
@@ -1010,12 +1044,27 @@ export default function PlaylistManager() {
   }
 
   async function refreshDashboardBaseline() {
+    if (!connectionId) return;
     await run("Follower baseline refreshed", async () => {
       await api("/api/playlists/sync?with_followers=1", {
         method: "POST",
         accessToken: accessToken(),
+        body: { connection_id: connectionId },
       });
       return loadDashboard();
+    });
+  }
+
+  async function importOnboardingPlaylists() {
+    if (!connectionId) return;
+    await run("Playlists imported", async () => {
+      await api("/api/playlists/sync?with_followers=1", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { connection_id: connectionId },
+      });
+      await loadPlaylists();
+      await loadDashboard();
     });
   }
 
@@ -1237,6 +1286,92 @@ export default function PlaylistManager() {
         </section>
       ) : (
       <>
+      {onboardingOpen && !onboardingDismissed ? (
+        <div className="onboardingOverlay" role="dialog" aria-modal="true" aria-label="PlaylistPilot onboarding">
+          <section className="onboardingPanel">
+            <div className="onboardingHeader">
+              <div>
+                <span>Setup</span>
+                <h2>Get your first playlist into PlaylistPilot</h2>
+                <p>Connect the Spotify app credentials you control, authorize Spotify, then import your playlists and baseline stats.</p>
+              </div>
+              <button className="iconOnlyButton" onClick={dismissOnboarding} aria-label="Close onboarding">
+                <X aria-hidden="true" />
+              </button>
+            </div>
+            <ol className="onboardingSteps">
+              <li className={onboardingStep === 1 ? "active" : onboardingCredentialsReady ? "done" : ""}>
+                <b>1</b>
+                <span><strong>Spotify API App</strong><small>{onboardingCredentialsReady ? "Credentials saved" : "Create credentials once for your account"}</small></span>
+              </li>
+              <li className={onboardingStep === 2 ? "active" : onboardingConnectionsReady ? "done" : ""}>
+                <b>2</b>
+                <span><strong>Connect Spotify</strong><small>{onboardingConnectionsReady ? `${connections.length} account connected` : "Authorize the account to manage"}</small></span>
+              </li>
+              <li className={onboardingStep === 3 ? "active" : onboardingPlaylistsReady ? "done" : ""}>
+                <b>3</b>
+                <span><strong>Import Playlists</strong><small>{onboardingPlaylistsReady ? `${playlists.length} playlists available` : "Load playlists and start follower baselines"}</small></span>
+              </li>
+            </ol>
+
+            {onboardingStep === 1 ? (
+              <div className="onboardingStage">
+                <div className="onboardingCopy">
+                  <h3>Create your Spotify Developer app</h3>
+                  <ol>
+                    <li>Open the Spotify Developer Dashboard and create an app.</li>
+                    <li>Add this Redirect URI in Spotify app settings.</li>
+                    <li>Paste Client ID and Client Secret below.</li>
+                  </ol>
+                </div>
+                <div className="onboardingForm">
+                  <label><span>Redirect URI</span><input value={spotifyRedirectUri} onChange={(e) => setSpotifyRedirectUri(e.target.value)} /></label>
+                  <input value={spotifyAppName} onChange={(e) => setSpotifyAppName(e.target.value)} placeholder="App name" />
+                  <input value={spotifyClientId} onChange={(e) => setSpotifyClientId(e.target.value)} placeholder="Client ID" />
+                  <input type="password" value={spotifyClientSecret} onChange={(e) => setSpotifyClientSecret(e.target.value)} placeholder="Client Secret" />
+                  <button disabled={busy || !spotifyClientId.trim() || !spotifyClientSecret.trim()} onClick={saveSpotifyCredentials}>Save Spotify App</button>
+                </div>
+              </div>
+            ) : null}
+
+            {onboardingStep === 2 ? (
+              <div className="onboardingStage">
+                <div className="onboardingCopy">
+                  <h3>Authorize a Spotify account</h3>
+                  <p>The connected Spotify account determines which playlists PlaylistPilot can import and edit.</p>
+                </div>
+                <div className="onboardingActions">
+                  <button disabled={busy} onClick={startSpotifyConnect}>Connect Spotify</button>
+                  <button className="secondaryOutline" onClick={() => setSettingsOpen(true)}>Open settings</button>
+                </div>
+              </div>
+            ) : null}
+
+            {onboardingStep === 3 ? (
+              <div className="onboardingStage">
+                <div className="onboardingCopy">
+                  <h3>Import playlists and start tracking</h3>
+                  <p>This loads playlists from Spotify and captures the first follower baseline. Growth history builds from this point forward.</p>
+                </div>
+                <div className="onboardingActions">
+                  <button disabled={busy || !connectionId} onClick={importOnboardingPlaylists}>Import playlists</button>
+                  <button className="secondaryOutline" disabled={busy} onClick={loadPlaylists}>Check imported playlists</button>
+                </div>
+              </div>
+            ) : null}
+
+            {onboardingStep === 4 ? (
+              <div className="onboardingStage onboardingReady">
+                <div>
+                  <h3>Your workspace is ready</h3>
+                  <p>Select a playlist in the manager. Dashboard growth starts as soon as PlaylistPilot has multiple follower snapshot days.</p>
+                </div>
+                <button onClick={() => { setOnboardingOpen(false); setView("manager"); }}>Open Playlist Manager</button>
+              </div>
+            ) : null}
+          </section>
+        </div>
+      ) : null}
       {settingsOpen ? (
         <div className="settingsOverlay" role="dialog" aria-modal="true" aria-label="Settings">
           <div className="settingsPanel">
@@ -1253,6 +1388,7 @@ export default function PlaylistManager() {
             <section className="settingsSection">
               <span>Signed in</span>
               <strong>{userContext.email}</strong>
+              <button disabled={busy} onClick={reopenOnboarding}>Open onboarding</button>
               <button className="dangerOutline settingsLogout" onClick={signOut}>Log out</button>
             </section>
 
@@ -2208,6 +2344,158 @@ export default function PlaylistManager() {
         }
         @keyframes spin {
           to { transform: rotate(360deg); }
+        }
+        .onboardingOverlay {
+          position: fixed;
+          inset: 0;
+          z-index: 75;
+          display: grid;
+          place-items: center;
+          padding: 24px;
+          background: rgba(7, 9, 12, 0.78);
+          backdrop-filter: blur(10px);
+        }
+        .onboardingPanel {
+          width: min(980px, 100%);
+          max-height: calc(100vh - 48px);
+          overflow: auto;
+          display: grid;
+          gap: 18px;
+          padding: clamp(18px, 3vw, 30px);
+          border: 1px solid #303743;
+          border-radius: 8px;
+          background: #181c23;
+          box-shadow: 0 28px 100px rgba(0, 0, 0, 0.58);
+        }
+        .onboardingHeader {
+          display: flex;
+          justify-content: space-between;
+          align-items: start;
+          gap: 20px;
+        }
+        .onboardingHeader div {
+          display: grid;
+          gap: 8px;
+          max-width: 720px;
+        }
+        .onboardingHeader span {
+          color: #18e06f;
+          font-size: 12px;
+          font-weight: 900;
+          text-transform: uppercase;
+        }
+        .onboardingHeader h2 {
+          font-size: clamp(28px, 4vw, 46px);
+          line-height: 1;
+        }
+        .onboardingHeader p,
+        .onboardingCopy p,
+        .onboardingCopy li,
+        .onboardingSteps small {
+          color: #a6adba;
+          line-height: 1.5;
+        }
+        .onboardingSteps {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 10px;
+          margin: 0;
+          padding: 0;
+          list-style: none;
+        }
+        .onboardingSteps li {
+          display: grid;
+          grid-template-columns: 38px minmax(0, 1fr);
+          align-items: center;
+          gap: 10px;
+          min-width: 0;
+          padding: 12px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #12161d;
+        }
+        .onboardingSteps li.active {
+          border-color: rgba(24, 224, 111, 0.58);
+          background: rgba(24, 224, 111, 0.08);
+        }
+        .onboardingSteps li.done b {
+          background: #18e06f;
+          color: #08110c;
+        }
+        .onboardingSteps b {
+          display: grid;
+          place-items: center;
+          width: 34px;
+          height: 34px;
+          border-radius: 50%;
+          background: #252c37;
+          color: #f4f6fb;
+        }
+        .onboardingSteps span,
+        .onboardingForm label {
+          display: grid;
+          gap: 3px;
+          min-width: 0;
+        }
+        .onboardingSteps strong {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .onboardingStage {
+          display: grid;
+          grid-template-columns: minmax(240px, 0.8fr) minmax(320px, 1fr);
+          gap: 18px;
+          align-items: start;
+          padding: 18px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #12161d;
+        }
+        .onboardingCopy {
+          display: grid;
+          gap: 12px;
+        }
+        .onboardingCopy h3,
+        .onboardingReady h3 {
+          font-size: 22px;
+        }
+        .onboardingCopy ol {
+          display: grid;
+          gap: 8px;
+          margin: 0;
+          padding-left: 18px;
+        }
+        .onboardingForm {
+          display: grid;
+          gap: 10px;
+        }
+        .onboardingForm label span {
+          color: #a6adba;
+          font-size: 12px;
+          font-weight: 850;
+        }
+        .onboardingActions {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
+          align-self: center;
+        }
+        .secondaryOutline {
+          border-color: #303743;
+          color: #f4f6fb;
+          background: transparent;
+        }
+        .onboardingReady {
+          grid-template-columns: minmax(0, 1fr) auto;
+          align-items: center;
+        }
+        .onboardingReady div {
+          display: grid;
+          gap: 6px;
+        }
+        .onboardingReady p {
+          color: #a6adba;
         }
         .settingsOverlay {
           position: fixed;
@@ -3969,6 +4257,14 @@ export default function PlaylistManager() {
         @media (max-width: 720px) {
           .topbar {
             padding: 22px;
+          }
+          .onboardingSteps,
+          .onboardingStage,
+          .onboardingReady {
+            grid-template-columns: 1fr;
+          }
+          .onboardingHeader {
+            align-items: start;
           }
           .brand {
             align-items: flex-start;
