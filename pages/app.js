@@ -1407,22 +1407,6 @@ export default function PlaylistManager() {
             <section className="settingsSection">
               <div className="settingsSectionHeader">
                 <div>
-                  <h3>Health Monitor</h3>
-                  <p>Current sync, cooldown, and rotator status.</p>
-                </div>
-                <button disabled={busy} onClick={loadHealthStatus}>Refresh</button>
-              </div>
-              <div className="healthGrid">
-                <article><span>Spotify</span><strong>{formatNumber(healthStatus?.spotify_connections?.active)}</strong><small>{formatNumber(healthStatus?.spotify_connections?.total)} connected</small></article>
-                <article><span>Needs Sync</span><strong>{formatNumber(healthStatus?.playlists?.needs_sync)}</strong><small>{formatNumber(healthStatus?.playlists?.on_cooldown)} in safe edit</small></article>
-                <article><span>Stale</span><strong>{formatNumber(healthStatus?.playlists?.stale)}</strong><small>{formatNumber(healthStatus?.playlists?.syncing)} syncing now</small></article>
-                <article><span>Rotator</span><strong>{formatNumber(healthStatus?.rotator?.enabled)}</strong><small>{formatNumber(healthStatus?.rotator?.due)} due</small></article>
-              </div>
-            </section>
-
-            <section className="settingsSection">
-              <div className="settingsSectionHeader">
-                <div>
                   <h3>Spotify Accounts</h3>
                   <p>Connect the Spotify accounts you want to manage in Playlist Pilot.</p>
                 </div>
@@ -1455,12 +1439,19 @@ export default function PlaylistManager() {
             </section>
 
             <section className={billingActive ? "billingBox billingBox--active" : "billingBox"}>
-              <span>{billingActive ? "Subscription active" : "Subscription required"}</span>
-              <strong>{billing.plan_code ? `${billing.plan_code} plan` : (billingActive ? "Active plan" : "Choose a plan")}</strong>
-              {billing.current_period_end ? <small>Renews through {formatShortDate(String(billing.current_period_end).slice(0, 10))}</small> : null}
-              {billingActive ? (
-                <button disabled={busy} onClick={openBillingPortal}>Manage billing</button>
-              ) : (
+              <div className="settingsSectionHeader">
+                <div>
+                  <h3>Billing</h3>
+                  <p>{billingActive ? "Your current PlaylistPilot plan and renewal." : "Choose a plan to unlock Spotify playlist operations."}</p>
+                </div>
+                {billingActive ? <button disabled={busy} onClick={openBillingPortal}>Manage billing</button> : null}
+              </div>
+              <div className="billingSummary">
+                <span>{billingActive ? "Subscription active" : "Subscription required"}</span>
+                <strong>{billing.plan_code ? `${billing.plan_code} plan` : (billingActive ? "Active plan" : "Choose a plan")}</strong>
+                {billing.current_period_end ? <small>Renews through {formatShortDate(String(billing.current_period_end).slice(0, 10))}</small> : null}
+              </div>
+              {!billingActive ? (
                 <div className="pricingGrid">
                   <article>
                     <span>Economy Class</span>
@@ -1477,34 +1468,65 @@ export default function PlaylistManager() {
                     <button disabled={busy} onClick={() => startCheckout("business", "yearly")}>149 EUR yearly</button>
                   </article>
                 </div>
+              ) : null}
+            </section>
+
+            <section className="settingsSection">
+              <div className="settingsSectionHeader">
+                <div>
+                  <h3>Spotify API App</h3>
+                  <p>{spotifyCredentials?.configured ? "Credentials configured for your Spotify OAuth flow." : "Create a Spotify Developer app before connecting Spotify accounts."}</p>
+                </div>
+                {spotifyCredentials?.configured ? (
+                  <button onClick={() => setSpotifyCredsOpen(!spotifyCredsOpen)}>{spotifyCredsOpen ? "Hide" : "Edit"}</button>
+                ) : null}
+              </div>
+              {spotifyCredentials?.configured && !spotifyCredsOpen ? (
+                <div className="spotifyApiSummary">
+                  <span>Configured</span>
+                  <strong>{spotifyCredentials?.credentials?.app_name || "Spotify app saved"}</strong>
+                  <small>{spotifyCredentials?.credentials?.client_id || "Client ID stored"}</small>
+                </div>
+              ) : (
+                <>
+                  <ol>
+                    <li>Open developer.spotify.com/dashboard and create an app.</li>
+                    <li>Add the Redirect URI below in the app settings.</li>
+                    <li>Copy Client ID and Client Secret into Playlist Pilot.</li>
+                  </ol>
+                  <label>
+                    <span>Redirect URI</span>
+                    <input value={spotifyRedirectUri} onChange={(e) => setSpotifyRedirectUri(e.target.value)} />
+                  </label>
+                  <input value={spotifyAppName} onChange={(e) => setSpotifyAppName(e.target.value)} placeholder="App name" />
+                  <input value={spotifyClientId} onChange={(e) => setSpotifyClientId(e.target.value)} placeholder="Client ID" />
+                  <input
+                    type="password"
+                    value={spotifyClientSecret}
+                    onChange={(e) => setSpotifyClientSecret(e.target.value)}
+                    placeholder={spotifyCredentials?.configured ? "New Client Secret to replace" : "Client Secret"}
+                  />
+                  <button disabled={busy || !spotifyClientId.trim() || !spotifyClientSecret.trim()} onClick={saveSpotifyCredentials}>
+                    Save Spotify App
+                  </button>
+                </>
               )}
             </section>
 
             <section className="settingsSection">
-              <div>
-                <h3>Spotify API App</h3>
-                <p>Create a Spotify Developer app, add this Redirect URI, then paste the Client ID and Client Secret here.</p>
+              <div className="settingsSectionHeader">
+                <div>
+                  <h3>System Status</h3>
+                  <p>Current sync, cooldown, and rotator health.</p>
+                </div>
+                <button disabled={busy} onClick={loadHealthStatus}>Refresh</button>
               </div>
-              <ol>
-                <li>Open developer.spotify.com/dashboard and create an app.</li>
-                <li>Add the Redirect URI below in the app settings.</li>
-                <li>Copy Client ID and Client Secret into Playlist Pilot.</li>
-              </ol>
-              <label>
-                <span>Redirect URI</span>
-                <input value={spotifyRedirectUri} onChange={(e) => setSpotifyRedirectUri(e.target.value)} />
-              </label>
-              <input value={spotifyAppName} onChange={(e) => setSpotifyAppName(e.target.value)} placeholder="App name" />
-              <input value={spotifyClientId} onChange={(e) => setSpotifyClientId(e.target.value)} placeholder="Client ID" />
-              <input
-                type="password"
-                value={spotifyClientSecret}
-                onChange={(e) => setSpotifyClientSecret(e.target.value)}
-                placeholder={spotifyCredentials?.configured ? "New Client Secret to replace" : "Client Secret"}
-              />
-              <button disabled={busy || !spotifyClientId.trim() || !spotifyClientSecret.trim()} onClick={saveSpotifyCredentials}>
-                Save Spotify App
-              </button>
+              <div className="healthGrid">
+                <article><span>Spotify</span><strong>{formatNumber(healthStatus?.spotify_connections?.active)}</strong><small>{formatNumber(healthStatus?.spotify_connections?.total)} connected</small></article>
+                <article><span>Needs Sync</span><strong>{formatNumber(healthStatus?.playlists?.needs_sync)}</strong><small>{formatNumber(healthStatus?.playlists?.on_cooldown)} in safe edit</small></article>
+                <article><span>Stale</span><strong>{formatNumber(healthStatus?.playlists?.stale)}</strong><small>{formatNumber(healthStatus?.playlists?.syncing)} syncing now</small></article>
+                <article><span>Rotator</span><strong>{formatNumber(healthStatus?.rotator?.enabled)}</strong><small>{formatNumber(healthStatus?.rotator?.due)} due</small></article>
+              </div>
             </section>
           </div>
         </div>
@@ -2730,6 +2752,21 @@ export default function PlaylistManager() {
           font-size: 13px;
           font-weight: 800;
         }
+        .billingBox h3 {
+          font-size: 18px;
+        }
+        .billingBox p {
+          color: #a6adba;
+          line-height: 1.45;
+        }
+        .billingSummary {
+          display: grid;
+          gap: 5px;
+          padding: 12px;
+          border: 1px solid rgba(255, 255, 255, 0.08);
+          border-radius: 8px;
+          background: rgba(18, 22, 29, 0.7);
+        }
         .billingBox strong {
           color: #f4f6fb;
           overflow-wrap: anywhere;
@@ -2738,8 +2775,30 @@ export default function PlaylistManager() {
           color: #a6adba;
         }
         .billingBox button {
-          width: 100%;
+          width: fit-content;
           margin-top: 4px;
+        }
+        .pricingGrid button {
+          width: 100%;
+        }
+        .spotifyApiSummary {
+          display: grid;
+          gap: 5px;
+          padding: 12px;
+          border: 1px solid rgba(24, 224, 111, 0.22);
+          border-radius: 8px;
+          background: rgba(24, 224, 111, 0.06);
+        }
+        .spotifyApiSummary span {
+          color: #18e06f;
+          font-size: 12px;
+          font-weight: 900;
+          text-transform: uppercase;
+        }
+        .spotifyApiSummary small {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
         }
         .pricingGrid {
           display: grid;
