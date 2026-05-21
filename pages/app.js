@@ -46,6 +46,7 @@ function formatShortDate(value) {
 function spotifySetupErrorMessage(code = "") {
   if (!code) return "";
   if (code === "subscription_required") return "Start a plan before connecting Spotify accounts.";
+  if (code === "auth_required") return "Sign in again before connecting Spotify.";
   if (code === "seat_limit_reached") return "This plan has no free Spotify account seats left.";
   if (code === "spotify_account_already_connected") return "This Spotify account is already connected to another PlaylistPilot workspace.";
   if (code === "missing_spotify_app_credentials") return "Save your Spotify API app credentials before connecting Spotify.";
@@ -631,11 +632,15 @@ export default function PlaylistManager() {
 
   function startSpotifyConnect() {
     if (!userContext?.bubble_user_id) return;
-    const qs = new URLSearchParams({
-      bubble_user_id: userContext.bubble_user_id,
-      return_to: `${window.location.origin}/app`,
+    run("Opening Spotify authorization", async () => {
+      const data = await api("/api/oauth/spotify/start", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { return_to: `${window.location.origin}/app` },
+      });
+      if (data?.url) window.location.href = data.url;
+      return data;
     });
-    window.location.href = `/api/oauth/spotify/start?${qs.toString()}`;
   }
 
   async function disconnectSpotifyConnection(id) {

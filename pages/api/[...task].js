@@ -20,9 +20,21 @@ async function parseJsonSafe(resp) {
 
 function withCORS(handler) {
   return async (req, res) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
+    const origin = req.headers?.origin || "";
+    const allowedOrigins = new Set([
+      "https://playlist-pilot.com",
+      process.env.PUBLIC_BASE_URL || "",
+      process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "",
+      process.env.NODE_ENV !== "production" ? "http://localhost:3000" : "",
+      process.env.NODE_ENV !== "production" ? "http://127.0.0.1:3000" : "",
+    ].filter(Boolean));
+    if (origin && !allowedOrigins.has(origin)) return res.status(403).json({ error: "origin_not_allowed" });
+    if (origin) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+    }
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,X-Bubble-User-Id,x-app-secret,x-service-key,x-bubble-user-id");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,x-app-secret");
     if (req.method === "OPTIONS") return res.status(204).end();
     return handler(req, res);
   };
@@ -68,13 +80,17 @@ function checkCronAuth(req) {
   return !want;  // falls ohne Secret explizit offen gewünscht
 }
 
-// ich hab katzi lieb
-
 function checkAppSecret(req) {
   const want = process.env.APP_WEBHOOK_SECRET;
   const got = req.headers["x-app-secret"];
   if (want && got !== want) return false;
   return true;
+}
+
+function hasValidAppSecret(req) {
+  const want = process.env.APP_WEBHOOK_SECRET || "";
+  const got = req.headers["x-app-secret"] || "";
+  return !!want && got === want;
 }
 
 function getBearerToken(req) {
@@ -173,13 +189,13 @@ async function getUserContext(req) {
 }
 
 async function bubbleUserIdFromRequest(req, explicitValue = "") {
-  const fromHeader = String(req.headers?.["x-bubble-user-id"] || "").trim();
-  if (fromHeader) return fromHeader;
-
   const ctx = await getUserContext(req);
   if (ctx?.bubble_user_id) return ctx.bubble_user_id;
 
-  return String(explicitValue || "").trim();
+  const legacyValue = String(explicitValue || req.headers?.["x-bubble-user-id"] || "").trim();
+  if (legacyValue && hasValidAppSecret(req)) return legacyValue;
+
+  return "";
 }
 
 function getStripeClient() {
@@ -3548,6 +3564,8 @@ const routes = {
   if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
   const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK } = process.env;
   if (!SUPABASE_URL || !SRK) return bad(res, 500, "missing_env");
+  const bubbleUserId = await bubbleUserIdFromRequest(req);
+  if (!bubbleUserId) return bad(res, 401, "not_authenticated");
 
   const playlist_id = req.query.playlist_id;
   if (!playlist_id) return bad(res, 400, "missing_playlist_id");
@@ -3557,6 +3575,7 @@ const routes = {
     `?select=id,playlist_id,name,image,tracks_total,followers,updated_at,` +
     `auto_remove_enabled,auto_remove_weeks` +
     `&id=eq.${encodeURIComponent(playlist_id)}` +
+    `&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}` +
     `&limit=1`;
 
   const r = await fetch(SUPABASE_URL + path, {
@@ -3569,24 +3588,27 @@ const routes = {
   return json(res, 200, arr[0] || null);
 },
    
-  /* ---------- debug/env (GET) ---------- */
-  "debug/env": async (_req, res) => {
-    return json(res, 200, {
-      SUPABASE_URL: !!process.env.SUPABASE_URL,
-      SUPABASE_SERVICE_ROLE_KEY: !!process.env.SUPABASE_SERVICE_ROLE_KEY
-    });
-  },
-
-   
   /* ===========================
-      oauth/spotify/start (GET)
+      oauth/spotify/start (POST)
       =========================== */
    "oauth/spotify/start": async (req, res) => {
      try {
-       // Eingaben
-       const bubble_user_id = String(req.query.bubble_user_id || "").trim();
-       const return_to      = String(req.query.return_to || "/").trim();
-       const label          = String(req.query.label || "").trim();
+       const body = req.method === "POST" ? await readBody(req) : {};
+       const return_to = String(body.return_to || req.query.return_to || "/").trim();
+       const label = String(body.label || req.query.label || "").trim();
+       let bubble_user_id = "";
+
+       if (req.method === "POST") {
+         const ctx = await getUserContext(req);
+         if (!ctx?.linked || !ctx.bubble_user_id) return bad(res, 401, "not_authenticated");
+         bubble_user_id = ctx.bubble_user_id;
+       } else if (hasValidAppSecret(req)) {
+         bubble_user_id = String(req.query.bubble_user_id || "").trim();
+       } else {
+         const base = return_to || "/";
+         const sep = base.includes("?") ? "&" : "?";
+         return res.redirect(`${base}${sep}spotify_error=auth_required`);
+       }
    
        if (!bubble_user_id) {
          const base = return_to || "/";
@@ -3639,10 +3661,12 @@ const routes = {
        });
    
        const url = `https://accounts.spotify.com/authorize?${params.toString()}`;
+       if (req.method === "POST") return json(res, 200, { ok: true, url });
        return res.redirect(url);
      } catch (e) {
        const msg = encodeURIComponent(e?.message || String(e));
-       const back = String(req.query.return_to || "/");
+       if (req.method === "POST") return bad(res, 500, `spotify_oauth_start_exception_${msg}`);
+       const back = String(req.query.return_to || "/app");
        const sep = back.includes("?") ? "&" : "?";
        return res.redirect(`${back}${sep}spotify_error=start_exception_${msg}`);
      }
