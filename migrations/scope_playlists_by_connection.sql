@@ -44,8 +44,5 @@ begin
   end loop;
 end $$;
 
-create index if not exists idx_playlists_connection_playlist
-  on public.playlists(connection_id, playlist_id);
-
 create index if not exists idx_playlists_bubble_connection
   on public.playlists(bubble_user_id, connection_id);
