@@ -2678,6 +2678,7 @@ const routes = {
      const sResp = await fetch(SUPABASE_URL + snapPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
      if (!sResp.ok) return bad(res, 500, `supabase_error: ${await sResp.text()}`);
      const rows = JSON.parse(await sResp.text() || "[]");
+     const uniqueDays = new Set(rows.map((row) => row.day).filter(Boolean));
    
      // Helper: bucket nach granularity
      const bucketKey = (isoDay) => {
@@ -2732,6 +2733,10 @@ const routes = {
          labels,               // z.B. Tage/Wochen/Monate
          followers,
          growth,               // Delta followers pro Bucket (gesamt)
+         data_points: rows.length,
+         history_days: uniqueDays.size,
+         ready: labels.length >= 2 && uniqueDays.size >= 2,
+         warmup: labels.length < 2 || uniqueDays.size < 2,
        });
      }
    
@@ -2756,7 +2761,7 @@ const routes = {
        by_playlist.push({ playlist_id: pid, growth: deltas });
      }
    
-     return json(res, 200, { ok: true, granularity: gran, labels, by_playlist });
+     return json(res, 200, { ok: true, granularity: gran, labels, by_playlist, data_points: rows.length, history_days: uniqueDays.size, ready: labels.length >= 2 && uniqueDays.size >= 2, warmup: labels.length < 2 || uniqueDays.size < 2 });
    },
    
       
@@ -2797,6 +2802,7 @@ const routes = {
     `&order=day.asc`;
   const sResp = await fetch(SUPABASE_URL + snapPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
   const snaps = sResp.ok ? JSON.parse(await sResp.text() || "[]") : [];
+  const snapshotDays = new Set(snaps.map((row) => row.day).filter(Boolean));
 
   // map: playlist_id -> {firstFollowers, lastFollowers}
   const snapMap = new Map();
@@ -2937,6 +2943,9 @@ const routes = {
       flex_due_count,
       cooldown_count,
       stale_count,
+      growth_snapshot_days: snapshotDays.size,
+      growth_data_points: snaps.length,
+      growth_ready: snapshotDays.size >= 2,
     },
     top_growing: top_growing || null,
     top_playlists,
@@ -5637,6 +5646,16 @@ const routes = {
      }
    
      return json(res, 200, { ok:true, bucket, connections: conns.length, dispatched_ok: ok, dispatched_fail: fail });
+   },
+
+   /* ---------- followers/cron-refresh-6h (GET/POST) ---------- */
+   "followers/cron-refresh-6h": async (req, res) => {
+     const reqSixHourly = {
+       ...req,
+       url: `/api/followers/cron-refresh-all?stale_hours=6&max=120&batch=100`,
+       query: { ...(req.query || {}), stale_hours: "6", max: "120", batch: "100" }
+     };
+     return routes["followers/cron-refresh-all"](reqSixHourly, res);
    },
    
       

@@ -234,6 +234,27 @@ function GrowthChart({ values = [], labels = [], growth = [], granularity = "dai
   );
 }
 
+function DashboardWarmup({ summary, series, onRefresh, busy }) {
+  const playlistCount = summary?.totals?.playlists_count || 0;
+  const historyDays = Math.max(summary?.totals?.growth_snapshot_days || 0, series?.history_days || 0);
+  const dataPoints = Math.max(summary?.totals?.growth_data_points || 0, series?.data_points || 0);
+  return (
+    <div className="dashboardWarmup">
+      <div>
+        <span>Growth monitor warming up</span>
+        <h3>Current playlist stats are ready. Trend data needs at least two snapshot days.</h3>
+        <p>Spotify does not expose historical follower data, so PlaylistPilot starts tracking from the moment playlists are connected. The growth chart becomes meaningful after a few days and reliable after about one week.</p>
+      </div>
+      <div className="warmupStats">
+        <article><strong>{formatNumber(playlistCount)}</strong><span>playlists tracked</span></article>
+        <article><strong>{formatNumber(historyDays)}</strong><span>snapshot days</span></article>
+        <article><strong>{formatNumber(dataPoints)}</strong><span>data points</span></article>
+      </div>
+      <button disabled={busy} onClick={onRefresh}>Refresh baseline now</button>
+    </div>
+  );
+}
+
 function GrowthBars({ items = [], selectedId = "", onSelect }) {
   const max = Math.max(1, ...items.map((item) => Math.abs(Number(item.delta) || 0)));
   return (
@@ -342,6 +363,7 @@ export default function PlaylistManager() {
   const moversPageCount = Math.max(1, Math.ceil(movers.length / moversPageSize));
   const safeMoversPage = Math.min(moversPage, moversPageCount - 1);
   const visibleMovers = movers.slice(safeMoversPage * moversPageSize, safeMoversPage * moversPageSize + moversPageSize);
+  const growthReady = !!(dashboardSeries?.ready || dashboardSummary?.totals?.growth_ready);
 
   useEffect(() => {
     const client = getSupabaseBrowserClient();
@@ -987,6 +1009,16 @@ export default function PlaylistManager() {
     });
   }
 
+  async function refreshDashboardBaseline() {
+    await run("Follower baseline refreshed", async () => {
+      await api("/api/playlists/sync?with_followers=1", {
+        method: "POST",
+        accessToken: accessToken(),
+      });
+      return loadDashboard();
+    });
+  }
+
   async function loadSpotifyCredentials() {
     if (!session?.access_token) return;
     return run("Spotify app settings loaded", async () => {
@@ -1368,8 +1400,9 @@ export default function PlaylistManager() {
             <strong>{formatNumber(dashboardSummary?.totals?.total_followers)}</strong>
           </article>
           <article>
-            <span>30d Growth</span>
-            <strong>{formatNumber(dashboardSummary?.totals?.net_growth_last_days)}</strong>
+            <span>Selected Growth</span>
+            <strong>{growthReady ? formatNumber(dashboardSummary?.totals?.net_growth_last_days) : "Warming up"}</strong>
+            <small>{growthReady ? `${formatNumber(dashboardSummary?.totals?.growth_snapshot_days)} snapshot days` : "needs 2+ days"}</small>
           </article>
           <article>
             <span>Playlists</span>
@@ -1421,17 +1454,23 @@ export default function PlaylistManager() {
                 </select>
               </div>
             </div>
-            <GrowthChart
-              values={dashboardSeries?.followers || dashboardSeries?.growth || []}
-              labels={dashboardSeries?.labels || []}
-              growth={dashboardSeries?.growth || []}
-              granularity={dashboardSeries?.granularity || dashboardGranularity}
-            />
-            <div className="sparkLabels">
-              <span>{dashboardSeries?.labels?.[0] ? formatShortDate(dashboardSeries.labels[0]) : ""}</span>
-              <strong>{formatDelta((dashboardSeries?.growth || []).reduce((sum, value) => sum + (Number(value) || 0), 0))}</strong>
-              <span>{dashboardSeries?.labels?.at?.(-1) ? formatShortDate(dashboardSeries.labels.at(-1)) : ""}</span>
-            </div>
+            {growthReady ? (
+              <>
+                <GrowthChart
+                  values={dashboardSeries?.followers || dashboardSeries?.growth || []}
+                  labels={dashboardSeries?.labels || []}
+                  growth={dashboardSeries?.growth || []}
+                  granularity={dashboardSeries?.granularity || dashboardGranularity}
+                />
+                <div className="sparkLabels">
+                  <span>{dashboardSeries?.labels?.[0] ? formatShortDate(dashboardSeries.labels[0]) : ""}</span>
+                  <strong>{formatDelta((dashboardSeries?.growth || []).reduce((sum, value) => sum + (Number(value) || 0), 0))}</strong>
+                  <span>{dashboardSeries?.labels?.at?.(-1) ? formatShortDate(dashboardSeries.labels.at(-1)) : ""}</span>
+                </div>
+              </>
+            ) : (
+              <DashboardWarmup summary={dashboardSummary} series={dashboardSeries} onRefresh={refreshDashboardBaseline} busy={busy} />
+            )}
           </section>
           <section className="dashboardPanel rankPanel">
             <div>
@@ -2688,6 +2727,55 @@ export default function PlaylistManager() {
           color: #a6adba;
           border: 1px dashed #303743;
           border-radius: 8px;
+        }
+        .dashboardWarmup {
+          display: grid;
+          gap: 18px;
+          min-height: 310px;
+          margin-top: 18px;
+          padding: 22px;
+          border: 1px dashed rgba(36, 211, 102, 0.34);
+          border-radius: 8px;
+          background: linear-gradient(135deg, rgba(36, 211, 102, 0.08), rgba(255, 255, 255, 0.025));
+          align-content: center;
+        }
+        .dashboardWarmup div:first-child {
+          display: grid;
+          gap: 10px;
+          max-width: 760px;
+        }
+        .dashboardWarmup span {
+          color: #18e06f;
+          font-size: 12px;
+          font-weight: 900;
+          text-transform: uppercase;
+        }
+        .dashboardWarmup h3 {
+          font-size: clamp(22px, 3vw, 34px);
+          line-height: 1.08;
+        }
+        .dashboardWarmup p {
+          max-width: 680px;
+          line-height: 1.55;
+        }
+        .warmupStats {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 10px;
+        }
+        .warmupStats article {
+          display: grid;
+          gap: 4px;
+          padding: 12px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: rgba(18, 22, 29, 0.76);
+        }
+        .warmupStats strong {
+          font-size: 24px;
+        }
+        .dashboardWarmup button {
+          justify-self: start;
         }
         .sparkLabels {
           display: grid;
