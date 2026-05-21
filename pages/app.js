@@ -1398,8 +1398,10 @@ export default function PlaylistManager() {
             <section className="settingsSection">
               <span>Signed in</span>
               <strong>{userContext.email}</strong>
-              <button disabled={busy} onClick={reopenOnboarding}>Open onboarding</button>
-              <button className="dangerOutline settingsLogout" onClick={signOut}>Log out</button>
+              <div className="accountActions">
+                <button disabled={busy} onClick={reopenOnboarding}>Open onboarding</button>
+                <button className="dangerOutline settingsLogout" onClick={signOut}>Log out</button>
+              </div>
             </section>
 
             <section className="settingsSection">
@@ -2587,6 +2589,12 @@ export default function PlaylistManager() {
         }
         .settingsSection strong {
           overflow-wrap: anywhere;
+        }
+        .accountActions {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 10px;
         }
         .settingsSection ol {
           padding-left: 18px;
@@ -4348,6 +4356,9 @@ export default function PlaylistManager() {
           }
           .accountField select {
             min-height: 48px;
+          }
+          .accountActions {
+            flex-wrap: wrap;
           }
           .sectionTitle {
             display: grid;
