@@ -390,6 +390,7 @@ export default function PlaylistManager() {
   const onboardingNeedsBilling = !onboardingBillingReady && !onboardingCredentialsReady && !onboardingConnectionsReady && !onboardingPlaylistsReady;
   const onboardingMustConnect = billingActive && !onboardingConnectionsReady;
   const onboardingStep = onboardingNeedsBilling ? 1 : !onboardingCredentialsReady ? 2 : !onboardingConnectionsReady ? 3 : !onboardingPlaylistsReady ? 4 : 5;
+  const workspaceBootstrapped = !!userContext?.linked && spotifyCredentials !== null && connectionsLoaded && (!connectionId || playlistsLoaded);
   const [isMobileViewport, setIsMobileViewport] = useState(false);
 
   useEffect(() => {
@@ -444,21 +445,26 @@ export default function PlaylistManager() {
     if (!userContext?.linked) return;
     setConnectionsLoaded(false);
     setPlaylistsLoaded(false);
+    setConnectionId("");
+    setPlaylists([]);
+    setPlaylistId("");
+    setPlaylist(null);
+    setTracks([]);
     loadConnections();
     loadDashboard();
     loadSpotifyCredentials();
     loadHealthStatus();
-  }, [userContext?.linked]);
+  }, [userContext?.linked, userContext?.bubble_user_id]);
 
   useEffect(() => {
-    if (!userContext?.linked || spotifyCredentials === null || !connectionsLoaded || (connectionId && !playlistsLoaded)) return;
+    if (!workspaceBootstrapped) return;
     const key = `playlistpilot:onboarding-dismissed:${userContext.bubble_user_id || userContext.email}`;
     const dismissed = !onboardingMustConnect && typeof window !== "undefined" && window.localStorage.getItem(key) === "1";
     setOnboardingDismissed(dismissed);
     if (onboardingMustConnect || (!dismissed && (onboardingNeedsBilling || !onboardingCredentialsReady || !onboardingConnectionsReady || !onboardingPlaylistsReady))) {
       setOnboardingOpen(true);
     }
-  }, [userContext?.linked, userContext?.bubble_user_id, userContext?.email, spotifyCredentials, connectionsLoaded, playlistsLoaded, connectionId, onboardingNeedsBilling, onboardingMustConnect, onboardingCredentialsReady, onboardingConnectionsReady, onboardingPlaylistsReady]);
+  }, [workspaceBootstrapped, userContext?.bubble_user_id, userContext?.email, onboardingNeedsBilling, onboardingMustConnect, onboardingCredentialsReady, onboardingConnectionsReady, onboardingPlaylistsReady]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -518,9 +524,10 @@ export default function PlaylistManager() {
       setTracks([]);
       return;
     }
+    if (!workspaceBootstrapped || !playlists.some((p) => p.id === playlistId)) return;
     if (userContext?.linked) writeStoredSelection(userContext, { playlistId });
     loadSelectedPlaylist();
-  }, [playlistId]);
+  }, [playlistId, workspaceBootstrapped, playlists]);
 
   const filteredPlaylists = useMemo(() => {
     const q = playlistSearch.trim().toLowerCase();
@@ -1677,7 +1684,17 @@ export default function PlaylistManager() {
         </div>
       ) : null}
 
-      {!onboardingConnectionsReady ? (
+      {!workspaceBootstrapped ? (
+        <section className="loadingScreen" aria-live="polite">
+          <div className="loaderMark">
+            <img src="/playlistpilot-logo-v1.jpg" alt="" />
+            <span />
+          </div>
+          <h2>Loading workspace</h2>
+          <p>Syncing your accounts, playlists, and saved position.</p>
+          {error ? <strong>{error}</strong> : null}
+        </section>
+      ) : !onboardingConnectionsReady ? (
         <section className="setupHold" aria-live="polite">
           <span>Setup required</span>
           <h2>Connect your first Spotify account</h2>
