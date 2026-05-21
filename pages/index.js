@@ -296,6 +296,12 @@ export default function PlaylistManager() {
   const [flexReferenceIssue, setFlexReferenceIssue] = useState(null);
   const [flexInterval, setFlexInterval] = useState("weekly");
   const [flexEnabled, setFlexEnabled] = useState(false);
+  const [flexRepeatWeeks, setFlexRepeatWeeks] = useState("8");
+  const [flexAvoidDuplicates, setFlexAvoidDuplicates] = useState(true);
+  const [flexMinPopularity, setFlexMinPopularity] = useState("");
+  const [flexMaxPopularity, setFlexMaxPopularity] = useState("");
+  const [flexMaxReleaseAgeWeeks, setFlexMaxReleaseAgeWeeks] = useState("");
+  const [flexHistory, setFlexHistory] = useState([]);
   const [backups, setBackups] = useState([]);
   const [busy, setBusy] = useState(false);
   const [busyLabel, setBusyLabel] = useState("");
@@ -318,6 +324,7 @@ export default function PlaylistManager() {
   const [spotifyCredentials, setSpotifyCredentials] = useState(null);
   const [spotifyCredsOpen, setSpotifyCredsOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [healthStatus, setHealthStatus] = useState(null);
   const [spotifyClientId, setSpotifyClientId] = useState("");
   const [spotifyClientSecret, setSpotifyClientSecret] = useState("");
   const [spotifyAppName, setSpotifyAppName] = useState("");
@@ -373,6 +380,7 @@ export default function PlaylistManager() {
     loadConnections();
     loadDashboard();
     loadSpotifyCredentials();
+    loadHealthStatus();
   }, [userContext?.linked]);
 
   useEffect(() => {
@@ -632,9 +640,21 @@ export default function PlaylistManager() {
       setFlexReferenceIssue(null);
       setFlexInterval(settings?.interval || "weekly");
       setFlexEnabled(!!settings?.enabled);
-      await loadBackups();
+      setFlexRepeatWeeks(String(settings?.repeat_cooldown_weeks ?? "8"));
+      setFlexAvoidDuplicates(settings?.avoid_target_duplicates !== false);
+      setFlexMinPopularity(settings?.min_popularity ?? "");
+      setFlexMaxPopularity(settings?.max_popularity ?? "");
+      setFlexMaxReleaseAgeWeeks(settings?.max_release_age_weeks ?? "");
+      await Promise.all([loadBackups(), loadFlexHistory()]);
       return { detail, items };
     });
+  }
+
+  async function loadFlexHistory() {
+    if (!playlistId) return [];
+    const rows = await api(`/api/flex/history?playlist_id=${encodeURIComponent(playlistId)}&limit=8`, { accessToken: accessToken() }).catch(() => []);
+    setFlexHistory(Array.isArray(rows) ? rows : []);
+    return rows;
   }
 
   async function loadBackups() {
@@ -901,6 +921,13 @@ export default function PlaylistManager() {
     });
   }
 
+  async function loadHealthStatus() {
+    if (!session?.access_token) return null;
+    const data = await api("/api/health/status", { accessToken: accessToken() }).catch(() => null);
+    setHealthStatus(data);
+    return data;
+  }
+
   async function saveSpotifyCredentials() {
     await run("Spotify app settings saved", async () => {
       const data = await api("/api/spotify/credentials/save", {
@@ -933,6 +960,11 @@ export default function PlaylistManager() {
             reference_playlist: flexReference,
             interval: flexInterval,
             enabled: flexEnabled,
+            repeat_cooldown_weeks: flexRepeatWeeks,
+            avoid_target_duplicates: flexAvoidDuplicates,
+            min_popularity: flexMinPopularity || null,
+            max_popularity: flexMaxPopularity || null,
+            max_release_age_weeks: flexMaxReleaseAgeWeeks || null,
           },
         });
       } catch (e) {
@@ -1020,6 +1052,7 @@ export default function PlaylistManager() {
         body: slotId ? { slot_id: slotId } : { playlist_id: playlistId },
       });
       await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
+      await loadFlexHistory();
     });
   }
 
@@ -1110,6 +1143,22 @@ export default function PlaylistManager() {
               <span>Signed in</span>
               <strong>{userContext.email}</strong>
               <button className="dangerOutline settingsLogout" onClick={signOut}>Log out</button>
+            </section>
+
+            <section className="settingsSection">
+              <div className="settingsSectionHeader">
+                <div>
+                  <h3>Health Monitor</h3>
+                  <p>Current sync, cooldown, and rotator status.</p>
+                </div>
+                <button disabled={busy} onClick={loadHealthStatus}>Refresh</button>
+              </div>
+              <div className="healthGrid">
+                <article><span>Spotify</span><strong>{formatNumber(healthStatus?.spotify_connections?.active)}</strong><small>{formatNumber(healthStatus?.spotify_connections?.total)} connected</small></article>
+                <article><span>Needs Sync</span><strong>{formatNumber(healthStatus?.playlists?.needs_sync)}</strong><small>{formatNumber(healthStatus?.playlists?.on_cooldown)} in safe edit</small></article>
+                <article><span>Stale</span><strong>{formatNumber(healthStatus?.playlists?.stale)}</strong><small>{formatNumber(healthStatus?.playlists?.syncing)} syncing now</small></article>
+                <article><span>Rotator</span><strong>{formatNumber(healthStatus?.rotator?.enabled)}</strong><small>{formatNumber(healthStatus?.rotator?.due)} due</small></article>
+              </div>
             </section>
 
             <section className="settingsSection">
@@ -1538,6 +1587,16 @@ export default function PlaylistManager() {
                         Save rotator
                       </button>
                     </div>
+                    <div className="rotatorRules">
+                      <label className="toggleField">
+                        <input type="checkbox" checked={flexAvoidDuplicates} onChange={(e) => setFlexAvoidDuplicates(e.target.checked)} />
+                        Skip songs already in target playlist
+                      </label>
+                      <input value={flexRepeatWeeks} onChange={(e) => setFlexRepeatWeeks(e.target.value)} placeholder="No repeat weeks" inputMode="numeric" />
+                      <input value={flexMaxReleaseAgeWeeks} onChange={(e) => setFlexMaxReleaseAgeWeeks(e.target.value)} placeholder="Max release age weeks" inputMode="numeric" />
+                      <input value={flexMinPopularity} onChange={(e) => setFlexMinPopularity(e.target.value)} placeholder="Min popularity" inputMode="numeric" />
+                      <input value={flexMaxPopularity} onChange={(e) => setFlexMaxPopularity(e.target.value)} placeholder="Max popularity" inputMode="numeric" />
+                    </div>
                     {flexReferenceMeta ? (
                       <div className="referencePlaylist">
                         <Artwork src={flexReferenceMeta.image} alt="" size="lg" />
@@ -1576,6 +1635,16 @@ export default function PlaylistManager() {
                           <button className="danger tooltipButton" data-tooltip="Remove this rotation slot. The song becomes a normal playlist item." disabled={busy} onClick={() => removeFlexSlot(slot)}>Remove</button>
                         </div>
                       ))}
+                    </div>
+                    <div className="rotationHistory">
+                      <h3>Recent rotations</h3>
+                      {flexHistory.map((item) => (
+                        <div key={item.id || `${item.track_id}-${item.rotated_at}`}>
+                          <span>{formatShortDate(String(item.rotated_at || "").slice(0, 10))}</span>
+                          <strong>{item.track_name || item.track_id}</strong>
+                        </div>
+                      ))}
+                      {!flexHistory.length ? <p>No rotation history yet.</p> : null}
                     </div>
                   </>
                 ) : null}
@@ -2007,6 +2076,28 @@ export default function PlaylistManager() {
         }
         .settingsSection h3 {
           font-size: 18px;
+        }
+        .healthGrid {
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 8px;
+        }
+        .healthGrid article {
+          display: grid;
+          gap: 5px;
+          padding: 10px;
+          border: 1px solid #252c37;
+          border-radius: 8px;
+          background: #181c23;
+        }
+        .healthGrid span,
+        .healthGrid small {
+          color: #a6adba;
+          font-size: 12px;
+        }
+        .healthGrid strong {
+          color: #18e06f;
+          font-size: 22px;
         }
         .settingsSection > span,
         .settingsSection label span {
@@ -3009,6 +3100,16 @@ export default function PlaylistManager() {
           display: grid;
           grid-template-columns: minmax(220px, 1fr) 132px auto auto;
         }
+        .rotatorRules {
+          display: grid;
+          grid-template-columns: minmax(220px, 1.4fr) repeat(4, minmax(120px, 1fr));
+          gap: 10px;
+          align-items: center;
+          padding: 12px;
+          border: 1px solid #252c37;
+          border-radius: 8px;
+          background: #12161d;
+        }
         .toggleField {
           display: flex;
           align-items: center;
@@ -3094,6 +3195,31 @@ export default function PlaylistManager() {
         .flexSlot span {
           color: #a6adba;
           font-weight: 800;
+        }
+        .rotationHistory {
+          display: grid;
+          gap: 8px;
+          padding-top: 4px;
+        }
+        .rotationHistory h3 {
+          font-size: 15px;
+        }
+        .rotationHistory div {
+          display: grid;
+          grid-template-columns: 86px minmax(0, 1fr);
+          gap: 10px;
+          padding: 8px 0;
+          border-top: 1px solid #202630;
+        }
+        .rotationHistory span {
+          color: #a6adba;
+          font-size: 12px;
+          font-weight: 800;
+        }
+        .rotationHistory strong {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
         }
         .backupList {
           display: grid;
@@ -3563,6 +3689,8 @@ export default function PlaylistManager() {
             grid-template-columns: 1fr;
           }
           .flexSettings,
+          .rotatorRules,
+          .healthGrid,
           .flexSlot {
             grid-template-columns: 1fr;
             align-items: stretch;

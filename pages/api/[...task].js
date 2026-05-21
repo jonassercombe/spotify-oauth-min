@@ -649,9 +649,30 @@ async function getOwnedPlaylist(playlist_id, bubble_user_id) {
   return rows?.[0] || null;
 }
 
+function normalizeFlexRules(settings = {}) {
+  const minPopularity = Number(settings.min_popularity);
+  const maxPopularity = Number(settings.max_popularity);
+  const maxReleaseAgeWeeks = Number(settings.max_release_age_weeks);
+  const repeatCooldownWeeks = Number(settings.repeat_cooldown_weeks);
+  return {
+    repeat_cooldown_weeks: Number.isFinite(repeatCooldownWeeks) ? Math.max(0, Math.min(260, repeatCooldownWeeks)) : 8,
+    avoid_target_duplicates: settings.avoid_target_duplicates !== false,
+    min_popularity: Number.isFinite(minPopularity) ? Math.max(0, Math.min(100, minPopularity)) : null,
+    max_popularity: Number.isFinite(maxPopularity) ? Math.max(0, Math.min(100, maxPopularity)) : null,
+    max_release_age_weeks: Number.isFinite(maxReleaseAgeWeeks) ? Math.max(1, Math.min(520, maxReleaseAgeWeeks)) : null,
+  };
+}
+
+function releaseDateToTime(value) {
+  if (!value) return NaN;
+  const text = String(value);
+  const normalized = text.length === 4 ? `${text}-01-01` : text.length === 7 ? `${text}-01` : text;
+  return Date.parse(`${normalized}T00:00:00Z`);
+}
+
 async function fetchReferencePlaylistTracks(reference_playlist_id, access_token) {
   const tracks = [];
-  let url = `https://api.spotify.com/v1/playlists/${encodeURIComponent(reference_playlist_id)}/tracks?limit=100&offset=0&fields=items(track(id,uri,name,is_local,type)),next`;
+  let url = `https://api.spotify.com/v1/playlists/${encodeURIComponent(reference_playlist_id)}/tracks?limit=100&offset=0&fields=items(track(id,uri,name,is_local,type,popularity,album(release_date,release_date_precision))),next`;
   let guard = 0;
   while (url && guard++ < 20) {
     const { r, json, text } = await fetchJSON(url, { headers: { Authorization: `Bearer ${access_token}` } }, 20000);
@@ -663,6 +684,37 @@ async function fetchReferencePlaylistTracks(reference_playlist_id, access_token)
     url = json?.next || "";
   }
   return tracks;
+}
+
+async function getPlaylistTrackIds(playlist_id) {
+  const ids = new Set();
+  const r = await sb(
+    `/rest/v1/playlist_items?select=track_id&playlist_id=eq.${encodeURIComponent(playlist_id)}&limit=2000`
+  );
+  if (!r.ok) return ids;
+  const rows = await r.json().catch(() => []);
+  for (const row of rows || []) {
+    if (row.track_id) ids.add(row.track_id);
+  }
+  return ids;
+}
+
+async function getFlexRecentTrackIds(playlist_id, cooldownWeeks) {
+  const ids = new Set();
+  if (!cooldownWeeks) return ids;
+  const since = new Date(Date.now() - cooldownWeeks * 7 * 24 * 3600 * 1000).toISOString();
+  const r = await sb(
+    `/rest/v1/playlist_flex_history?select=track_id` +
+    `&playlist_id=eq.${encodeURIComponent(playlist_id)}` +
+    `&rotated_at=gte.${encodeURIComponent(since)}` +
+    `&limit=1000`
+  );
+  if (!r.ok) return ids;
+  const rows = await r.json().catch(() => []);
+  for (const row of rows || []) {
+    if (row.track_id) ids.add(row.track_id);
+  }
+  return ids;
 }
 
 async function fetchSpotifyPlaylistMeta(playlist_id, access_token) {
@@ -717,8 +769,26 @@ async function rotateFlexSlot(slot, settings) {
   const refPlaylistId = settings?.reference_playlist_id || slot.source_playlist_id;
   if (!refPlaylistId) throw new Error("missing_reference_playlist");
 
+  const rules = normalizeFlexRules(settings);
   const candidates = await fetchReferencePlaylistTracks(refPlaylistId, access_token);
-  const usable = candidates.filter(t => t.id !== slot.current_track_id);
+  const targetTrackIds = rules.avoid_target_duplicates ? await getPlaylistTrackIds(slot.playlist_id) : new Set();
+  const recentTrackIds = await getFlexRecentTrackIds(slot.playlist_id, rules.repeat_cooldown_weeks);
+  const releaseCutoff = rules.max_release_age_weeks
+    ? Date.now() - rules.max_release_age_weeks * 7 * 24 * 3600 * 1000
+    : null;
+  const usable = candidates.filter((t) => {
+    if (!t?.id || t.id === slot.current_track_id) return false;
+    if (rules.avoid_target_duplicates && targetTrackIds.has(t.id)) return false;
+    if (recentTrackIds.has(t.id)) return false;
+    const popularity = Number(t.popularity);
+    if (rules.min_popularity !== null && Number.isFinite(popularity) && popularity < rules.min_popularity) return false;
+    if (rules.max_popularity !== null && Number.isFinite(popularity) && popularity > rules.max_popularity) return false;
+    if (releaseCutoff) {
+      const releaseTime = releaseDateToTime(t.album?.release_date);
+      if (!Number.isFinite(releaseTime) || releaseTime < releaseCutoff) return false;
+    }
+    return true;
+  });
   if (!usable.length) throw new Error("reference_playlist_has_no_usable_tracks");
   const picked = usable[Math.floor(Math.random() * usable.length)];
   const desired = Math.max(0, Number(slot.position) || 0);
@@ -775,6 +845,20 @@ async function rotateFlexSlot(slot, settings) {
       updated_at: nowIso
     })
   });
+  await sb(`/rest/v1/playlist_flex_history`, {
+    method: "POST",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify([{
+      playlist_id: slot.playlist_id,
+      slot_id: slot.id,
+      bubble_user_id: slot.bubble_user_id,
+      connection_id: slot.connection_id,
+      track_id: picked.id,
+      track_name: picked.name || null,
+      source_playlist_id: refPlaylistId,
+      rotated_at: nowIso
+    }])
+  }).catch(() => {});
   await sb(`/rest/v1/playlist_flex_settings?playlist_id=eq.${encodeURIComponent(slot.playlist_id)}`, {
     method: "PATCH",
     headers: { Prefer: "return=minimal" },
@@ -985,6 +1069,45 @@ const routes = {
         seats_limit: billing.row?.seats_limit ?? 0,
         seats_used: billing.row?.seats_used ?? 0,
         provider: billing.row?.provider || null,
+      },
+    });
+  },
+
+  /* ---------- health/status (GET) ---------- */
+  "health/status": async (req, res) => {
+    if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req, req.query.bubble_user_id);
+    if (!bubbleUserId) return bad(res, 401, "missing_user");
+    const now = new Date();
+    const [connR, playlistR, flexR] = await Promise.all([
+      sb(`/rest/v1/spotify_connections?select=id,is_active&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`),
+      sb(
+        `/rest/v1/playlists?select=id,next_check_at,needs_sync,sync_started_at,last_checked_at,error_count` +
+        `&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}&is_owner=is.true&is_public=is.true`
+      ),
+      sb(`/rest/v1/playlist_flex_settings?select=playlist_id,enabled,next_rotation_at&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`).catch(() => null),
+    ]);
+    const connections = connR.ok ? await connR.json() : [];
+    const playlists = playlistR.ok ? await playlistR.json() : [];
+    const flex = flexR?.ok ? await flexR.json() : [];
+    return json(res, 200, {
+      ok: true,
+      checked_at: now.toISOString(),
+      spotify_connections: {
+        total: connections.length,
+        active: connections.filter((c) => c.is_active !== false).length,
+      },
+      playlists: {
+        total: playlists.length,
+        on_cooldown: playlists.filter((p) => p.next_check_at && new Date(p.next_check_at) > now).length,
+        needs_sync: playlists.filter((p) => p.needs_sync).length,
+        syncing: playlists.filter((p) => p.sync_started_at).length,
+        stale: playlists.filter((p) => !p.last_checked_at || new Date(p.last_checked_at) < new Date(Date.now() - 24 * 3600 * 1000)).length,
+        failed: playlists.filter((p) => Number(p.error_count || 0) > 0).length,
+      },
+      rotator: {
+        enabled: flex.filter((f) => f.enabled).length,
+        due: flex.filter((f) => f.enabled && (!f.next_rotation_at || new Date(f.next_rotation_at) <= now)).length,
       },
     });
   },
@@ -5608,8 +5731,10 @@ const routes = {
       interval: "weekly",
       enabled: false,
       next_rotation_at: null,
-      last_rotated_at: null
+      last_rotated_at: null,
+      ...normalizeFlexRules({})
     };
+    Object.assign(base, normalizeFlexRules(base));
     let reference_playlist = null;
     if (base.reference_playlist_id) {
       const token = await getAccessTokenFromConnection(base.connection_id).catch(() => "");
@@ -5669,19 +5794,63 @@ const routes = {
       interval,
       enabled,
       next_rotation_at,
-      updated_at: nowIso
+      updated_at: nowIso,
+      repeat_cooldown_weeks: normalizeFlexRules(body).repeat_cooldown_weeks,
+      avoid_target_duplicates: normalizeFlexRules(body).avoid_target_duplicates,
+      min_popularity: normalizeFlexRules(body).min_popularity,
+      max_popularity: normalizeFlexRules(body).max_popularity,
+      max_release_age_weeks: normalizeFlexRules(body).max_release_age_weeks
     };
 
-    const r = await sb(`/rest/v1/playlist_flex_settings?on_conflict=playlist_id`, {
+    let r = await sb(`/rest/v1/playlist_flex_settings?on_conflict=playlist_id`, {
       method: "POST",
       headers: { Prefer: "resolution=merge-duplicates,return=representation" },
       body: JSON.stringify([payload])
     });
+    if (!r.ok) {
+      const text = await r.text();
+      if (text.includes("repeat_cooldown_weeks") || text.includes("avoid_target_duplicates") || text.includes("min_popularity") || text.includes("max_popularity") || text.includes("max_release_age_weeks")) {
+        const {
+          repeat_cooldown_weeks,
+          avoid_target_duplicates,
+          min_popularity,
+          max_popularity,
+          max_release_age_weeks,
+          ...fallbackPayload
+        } = payload;
+        r = await sb(`/rest/v1/playlist_flex_settings?on_conflict=playlist_id`, {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+          body: JSON.stringify([fallbackPayload])
+        });
+      } else {
+        return bad(res, 500, `flex_settings_upsert_failed: ${text}`);
+      }
+    }
     if (!r.ok) return bad(res, 500, `flex_settings_upsert_failed: ${await r.text()}`);
     const rows = await r.json();
     await setPlaylistUpdateCooldown(playlist_id, 300);
     const saved = rows?.[0] || payload;
-    return json(res, 200, { ok: true, settings: { ...saved, reference_playlist } });
+    return json(res, 200, { ok: true, settings: { ...normalizeFlexRules(payload), ...saved, reference_playlist } });
+  },
+
+  /* ---------- flex/history (GET) ---------- */
+  "flex/history": async (req, res) => {
+    if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req, req.query.bubble_user_id);
+    if (!bubbleUserId) return bad(res, 401, "missing_bubble_user_id");
+    const playlist_id = String(req.query.playlist_id || "").trim();
+    if (!playlist_id) return bad(res, 400, "missing_playlist_id");
+    const owned = await getOwnedPlaylist(playlist_id, bubbleUserId);
+    if (!owned) return bad(res, 403, "playlist_not_owned");
+    const limit = Math.max(1, Math.min(50, Number(req.query.limit || "10")));
+    const r = await sb(
+      `/rest/v1/playlist_flex_history?select=id,slot_id,track_id,track_name,source_playlist_id,rotated_at` +
+      `&playlist_id=eq.${encodeURIComponent(playlist_id)}` +
+      `&order=rotated_at.desc&limit=${encodeURIComponent(limit)}`
+    );
+    if (!r.ok) return json(res, 200, []);
+    return json(res, 200, await r.json());
   },
 
   /* ---------- flex/slots/list (GET) ---------- */
