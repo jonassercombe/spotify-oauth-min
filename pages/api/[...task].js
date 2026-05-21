@@ -207,6 +207,10 @@ function publicBaseUrl(req = null) {
   return process.env.PUBLIC_BASE_URL || (req?.headers?.host ? `https://${req.headers.host}` : "https://playlist-pilot.com");
 }
 
+function internalBaseUrl() {
+  return process.env.PUBLIC_BASE_URL || "https://playlist-pilot.com";
+}
+
 function stripePlanCatalog() {
   return {
     economy_monthly: {
@@ -1152,7 +1156,7 @@ async function rotateFlexSlot(slot, settings) {
     body: JSON.stringify({ needs_sync: true, next_check_at: cooldownUntil })
   }).catch(() => {});
 
-  const base = process.env.PUBLIC_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
+  const base = internalBaseUrl();
   if (base) {
     fetch(`${base}/api/playlists/dispatch-sync`, {
       method: "POST",
@@ -3154,7 +3158,7 @@ const routes = {
         })
       }).catch(() => {});
 
-      const base = process.env.PUBLIC_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
+      const base = internalBaseUrl();
       if (base) {
         fetch(`${base}/api/playlists/dispatch-sync`, {
           method: "POST",
@@ -3537,7 +3541,7 @@ const routes = {
          }
        }
 
-       const base = process.env.PUBLIC_BASE_URL || `https://${process.env.VERCEL_URL}`;
+       const base = internalBaseUrl();
        await fetch(`${base}/api/playlists/dispatch-sync`, {
          method: "POST",
          headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
@@ -5352,7 +5356,7 @@ const routes = {
     const initialItems = String(req.query.with_items || "0") === "1";
     let itemSyncDispatched = 0;
     if (initialItems && syncedRows.length) {
-      const base = process.env.PUBLIC_BASE_URL || `https://${process.env.VERCEL_URL}`;
+      const base = internalBaseUrl();
       const syncCandidates = syncedRows
         .filter((p) => p?.id && Number(p.tracks_total || 0) > 0)
         .sort((a, b) => Number(b.followers ?? -1) - Number(a.followers ?? -1));
@@ -5532,7 +5536,7 @@ const routes = {
      const rows = await r.json();
      if (rows.length === 0) return json(res, 200, { ok:true, synced:0 });
    
-     const base = process.env.PUBLIC_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
+     const base = internalBaseUrl();
      if (!base) return bad(res, 500, "missing PUBLIC_BASE_URL/VERCEL_URL");
      const syncUrl = `${base}/api/playlists/sync-items`;
    
@@ -5926,7 +5930,7 @@ const routes = {
 
     const cooldownUntil = await setPlaylistUpdateCooldown(playlist_id, 300);
    
-     const base = process.env.PUBLIC_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "");
+     const base = internalBaseUrl();
      if (base) {
        fetch(`${base}/api/playlists/dispatch-sync`, {
          method: "POST",
@@ -6107,7 +6111,7 @@ const routes = {
            body: JSON.stringify({ needs_sync: true, last_snapshot_checked_at: new Date().toISOString(), next_check_at: cooldownUntil })
          }).catch(()=>{});
    
-         const base = process.env.PUBLIC_BASE_URL || `https://${process.env.VERCEL_URL}`;
+         const base = internalBaseUrl();
          if (base) {
            fetch(`${base}/api/playlists/dispatch-sync`, {
              method: "POST",
@@ -6631,7 +6635,7 @@ const routes = {
     if (!playlist_id) return bad(res, 400, "missing_playlist_id");
 
     // pg_net-Aufruf an Supabase: ruft asynchron deinen /api/playlists/sync-items Endpoint auf
-    const base = process.env.PUBLIC_BASE_URL || `https://${process.env.VERCEL_URL}`;
+    const base = internalBaseUrl();
     const targetUrl = `${base}/api/playlists/sync-items`;
     const syncBody = JSON.stringify({ playlist_row_id: playlist_id });
 
