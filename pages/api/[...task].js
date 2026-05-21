@@ -70,28 +70,9 @@ async function sb(path, init = {}) {
 
 async function scopedPlaylistUpsert(batch) {
   const rows = Array.isArray(batch) ? batch : [batch];
-  const scoped = await sb(`/rest/v1/playlists?on_conflict=connection_id,playlist_id`, {
+  return sb(`/rest/v1/playlists?on_conflict=connection_id,playlist_id`, {
     method: "POST",
     headers: { Prefer: "resolution=merge-duplicates,return=representation" },
-    body: JSON.stringify(rows),
-  });
-  if (scoped.ok) return scoped;
-
-  const scopedText = await scoped.text().catch(() => "");
-  const missingScopedConstraint =
-    scoped.status === 400 &&
-    /connection_id|playlist_id|constraint|schema cache|unique/i.test(scopedText);
-  if (!missingScopedConstraint) {
-    return new Response(scopedText, { status: scoped.status, statusText: scoped.statusText });
-  }
-
-  // Compatibility path until the DB migration adding unique(connection_id, playlist_id) is applied.
-  return sb(`/rest/v1/playlists?on_conflict=playlist_id`, {
-    method: "POST",
-    headers: {
-      Prefer: "resolution=merge-duplicates,return=representation",
-      "x-playlistpilot-fallback": "global-playlist-id",
-    },
     body: JSON.stringify(rows),
   });
 }
