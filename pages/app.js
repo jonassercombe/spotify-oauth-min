@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Head from "next/head";
+import { useRouter } from "next/router";
 import { ArrowDown, ArrowUp, GripVertical, Lock, Settings, Shuffle, TimerReset, Trash2, Unlock, X } from "lucide-react";
 import { getSupabaseBrowserClient } from "../lib/supabaseBrowser";
 
@@ -165,8 +166,13 @@ function writeStoredSelection(userContext, nextSelection) {
   window.localStorage.setItem(key, JSON.stringify({ ...current, ...nextSelection }));
 }
 
-function reorderTracks(list, sourceTrackId, targetPosition) {
-  const fromIndex = list.findIndex((track) => track.track_id === sourceTrackId);
+function reorderTracks(list, sourceTrack, targetPosition) {
+  const sourcePosition = Number(sourceTrack?.position);
+  const fromIndex = list.findIndex((track) => (
+    Number.isFinite(sourcePosition)
+      ? Number(track.position) === sourcePosition
+      : track.track_id === sourceTrack?.track_id
+  ));
   const toIndex = Math.max(0, Math.min(list.length - 1, Number(targetPosition)));
   if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return list;
   const next = [...list];
@@ -303,6 +309,7 @@ function GrowthBars({ items = [], selectedId = "", onSelect }) {
 }
 
 export default function PlaylistManager() {
+  const router = useRouter();
   const [supabase, setSupabase] = useState(null);
   const [session, setSession] = useState(null);
   const [authRefreshTick, setAuthRefreshTick] = useState(0);
@@ -486,9 +493,9 @@ export default function PlaylistManager() {
     }
     if (spotifyError || spotifyLinked) {
       const next = params.toString();
-      window.history.replaceState({}, "", `${window.location.pathname}${next ? `?${next}` : ""}${window.location.hash}`);
+      router.replace(`${window.location.pathname}${next ? `?${next}` : ""}${window.location.hash}`, undefined, { shallow: true });
     }
-  }, []);
+  }, [router]);
 
   useEffect(() => {
     if (!initialSpotifySyncPending || !billingActive || !connectionId || !session?.access_token) return;
@@ -956,7 +963,7 @@ export default function PlaylistManager() {
     moveInFlightRef.current = true;
     const previousTracks = tracks;
     const targetPosition = Number(track.position) + (dir === "up" ? -1 : 1);
-    if (ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(reorderTracks(tracks, track.track_id, targetPosition));
+    if (ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(reorderTracks(tracks, track, targetPosition));
     await run("Track move queued", async () => {
       await api("/api/playlist-items/move", {
         method: "POST",
@@ -984,7 +991,7 @@ export default function PlaylistManager() {
     if (!Number.isFinite(from) || !Number.isFinite(to) || from === to) return;
     moveInFlightRef.current = true;
     const previousTracks = tracks;
-    if (ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(reorderTracks(tracks, track.track_id, to));
+    if (ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(reorderTracks(tracks, track, to));
     await run("Track reordered", async () => {
       await api("/api/playlist-items/move", {
         method: "POST",
