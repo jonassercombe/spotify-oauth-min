@@ -1338,8 +1338,8 @@ export default function PlaylistManager() {
         <meta property="og:url" content="https://playlist-pilot.com" />
         <meta property="og:image" content="https://playlist-pilot.com/playlistpilot-logo-v1.jpg" />
         <meta name="twitter:card" content="summary" />
-        <link rel="icon" href="/playlistpilot-logo-v1.jpg" />
-        <link rel="apple-touch-icon" href="/playlistpilot-logo-v1.jpg" />
+        <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+        <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
         <link rel="canonical" href="https://playlist-pilot.com/app" />
       </Head>
       <header className="topbar">

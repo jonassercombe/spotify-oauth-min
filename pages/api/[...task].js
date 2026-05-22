@@ -2390,7 +2390,7 @@ const routes = {
    
        // 1) Eigentum prüfen & Playlist-Infos ziehen
        const pR = await fetch(
-         `${SUPABASE_URL}/rest/v1/playlists?select=id,name,followers,bubble_user_id&limit=1&id=eq.${encodeURIComponent(playlist_id)}&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}`,
+         `${SUPABASE_URL}/rest/v1/playlists?select=id,playlist_id,name,followers,bubble_user_id&limit=1&id=eq.${encodeURIComponent(playlist_id)}&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}`,
          { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` } }
        );
        const pArr = await pR.json().catch(()=>[]);
@@ -2405,10 +2405,10 @@ const routes = {
        // 3) Daily-Folgs holen (ASC für Delta-Berechnung)
        const dR = await fetch(
          `${SUPABASE_URL}/rest/v1/playlist_followers_daily` +
-         `?select=day,followers` +
-         `&playlist_id=eq.${encodeURIComponent(playlist_id)}` +
+         `?select=day,followers,playlist_id,spotify_playlist_id` +
          `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
          `&day=gte.${encodeURIComponent(cutoff)}` +
+         `&or=(playlist_id.eq.${encodeURIComponent(playlist_id)},spotify_playlist_id.eq.${encodeURIComponent(playlist.playlist_id || "")})` +
          `&order=day.asc`,
          { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` } }
        );
@@ -2418,10 +2418,10 @@ const routes = {
        // 4) Notizen für diesen Zeitraum ziehen
        const nR = await fetch(
          `${SUPABASE_URL}/rest/v1/playlist_growth_notes` +
-         `?select=day,note` +
-         `&playlist_id=eq.${encodeURIComponent(playlist_id)}` +
+         `?select=day,note,playlist_id,spotify_playlist_id` +
          `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
-         `&day=gte.${encodeURIComponent(cutoff)}`,
+         `&day=gte.${encodeURIComponent(cutoff)}` +
+         `&or=(playlist_id.eq.${encodeURIComponent(playlist_id)},spotify_playlist_id.eq.${encodeURIComponent(playlist.playlist_id || "")})`,
          { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` } }
        );
        const nArr = await nR.json().catch(()=>[]);
@@ -2494,7 +2494,7 @@ const routes = {
      // 1) Aktuelle Playlists des Users (Owner + public)
      const pathNow =
        `/rest/v1/playlists` +
-       `?select=id,name,followers` +
+       `?select=id,playlist_id,name,followers` +
        `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
        `&is_owner=is.true&is_public=is.true` +
        `&order=followers.desc.nullslast,name.asc`;
@@ -2534,7 +2534,7 @@ const routes = {
      // 2) Baseline primär aus playlist_followers_daily (<= threshold), pro Playlist jüngster Eintrag
      const pathDaily =
        `/rest/v1/playlist_followers_daily` +
-       `?select=playlist_id,day,followers` +
+       `?select=playlist_id,spotify_playlist_id,day,followers` +
        `&playlist_id=in.${encodeURIComponent(inList)}` +
        `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
        `&day=lte.${encodeURIComponent(threshold)}` +
@@ -2547,9 +2547,11 @@ const routes = {
      if (!dailyR.ok) return bad(res, 500, `supabase_daily_failed: ${JSON.stringify(dailyArr)}`);
    
      const baselineById = new Map(); // playlist_id -> followers
+     const playlistByStableId = new Map(nowArr.map((p) => [p.playlist_id, p.id]).filter(([spotifyId]) => !!spotifyId));
      for (const row of dailyArr) {
-       if (!baselineById.has(row.playlist_id)) {
-         baselineById.set(row.playlist_id, Number(row.followers ?? 0));
+       const localId = row.playlist_id || playlistByStableId.get(row.spotify_playlist_id);
+       if (localId && !baselineById.has(localId)) {
+         baselineById.set(localId, Number(row.followers ?? 0));
        }
      }
      const baselineDailyCount = baselineById.size;
@@ -2561,7 +2563,7 @@ const routes = {
          const inMissing = `(${missing.join(",")})`;
          const pathHist =
            `/rest/v1/playlist_followers_history` +
-           `?select=playlist_id,day,followers` +
+           `?select=playlist_id,spotify_playlist_id,day,followers` +
            `&playlist_id=in.${encodeURIComponent(inMissing)}` +
            `&day=lte.${encodeURIComponent(threshold)}` +
            `&order=playlist_id.asc,day.desc`;
@@ -2571,8 +2573,9 @@ const routes = {
          const histArr = await histR.json().catch(() => []);
          if (!histR.ok) return bad(res, 500, `supabase_hist_failed: ${JSON.stringify(histArr)}`);
          for (const row of histArr) {
-           if (!baselineById.has(row.playlist_id)) {
-             baselineById.set(row.playlist_id, Number(row.followers ?? 0));
+           const localId = row.playlist_id || playlistByStableId.get(row.spotify_playlist_id);
+           if (localId && !baselineById.has(localId)) {
+             baselineById.set(localId, Number(row.followers ?? 0));
            }
          }
        }
@@ -2726,23 +2729,32 @@ const routes = {
    
      let playlistFilter = "";
      if (playlist_id) {
-       playlistFilter = `&playlist_id=eq.${encodeURIComponent(playlist_id)}`;
+       const plR = await fetch(
+         SUPABASE_URL +
+           `/rest/v1/playlists?select=id,playlist_id&limit=1&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+           `&id=eq.${encodeURIComponent(playlist_id)}`,
+         { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" }
+       );
+       const selectedPlaylist = plR.ok ? JSON.parse(await plR.text() || "[]")?.[0] : null;
+       if (!selectedPlaylist) return json(res, 200, { ok: true, granularity: gran, labels: [], followers: [], growth: [] });
+       playlistFilter = `&or=(playlist_id.eq.${encodeURIComponent(selectedPlaylist.id)},spotify_playlist_id.eq.${encodeURIComponent(selectedPlaylist.playlist_id || "")})`;
      } else if (connection_id) {
        const plR = await fetch(
          SUPABASE_URL +
-           `/rest/v1/playlists?select=id&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+           `/rest/v1/playlists?select=id,playlist_id&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
            `&connection_id=eq.${encodeURIComponent(connection_id)}&is_owner=is.true&is_public=is.true`,
          { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" }
        );
        const accountPlaylists = plR.ok ? JSON.parse(await plR.text() || "[]") : [];
        const ids = accountPlaylists.map((p) => p.id).filter(Boolean);
        if (!ids.length) return json(res, 200, { ok: true, granularity: gran, labels: [], followers: [], growth: [] });
-       playlistFilter = `&playlist_id=in.(${ids.map((id) => `"${id}"`).join(",")})`;
+       const spotifyIds = accountPlaylists.map((p) => p.playlist_id).filter(Boolean);
+       playlistFilter = `&or=(playlist_id.in.(${ids.map((id) => `"${id}"`).join(",")}),spotify_playlist_id.in.(${spotifyIds.map((id) => `"${id}"`).join(",")}))`;
      }
 
      const snapPath =
        `/rest/v1/playlist_followers_daily` +
-       `?select=playlist_id,day,followers` +
+       `?select=playlist_id,spotify_playlist_id,day,followers` +
        `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
        `&day=gte.${encodeURIComponent(fromStr)}` +
        toFilter +
@@ -2778,7 +2790,7 @@ const routes = {
        let o = agg.get(k);
        if (!o) { o = { followersTotal: 0, byPl: new Map() }; agg.set(k, o); }
        // wir nehmen den letzten Wert pro playlist_id im Bucket als "Stand"
-       o.byPl.set(r.playlist_id, r.followers);
+       o.byPl.set(r.spotify_playlist_id || r.playlist_id, r.followers);
      }
      // jetzt pro Bucket Summen bilden
      for (const [, o] of agg) {
@@ -2816,7 +2828,7 @@ const routes = {
      // by_playlist: Growth je Playlist (für z.B. gestapelte Graphen)
      // Wir berechnen je Playlist die Buckets (letzter Followers-Wert je Bucket), dann Delta
      const byPlMap = new Map(); // playlist_id -> array followersByBucket
-     const plIds = new Set(rows.map(r => r.playlist_id));
+     const plIds = new Set(rows.map(r => r.spotify_playlist_id || r.playlist_id));
      for (const pid of plIds) {
        const series = [];
        for (const k of labels) {
@@ -2856,7 +2868,7 @@ const routes = {
 
   // 1) aktuelle Playlists ziehen (für total followers + Namen)
   const plistPath =
-    `/rest/v1/playlists?select=id,name,followers,image,tracks_total,connection_id,auto_remove_enabled,auto_remove_weeks,updated_at,last_checked_at,next_check_at` +
+    `/rest/v1/playlists?select=id,playlist_id,name,followers,image,tracks_total,connection_id,auto_remove_enabled,auto_remove_weeks,updated_at,last_checked_at,next_check_at` +
     `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
     `&is_owner=is.true&is_public=is.true`;
   const pResp = await fetch(SUPABASE_URL + plistPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
@@ -2869,7 +2881,7 @@ const routes = {
 
   const snapPath =
     `/rest/v1/playlist_followers_daily` +
-    `?select=playlist_id,day,followers` +
+    `?select=playlist_id,spotify_playlist_id,day,followers` +
     `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
     `&day=gte.${encodeURIComponent(fromStr)}` +
     `&order=day.asc`;
@@ -2877,11 +2889,12 @@ const routes = {
   const snaps = sResp.ok ? JSON.parse(await sResp.text() || "[]") : [];
   const snapshotDays = new Set(snaps.map((row) => row.day).filter(Boolean));
 
-  // map: playlist_id -> {firstFollowers, lastFollowers}
+  // map: stable spotify_playlist_id -> {firstFollowers, lastFollowers}
   const snapMap = new Map();
   for (const r of snaps) {
-    let o = snapMap.get(r.playlist_id);
-    if (!o) { o = { first: r.followers, last: r.followers }; snapMap.set(r.playlist_id, o); }
+    const stableKey = r.spotify_playlist_id || r.playlist_id;
+    let o = snapMap.get(stableKey);
+    if (!o) { o = { first: r.followers, last: r.followers }; snapMap.set(stableKey, o); }
     o.last = r.followers; // wegen day.asc ist die letzte Zeile am Ende
   }
 
@@ -2889,7 +2902,7 @@ const routes = {
   let net_growth = 0;
   const growth_rank = [];
   for (const p of playlists) {
-    const s = snapMap.get(p.id);
+    const s = snapMap.get(p.playlist_id) || snapMap.get(p.id);
     const delta = s ? (s.last - s.first) : 0;
     net_growth += delta;
     if (!top_growing || delta > top_growing.delta) {
@@ -4183,10 +4196,11 @@ const routes = {
        }
    
        // --- Helper: Follower-Snapshot (UPSERT) schreiben
-       async function upsertFollowersDaily(localPlaylistUUID, conn, followersInt) {
+       async function upsertFollowersDaily(localPlaylistUUID, conn, followersInt, spotifyPlaylistId = null) {
          const day = new Date().toISOString().slice(0,10); // YYYY-MM-DD
          const payload = {
            playlist_id: localPlaylistUUID,      // uuid in deiner Tabelle!
+           spotify_playlist_id: spotifyPlaylistId || null,
            bubble_user_id: conn.bubble_user_id, // text
            connection_id: conn.id,              // uuid, nullable – wir füllen sie
            day,
@@ -4247,7 +4261,7 @@ const routes = {
    
              // followers_daily upserten
              try {
-               await upsertFollowersDaily(localUUID, conn, followers);
+               await upsertFollowersDaily(localUUID, conn, followers, sp.id);
                out.snapshots += 1;
              } catch (e) {
                out.errors.push(`upsert_daily:${sp.id}:${e.message}`);
@@ -4548,7 +4562,9 @@ const routes = {
        if (freshResults.length > 0) {
          const dailyRows = freshResults.map(fr => ({
            playlist_id: fr.row.id,
+           spotify_playlist_id: fr.row.playlist_id || null,
            bubble_user_id: fr.row.bubble_user_id || null,
+           connection_id,
            day: today,
            followers: Number(fr.followers || 0)
          }));
@@ -4586,7 +4602,9 @@ const routes = {
              // Noch kein Today-Row → Fallback mit letztem bekannten Stand
              dailyFallbackRows.push({
                playlist_id: p.id,
+               spotify_playlist_id: p.playlist_id || null,
                bubble_user_id: p.bubble_user_id || null,
+               connection_id,
                day: today,
                followers: Number(p.followers ?? 0)
              });
