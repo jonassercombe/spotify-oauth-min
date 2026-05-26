@@ -389,6 +389,7 @@ export default function PlaylistManager() {
   const [connectionsLoaded, setConnectionsLoaded] = useState(false);
   const [playlistsLoaded, setPlaylistsLoaded] = useState(false);
   const [healthStatus, setHealthStatus] = useState(null);
+  const [adminStatus, setAdminStatus] = useState(null);
   const [spotifyClientId, setSpotifyClientId] = useState("");
   const [spotifyClientSecret, setSpotifyClientSecret] = useState("");
   const [spotifyAppName, setSpotifyAppName] = useState("");
@@ -398,6 +399,7 @@ export default function PlaylistManager() {
 
   const billing = userContext?.billing || {};
   const billingActive = !!billing.is_active;
+  const isAdmin = !!userContext?.is_admin;
   const movers = dashboardSummary?.growth_rank || [];
   const moversPageSize = 5;
   const moversPageCount = Math.max(1, Math.ceil(movers.length / moversPageSize));
@@ -569,6 +571,11 @@ export default function PlaylistManager() {
     if (!userContext?.linked || view !== "dashboard") return;
     loadDashboard();
   }, [dashboardRange, dashboardGranularity, dashboardStartDate, dashboardEndDate, dashboardConnectionId, dashboardPlaylistId, view]);
+
+  useEffect(() => {
+    if (!userContext?.linked || !isAdmin || view !== "admin") return;
+    loadAdminStatus();
+  }, [userContext?.linked, isAdmin, view]);
 
   useEffect(() => {
     if (dashboardRange === "year" && dashboardGranularity !== "monthly") {
@@ -1324,6 +1331,29 @@ export default function PlaylistManager() {
     return data;
   }
 
+  async function loadAdminStatus() {
+    if (!session?.access_token || !isAdmin) return null;
+    const data = await api("/api/admin/status", { accessToken: accessToken() }).catch((e) => {
+      setError(e.message || "Admin status failed.");
+      return null;
+    });
+    setAdminStatus(data);
+    return data;
+  }
+
+  async function runAdminJobs() {
+    if (!isAdmin) return;
+    await run("Sync worker started", async () => {
+      const result = await api("/api/admin/run-jobs", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { limit: 10, max_ms: 45000 },
+      });
+      await loadAdminStatus();
+      return result;
+    });
+  }
+
   async function saveSpotifyCredentials() {
     await run("Spotify app settings saved", async () => {
       const data = await api("/api/spotify/credentials/save", {
@@ -1481,6 +1511,7 @@ export default function PlaylistManager() {
             <div className="navTabs">
               <button className={view === "dashboard" ? "navButton active" : "navButton"} onClick={() => setView("dashboard")}>Dashboard</button>
               <button className={view === "manager" ? "navButton active" : "navButton"} onClick={() => setView("manager")}>Playlist Manager</button>
+              {isAdmin ? <button className={view === "admin" ? "navButton active" : "navButton"} onClick={() => setView("admin")}>Admin</button> : null}
             </div>
           ) : null}
           {session && userContext?.linked && billingActive && onboardingConnectionsReady ? (
@@ -2044,6 +2075,175 @@ export default function PlaylistManager() {
                 </div>
               ))}
               {!dashboardSummary?.upcoming_removals?.length ? <p>No upcoming removals.</p> : null}
+            </div>
+          </section>
+        </div>
+      </section>
+      ) : view === "admin" && isAdmin ? (
+      <section className="adminPanel">
+        <div className="statusLine">
+          {busy ? <span><i className="miniSpinner" aria-hidden="true" />{busyLabel || "Working"}</span> : message ? <span>{message}</span> : <span />}
+          {error ? <strong>{error}</strong> : null}
+        </div>
+        <div className="dashboardHero">
+          <div>
+            <h2>Admin</h2>
+            <p>Queue, sync health, locks, and recent worker activity.</p>
+          </div>
+          <div className="dashboardActions">
+            <button disabled={busy} onClick={loadAdminStatus}>Refresh</button>
+            <button disabled={busy} onClick={runAdminJobs}>Run worker</button>
+          </div>
+        </div>
+
+        <div className="metricGrid metricGrid--primary">
+          <article>
+            <span className="metricLabel">Users</span>
+            <strong className="metricValue">{formatNumber(adminStatus?.totals?.active_users)}</strong>
+            <small className="metricMeta">{formatNumber(adminStatus?.totals?.users)} total</small>
+          </article>
+          <article>
+            <span className="metricLabel">Connections</span>
+            <strong className="metricValue">{formatNumber(adminStatus?.totals?.active_connections)}</strong>
+            <small className="metricMeta">{formatNumber(adminStatus?.totals?.spotify_connections)} total</small>
+          </article>
+          <article>
+            <span className="metricLabel">Playlists</span>
+            <strong className="metricValue">{formatNumber(adminStatus?.totals?.playlists)}</strong>
+            <small className="metricMeta">{formatNumber(adminStatus?.totals?.tracks)} tracks</small>
+          </article>
+          <article>
+            <span className="metricLabel">Queue</span>
+            <strong className="metricValue">{formatNumber((adminStatus?.queue?.pending || 0) + (adminStatus?.queue?.running || 0))}</strong>
+            <small className="metricMeta">{formatNumber(adminStatus?.queue?.failed)} failed</small>
+          </article>
+        </div>
+
+        <div className="adminGrid">
+          <section className="dashboardPanel adminQueuePanel">
+            <div className="panelHeader">
+              <div>
+                <h2>Queue Health</h2>
+                <p>Pending and running sync work across all users.</p>
+              </div>
+              <span className={adminStatus?.queue?.failed ? "adminBadge adminBadge--danger" : "adminBadge"}>{formatNumber(adminStatus?.queue?.failed)} failed</span>
+            </div>
+            <div className="healthGrid">
+              <article><span>Pending</span><strong>{formatNumber(adminStatus?.queue?.pending)}</strong><small>{adminStatus?.queue?.oldest_pending_at ? `oldest ${formatShortDate(String(adminStatus.queue.oldest_pending_at).slice(0, 10))}` : "none waiting"}</small></article>
+              <article><span>Running</span><strong>{formatNumber(adminStatus?.queue?.running)}</strong><small>{formatNumber(adminStatus?.locks?.active)} active locks</small></article>
+              <article><span>Stale</span><strong>{formatNumber(adminStatus?.sync?.stale_24h)}</strong><small>{formatNumber(adminStatus?.sync?.needs_sync)} need sync</small></article>
+              <article><span>Snapshots</span><strong>{formatNumber(adminStatus?.sync?.with_recent_snapshots)}</strong><small>{formatNumber(adminStatus?.sync?.without_recent_snapshots)} missing 7d</small></article>
+            </div>
+            <div className="jobTypeGrid">
+              {Object.entries(adminStatus?.queue?.by_type || {}).map(([key, value]) => (
+                <div key={key}>
+                  <span>{key.replace(":", " · ")}</span>
+                  <strong>{formatNumber(value)}</strong>
+                </div>
+              ))}
+              {!Object.keys(adminStatus?.queue?.by_type || {}).length ? <p>No active jobs.</p> : null}
+            </div>
+          </section>
+
+          <section className="dashboardPanel adminQueuePanel">
+            <div className="panelHeader">
+              <div>
+                <h2>Sync State</h2>
+                <p>Playlist freshness and automation contention.</p>
+              </div>
+            </div>
+            <div className="adminStateList">
+              <div><span>Needs sync</span><strong>{formatNumber(adminStatus?.sync?.needs_sync)}</strong></div>
+              <div><span>Currently syncing</span><strong>{formatNumber(adminStatus?.sync?.syncing)}</strong></div>
+              <div><span>Safe edit cooldown</span><strong>{formatNumber(adminStatus?.sync?.in_cooldown)}</strong></div>
+              <div><span>Playlist errors</span><strong>{formatNumber(adminStatus?.sync?.error_count)}</strong></div>
+              <div><span>Active locks</span><strong>{formatNumber(adminStatus?.locks?.active)}</strong></div>
+              <div><span>Expired locks</span><strong>{formatNumber(adminStatus?.locks?.expired)}</strong></div>
+            </div>
+          </section>
+        </div>
+
+        <div className="adminGrid adminGrid--wide">
+          <section className="dashboardPanel">
+            <div className="panelHeader">
+              <div>
+                <h2>Recent Jobs</h2>
+                <p>Latest worker lifecycle events.</p>
+              </div>
+            </div>
+            <div className="adminTable">
+              {(adminStatus?.recent_jobs || []).map((job) => (
+                <div key={job.id}>
+                  <span className={`jobStatus jobStatus--${job.status}`}>{job.status}</span>
+                  <strong>{job.job_type}</strong>
+                  <span>{job.scope_type}:{String(job.scope_id || "").slice(0, 8)}</span>
+                  <span>{formatNumber(job.attempts)} attempts</span>
+                  <small>{job.last_error || job.completed_at || job.updated_at}</small>
+                </div>
+              ))}
+              {!adminStatus?.recent_jobs?.length ? <p>No recent jobs.</p> : null}
+            </div>
+          </section>
+
+          <section className="dashboardPanel">
+            <div className="panelHeader">
+              <div>
+                <h2>Failed Jobs</h2>
+                <p>Failures that need attention or automatic retry review.</p>
+              </div>
+            </div>
+            <div className="adminTable">
+              {(adminStatus?.failed_jobs || []).map((job) => (
+                <div key={job.id}>
+                  <span className="jobStatus jobStatus--failed">failed</span>
+                  <strong>{job.job_type}</strong>
+                  <span>{formatNumber(job.attempts)} attempts</span>
+                  <small>{job.last_error || "No error message"}</small>
+                </div>
+              ))}
+              {!adminStatus?.failed_jobs?.length ? <p>No failed jobs.</p> : null}
+            </div>
+          </section>
+        </div>
+
+        <div className="adminGrid adminGrid--wide">
+          <section className="dashboardPanel">
+            <div className="panelHeader">
+              <div>
+                <h2>Locks</h2>
+                <p>Active mutexes protecting playlist and connection writes.</p>
+              </div>
+            </div>
+            <div className="adminTable">
+              {(adminStatus?.locks?.items || []).map((lock) => (
+                <div key={lock.lock_key}>
+                  <span className="jobStatus jobStatus--running">lock</span>
+                  <strong>{lock.lock_key}</strong>
+                  <span>{lock.owner?.split(":")?.[0] || "worker"}</span>
+                  <small>expires {lock.expires_at ? new Date(lock.expires_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "unknown"}</small>
+                </div>
+              ))}
+              {!adminStatus?.locks?.items?.length ? <p>No active locks.</p> : null}
+            </div>
+          </section>
+
+          <section className="dashboardPanel">
+            <div className="panelHeader">
+              <div>
+                <h2>Recent Connections</h2>
+                <p>Newest Spotify accounts connected to the platform.</p>
+              </div>
+            </div>
+            <div className="adminTable">
+              {(adminStatus?.recent_connections || []).map((connection) => (
+                <div key={connection.id}>
+                  <span className={connection.is_active === false ? "jobStatus jobStatus--failed" : "jobStatus jobStatus--done"}>{connection.is_active === false ? "off" : "active"}</span>
+                  <strong>{connection.display_name || connection.spotify_user_id || "Spotify Account"}</strong>
+                  <span>{String(connection.bubble_user_id || "").slice(0, 16)}</span>
+                  <small>{connection.created_at ? formatShortDate(String(connection.created_at).slice(0, 10)) : ""}</small>
+                </div>
+              ))}
+              {!adminStatus?.recent_connections?.length ? <p>No recent connections.</p> : null}
             </div>
           </section>
         </div>
@@ -3405,7 +3605,8 @@ export default function PlaylistManager() {
         .siteFooter a:focus-visible {
           color: #18e06f;
         }
-        .dashboard {
+        .dashboard,
+        .adminPanel {
           display: grid;
           gap: 20px;
           padding: 18px clamp(20px, 3vw, 40px) 32px;
@@ -3514,6 +3715,132 @@ export default function PlaylistManager() {
           display: grid;
           grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
           gap: 14px;
+        }
+        .adminGrid {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 14px;
+          align-items: start;
+        }
+        .adminGrid--wide {
+          grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        }
+        .adminQueuePanel {
+          min-height: 310px;
+        }
+        .adminBadge {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          min-width: 74px;
+          min-height: 34px;
+          padding: 7px 10px;
+          border: 1px solid rgba(24, 224, 111, 0.45);
+          border-radius: 999px;
+          color: #18e06f;
+          background: rgba(24, 224, 111, 0.08);
+          font-weight: 900;
+          font-size: 13px;
+        }
+        .adminBadge--danger {
+          border-color: rgba(255, 77, 77, 0.48);
+          color: #ff6b6b;
+          background: rgba(255, 77, 77, 0.08);
+        }
+        .jobTypeGrid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+          gap: 10px;
+          margin-top: 14px;
+        }
+        .jobTypeGrid div,
+        .adminStateList div {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          min-height: 44px;
+          padding: 10px 12px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #151920;
+        }
+        .jobTypeGrid span,
+        .adminStateList span {
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          color: #a6adba;
+          font-size: 13px;
+        }
+        .jobTypeGrid strong,
+        .adminStateList strong {
+          color: #f4f6fb;
+          font-size: 18px;
+        }
+        .adminStateList {
+          display: grid;
+          gap: 10px;
+        }
+        .adminTable {
+          display: grid;
+          gap: 8px;
+          margin-top: 14px;
+        }
+        .adminTable div {
+          display: grid;
+          grid-template-columns: 82px minmax(140px, 1fr) minmax(90px, 0.7fr) minmax(90px, 0.8fr);
+          align-items: center;
+          gap: 10px;
+          min-height: 48px;
+          padding: 10px 12px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #151920;
+        }
+        .adminTable strong,
+        .adminTable span,
+        .adminTable small {
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .adminTable strong {
+          color: #f4f6fb;
+          font-size: 14px;
+        }
+        .adminTable small,
+        .adminTable span {
+          color: #a6adba;
+          font-size: 12px;
+        }
+        .jobStatus {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 74px;
+          min-height: 26px;
+          border: 1px solid rgba(166, 173, 186, 0.22);
+          border-radius: 999px;
+          color: #a6adba;
+          font-size: 11px;
+          font-weight: 900;
+          text-transform: uppercase;
+        }
+        .jobStatus--pending {
+          border-color: rgba(255, 208, 102, 0.5);
+          color: #ffd066;
+        }
+        .jobStatus--running,
+        .jobStatus--done {
+          border-color: rgba(24, 224, 111, 0.48);
+          color: #18e06f;
+        }
+        .jobStatus--failed {
+          border-color: rgba(255, 77, 77, 0.48);
+          color: #ff6b6b;
         }
         .growthPanel {
           min-height: 560px;
@@ -5027,8 +5354,16 @@ export default function PlaylistManager() {
           .automationHealth,
           .dashboardFocusGrid,
           .dashboardSplitGrid,
+          .adminGrid,
+          .adminGrid--wide,
           .removalList {
             grid-template-columns: 1fr;
+          }
+          .adminTable div {
+            grid-template-columns: 82px minmax(0, 1fr);
+          }
+          .adminTable small {
+            grid-column: 2;
           }
           .playlistTable div {
             grid-template-columns: 52px minmax(0, 1fr) 100px;

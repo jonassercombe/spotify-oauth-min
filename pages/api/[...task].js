@@ -12,6 +12,7 @@ import { randomUUID } from "crypto";
 const json = (res, code, payload) => res.status(code).json(payload);
 const bad  = (res, code, msg) => json(res, code, { error: msg });
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const ADMIN_EMAILS = new Set(["jonassercombe@googlemail.com"]);
 
 async function parseJsonSafe(resp) {
   const txt = await resp.text();
@@ -297,6 +298,10 @@ function getPublicSupabaseKey() {
   return process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY || "";
 }
 
+function isAdminEmail(email) {
+  return ADMIN_EMAILS.has(String(email || "").trim().toLowerCase());
+}
+
 async function getSupabaseAuthUser(req) {
   const token = getBearerToken(req);
   const publicKey = getPublicSupabaseKey();
@@ -379,7 +384,21 @@ async function getUserContext(req) {
     linked: true,
     bubble_user_id: link.bubble_user_id,
     role: link.role || "user",
+    is_admin: isAdminEmail(email),
   };
+}
+
+async function requireAdminContext(req, res) {
+  const ctx = await getUserContext(req);
+  if (!ctx?.authUser) {
+    bad(res, 401, "not_authenticated");
+    return null;
+  }
+  if (!ctx.is_admin) {
+    bad(res, 403, "admin_only");
+    return null;
+  }
+  return ctx;
 }
 
 async function bubbleUserIdFromRequest(req) {
@@ -1541,6 +1560,7 @@ const routes = {
       email: ctx.email,
       bubble_user_id: ctx.bubble_user_id,
       role: ctx.role,
+      is_admin: !!ctx.is_admin,
       has_spotify_credentials: !!credentials,
       spotify_redirect_uri: `${process.env.PUBLIC_BASE_URL || "https://playlist-pilot.com"}/api/oauth/spotify/callback`,
       billing: {
@@ -1704,6 +1724,117 @@ const routes = {
       results,
       elapsed_ms: Date.now() - startedAt,
     });
+  },
+
+  /* ---------- admin/status (GET) ---------- */
+  "admin/status": async (req, res) => {
+    if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+
+    const now = new Date();
+    const dayAgo = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+    const weekAgo = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+    const [usersR, connectionsR, playlistsR, jobsR, failedJobsR, locksR, snapshotsR, recentJobsR, recentConnectionsR] = await Promise.all([
+      sb(`/rest/v1/app_users?select=bubble_user_id,subscription_status,subscription_expires_at,is_active,seats_limit,seats_used&limit=2000`),
+      sb(`/rest/v1/spotify_connections?select=id,bubble_user_id,is_active,disabled_at,cron_bucket,created_at&limit=5000`),
+      sb(`/rest/v1/playlists?select=id,bubble_user_id,connection_id,followers,tracks_total,needs_sync,sync_started_at,next_check_at,last_checked_at,last_synced_at,error_count,is_owner,is_public&limit=10000`),
+      sb(`/rest/v1/sync_jobs?select=id,job_type,status,priority,attempts,max_attempts,run_after,locked_at,created_at,updated_at,completed_at,last_error,scope_type,scope_id,playlist_id,connection_id,bubble_user_id&status=in.(pending,running,failed)&order=priority.desc,created_at.asc&limit=1000`),
+      sb(`/rest/v1/sync_jobs?select=id,job_type,status,attempts,last_error,created_at,updated_at,playlist_id,connection_id,bubble_user_id&status=eq.failed&order=updated_at.desc&limit=12`),
+      sb(`/rest/v1/sync_locks?select=lock_key,scope_type,scope_id,owner,expires_at,created_at,updated_at&order=expires_at.asc&limit=100`),
+      sb(`/rest/v1/playlist_followers_daily?select=playlist_id,day&day=gte.${encodeURIComponent(weekAgo.slice(0, 10))}&limit=10000`),
+      sb(`/rest/v1/sync_jobs?select=id,job_type,status,attempts,created_at,updated_at,completed_at,last_error,scope_type,scope_id,playlist_id,connection_id,bubble_user_id&order=updated_at.desc&limit=20`),
+      sb(`/rest/v1/spotify_connections?select=id,bubble_user_id,display_name,spotify_user_id,is_active,created_at&order=created_at.desc&limit=8`),
+    ]);
+
+    const users = usersR.ok ? await usersR.json().catch(() => []) : [];
+    const connections = connectionsR.ok ? await connectionsR.json().catch(() => []) : [];
+    const playlists = playlistsR.ok ? await playlistsR.json().catch(() => []) : [];
+    const jobs = jobsR.ok ? await jobsR.json().catch(() => []) : [];
+    const failedJobs = failedJobsR.ok ? await failedJobsR.json().catch(() => []) : [];
+    const locks = locksR.ok ? await locksR.json().catch(() => []) : [];
+    const snapshots = snapshotsR.ok ? await snapshotsR.json().catch(() => []) : [];
+    const recentJobs = recentJobsR.ok ? await recentJobsR.json().catch(() => []) : [];
+    const recentConnections = recentConnectionsR.ok ? await recentConnectionsR.json().catch(() => []) : [];
+
+    const activeUsers = users.filter((u) => {
+      const status = String(u.subscription_status || "").toLowerCase();
+      const expires = u.subscription_expires_at ? new Date(u.subscription_expires_at) : null;
+      return u.is_active !== false && status !== "none" && status !== "canceled" && (!expires || expires > now);
+    });
+    const activeConnections = connections.filter((c) => c.is_active !== false && !c.disabled_at);
+    const ownedPublic = playlists.filter((p) => p.is_owner && p.is_public);
+    const stalePlaylists = ownedPublic.filter((p) => !p.last_checked_at || new Date(p.last_checked_at) < new Date(dayAgo));
+    const syncingPlaylists = ownedPublic.filter((p) => p.sync_started_at);
+    const cooldownPlaylists = ownedPublic.filter((p) => p.next_check_at && new Date(p.next_check_at) > now);
+    const snapshotPlaylistIds = new Set(snapshots.map((s) => s.playlist_id).filter(Boolean));
+
+    const jobsByStatus = jobs.reduce((acc, job) => {
+      acc[job.status] = (acc[job.status] || 0) + 1;
+      return acc;
+    }, {});
+    const jobsByType = jobs.reduce((acc, job) => {
+      const key = `${job.job_type}:${job.status}`;
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {});
+
+    return json(res, 200, {
+      ok: true,
+      checked_at: now.toISOString(),
+      totals: {
+        users: users.length,
+        active_users: activeUsers.length,
+        spotify_connections: connections.length,
+        active_connections: activeConnections.length,
+        playlists: ownedPublic.length,
+        tracks: ownedPublic.reduce((sum, p) => sum + Number(p.tracks_total || 0), 0),
+        followers: ownedPublic.reduce((sum, p) => sum + Number(p.followers || 0), 0),
+      },
+      queue: {
+        pending: jobsByStatus.pending || 0,
+        running: jobsByStatus.running || 0,
+        failed: jobsByStatus.failed || 0,
+        by_type: jobsByType,
+        oldest_pending_at: jobs.filter((j) => j.status === "pending").map((j) => j.created_at).sort()[0] || null,
+      },
+      sync: {
+        needs_sync: ownedPublic.filter((p) => p.needs_sync).length,
+        syncing: syncingPlaylists.length,
+        stale_24h: stalePlaylists.length,
+        in_cooldown: cooldownPlaylists.length,
+        with_recent_snapshots: snapshotPlaylistIds.size,
+        without_recent_snapshots: Math.max(0, ownedPublic.length - snapshotPlaylistIds.size),
+        error_count: ownedPublic.filter((p) => Number(p.error_count || 0) > 0).length,
+      },
+      locks: {
+        active: locks.filter((l) => new Date(l.expires_at) > now).length,
+        expired: locks.filter((l) => new Date(l.expires_at) <= now).length,
+        items: locks.slice(0, 20),
+      },
+      recent_jobs: recentJobs,
+      failed_jobs: failedJobs,
+      recent_connections: recentConnections,
+    });
+  },
+
+  /* ---------- admin/run-jobs (POST) ---------- */
+  "admin/run-jobs": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const body = await readBody(req);
+    const limit = Math.max(1, Math.min(25, Number(body.limit || 10)));
+    const maxMs = Math.max(5000, Math.min(55000, Number(body.max_ms || 45000)));
+    const runnerReq = {
+      ...req,
+      method: "POST",
+      headers: { ...(req.headers || {}), "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+      url: `/api/sync/jobs/run?limit=${encodeURIComponent(String(limit))}&max_ms=${encodeURIComponent(String(maxMs))}`,
+      query: { limit: String(limit), max_ms: String(maxMs) },
+      body: {},
+    };
+    return routes["sync/jobs/run"](runnerReq, res);
   },
 
   /* ---------- health/status (GET) ---------- */
