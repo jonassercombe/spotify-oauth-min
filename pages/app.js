@@ -37,6 +37,12 @@ function formatDelta(value) {
   return formatNumber(n);
 }
 
+function formatPercent(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "n/a";
+  return `${n > 0 ? "+" : ""}${n.toFixed(Math.abs(n) >= 10 ? 0 : 1)}%`;
+}
+
 function formatShortDate(value) {
   if (!value) return "";
   const d = new Date(`${value}T00:00:00`);
@@ -193,18 +199,18 @@ function dropTargetPosition(source, target, placement = "before") {
   return from < targetPos ? targetPos - 1 : targetPos;
 }
 
-function GrowthChart({ values = [], labels = [], growth = [], granularity = "daily" }) {
+function GrowthChart({ values = [], labels = [], growth = [], granularity = "daily", valueLabel = "followers" }) {
   const [hoverIndex, setHoverIndex] = useState(null);
   const points = values.map((v) => Number(v) || 0);
   if (!points.length) return <div className="growthChart growthChart--empty"><span>No growth data yet</span></div>;
   const min = Math.min(...points);
   const max = Math.max(...points);
   const span = max - min || 1;
-  const padX = 8;
-  const padTop = 10;
-  const padBottom = 18;
-  const width = 100;
-  const height = 64;
+  const width = 720;
+  const height = 260;
+  const padX = 38;
+  const padTop = 28;
+  const padBottom = 34;
   const chartHeight = height - padTop - padBottom;
   const d = points.map((v, i) => {
     const x = points.length === 1 ? 50 : padX + (i / (points.length - 1)) * (width - padX * 2);
@@ -218,6 +224,8 @@ function GrowthChart({ values = [], labels = [], growth = [], granularity = "dai
   const activeIndex = hoverIndex === null ? points.length - 1 : hoverIndex;
   const activeX = points.length === 1 ? 50 : padX + (activeIndex / (points.length - 1)) * (width - padX * 2);
   const activeY = padTop + chartHeight - ((points[activeIndex] - min) / span) * chartHeight;
+  const activePercent = points.length === 1 ? 50 : (activeX / width) * 100;
+  const tooltipX = Math.max(16, Math.min(84, activePercent));
   const tooltipTitle = labels?.[activeIndex] ? formatShortDate(labels[activeIndex]) : `${granularity} ${activeIndex + 1}`;
   const tooltipGrowth = Number(growth?.[activeIndex] || 0);
   const growthLabel = granularity === "monthly" ? "monthly growth" : granularity === "weekly" ? "weekly growth" : "daily growth";
@@ -231,8 +239,8 @@ function GrowthChart({ values = [], labels = [], growth = [], granularity = "dai
         setHoverIndex(Math.round(ratio * (points.length - 1)));
       }}
     >
-      <svg viewBox={`0 0 ${width} ${height}`} aria-hidden="true">
-        {gridLines.map((y) => <line key={y} className="chartGridLine" x1="0" x2="100" y1={y} y2={y} />)}
+      <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+        {gridLines.map((y) => <line key={y} className="chartGridLine" x1={padX} x2={width - padX} y1={y} y2={y} />)}
         <line className="chartHoverLine" x1={activeX} x2={activeX} y1={padTop} y2={height - padBottom} />
         <path className="chartArea" d={area} />
         <path className="chartLine" d={d} />
@@ -244,10 +252,10 @@ function GrowthChart({ values = [], labels = [], growth = [], granularity = "dai
         })}
         <circle className="chartActivePoint" cx={activeX} cy={activeY} r="2" />
       </svg>
-      <div className="chartTooltip" style={{ left: `${activeX}%` }}>
+      <div className="chartTooltip" style={{ left: `${tooltipX}%` }}>
         <strong>{tooltipTitle}</strong>
-        <span>{formatNumber(points[activeIndex])} followers</span>
-        <em>{formatDelta(tooltipGrowth)} {growthLabel}</em>
+        <span>{formatNumber(points[activeIndex])} {valueLabel}</span>
+        <em><b>{formatDelta(tooltipGrowth)}</b> {growthLabel}</em>
       </div>
     </div>
   );
@@ -275,12 +283,13 @@ function DashboardWarmup({ summary, series, onRefresh, busy }) {
 }
 
 function GrowthBars({ items = [], selectedId = "", onSelect }) {
-  const max = Math.max(1, ...items.map((item) => Math.abs(Number(item.delta) || 0)));
+  const paddedItems = [...items];
+  while (paddedItems.length < 5) paddedItems.push(null);
   return (
     <div className="growthBars">
-      {items.map((item, index) => {
+      {paddedItems.map((item, index) => {
+        if (!item) return <div className="growthBar growthBar--empty" key={`empty-${index}`} aria-hidden="true" />;
         const delta = Number(item.delta) || 0;
-        const width = Math.max(4, Math.round((Math.abs(delta) / max) * 100));
         return (
           <button
             type="button"
@@ -290,16 +299,16 @@ function GrowthBars({ items = [], selectedId = "", onSelect }) {
           >
             <span className="growthRank">{index + 1}</span>
             <Artwork src={item.image} alt="" size="sm" />
-            <div>
+            <div className="growthBarCopy">
               <strong>{item.name || "Untitled playlist"}</strong>
-              <span>{formatNumber(item.followers_now)} followers</span>
+              <span>{formatNumber(item.followers_now)} followers · {formatPercent(item.percent_delta)}</span>
             </div>
-            <div className="growthSignal">
-              <b>{formatDelta(delta)}</b>
-              <div className={delta < 0 ? "barTrack negative" : "barTrack"}>
-                <i style={{ width: `${width}%` }} />
-              </div>
-            </div>
+            <b
+              className={`${delta < 0 ? "growthDelta negative" : "growthDelta"} ${!item.has_growth_data ? "muted" : ""}`}
+              title={item.has_growth_data ? `${formatNumber(item.snapshot_days)} snapshot days in this range` : "Not enough snapshots in this range"}
+            >
+              {item.has_growth_data ? formatDelta(delta) : "warming"}
+            </b>
           </button>
         );
       })}
@@ -320,6 +329,7 @@ export default function PlaylistManager() {
   const [playlistId, setPlaylistId] = useState("");
   const [playlist, setPlaylist] = useState(null);
   const [tracks, setTracks] = useState([]);
+  const [playlistLoading, setPlaylistLoading] = useState(false);
   const [playlistSearch, setPlaylistSearch] = useState("");
   const [trackSearch, setTrackSearch] = useState("");
   const [trackLink, setTrackLink] = useState("");
@@ -351,6 +361,8 @@ export default function PlaylistManager() {
   const [backupRestoreMode, setBackupRestoreMode] = useState("order");
   const [busy, setBusy] = useState(false);
   const moveInFlightRef = useRef(false);
+  const playlistLoadSeqRef = useRef(0);
+  const selectedPlaylistIdRef = useRef("");
   const [busyLabel, setBusyLabel] = useState("");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -363,6 +375,7 @@ export default function PlaylistManager() {
   const [dashboardEndDate, setDashboardEndDate] = useState("");
   const [dashboardConnectionId, setDashboardConnectionId] = useState("");
   const [dashboardPlaylistId, setDashboardPlaylistId] = useState("");
+  const [dashboardGrowthMode, setDashboardGrowthMode] = useState("followers");
   const [moversPage, setMoversPage] = useState(0);
   const [toolsOpen, setToolsOpen] = useState(false);
   const [activeTool, setActiveTool] = useState("add");
@@ -390,7 +403,51 @@ export default function PlaylistManager() {
   const moversPageCount = Math.max(1, Math.ceil(movers.length / moversPageSize));
   const safeMoversPage = Math.min(moversPage, moversPageCount - 1);
   const visibleMovers = movers.slice(safeMoversPage * moversPageSize, safeMoversPage * moversPageSize + moversPageSize);
-  const growthReady = !!(dashboardSeries?.ready || dashboardSummary?.totals?.growth_ready);
+  const dashboardPlaylistOptions = useMemo(() => {
+    const byId = new Map();
+    const addOption = (item) => {
+      const id = item?.id || item?.playlist_id;
+      if (!id || byId.has(id)) return;
+      byId.set(id, {
+        id,
+        name: item.name || item.playlist_name || "Untitled playlist",
+      });
+    };
+    playlists.forEach(addOption);
+    (dashboardSummary?.top_playlists || []).forEach(addOption);
+    (dashboardSummary?.growth_rank || []).forEach(addOption);
+    return Array.from(byId.values()).sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+  }, [playlists, dashboardSummary?.top_playlists, dashboardSummary?.growth_rank]);
+  const growthReady = !!(dashboardSeries?.ready && (dashboardSeries?.labels || []).length >= 2);
+  const growthQuality = dashboardSeries?.quality || {};
+  const dashboardChartData = useMemo(() => {
+    const followers = (dashboardSeries?.followers || []).map((value) => Number(value) || 0);
+    const growth = (dashboardSeries?.growth || []).map((value) => Number(value) || 0);
+    if (dashboardGrowthMode === "growth") {
+      return { values: growth, growth, label: "growth" };
+    }
+    if (dashboardGrowthMode === "cumulative") {
+      let total = 0;
+      return {
+        values: growth.map((value) => {
+          total += value;
+          return total;
+        }),
+        growth,
+        label: "cumulative growth",
+      };
+    }
+    return { values: followers, growth, label: "followers" };
+  }, [dashboardSeries?.followers, dashboardSeries?.growth, dashboardGrowthMode]);
+  const selectedDashboardPlaylist = useMemo(() => {
+    if (!dashboardPlaylistId) return null;
+    const candidates = [
+      ...(dashboardSummary?.growth_rank || []),
+      ...(dashboardSummary?.top_playlists || []),
+      ...playlists,
+    ];
+    return candidates.find((item) => (item?.id || item?.playlist_id) === dashboardPlaylistId) || null;
+  }, [dashboardPlaylistId, dashboardSummary?.growth_rank, dashboardSummary?.top_playlists, playlists]);
   const onboardingBillingReady = billingActive;
   const onboardingCredentialsReady = !!spotifyCredentials?.configured;
   const onboardingConnectionsReady = connections.length > 0;
@@ -400,6 +457,10 @@ export default function PlaylistManager() {
   const onboardingStep = onboardingNeedsBilling ? 1 : !onboardingCredentialsReady ? 2 : !onboardingConnectionsReady ? 3 : !onboardingPlaylistsReady ? 4 : 5;
   const workspaceBootstrapped = !!userContext?.linked && spotifyCredentials !== null && connectionsLoaded && (!connectionId || playlistsLoaded);
   const [isMobileViewport, setIsMobileViewport] = useState(false);
+
+  useEffect(() => {
+    selectedPlaylistIdRef.current = playlistId || "";
+  }, [playlistId]);
 
   useEffect(() => {
     const client = getSupabaseBrowserClient();
@@ -510,6 +571,12 @@ export default function PlaylistManager() {
   }, [dashboardRange, dashboardGranularity, dashboardStartDate, dashboardEndDate, dashboardConnectionId, dashboardPlaylistId, view]);
 
   useEffect(() => {
+    if (dashboardRange === "year" && dashboardGranularity !== "monthly") {
+      setDashboardGranularity("monthly");
+    }
+  }, [dashboardRange, dashboardGranularity]);
+
+  useEffect(() => {
     setMoversPage(0);
   }, [dashboardRange, dashboardConnectionId, dashboardSummary?.growth_rank?.length]);
 
@@ -521,19 +588,16 @@ export default function PlaylistManager() {
   }, [userContext?.linked, connectionId]);
 
   useEffect(() => {
-    if (!dashboardPlaylistId) return;
-    const stillAvailable = playlists.some((p) => p.id === dashboardPlaylistId);
-    if (!stillAvailable) setDashboardPlaylistId("");
-  }, [playlists, dashboardPlaylistId]);
-
-  useEffect(() => {
     if (!playlistId) {
       setPlaylist(null);
       setTracks([]);
+      setPlaylistLoading(false);
       return;
     }
     if (!workspaceBootstrapped || !playlists.some((p) => p.id === playlistId)) return;
     if (userContext?.linked) writeStoredSelection(userContext, { playlistId });
+    setPlaylist(null);
+    setTracks([]);
     loadSelectedPlaylist();
   }, [playlistId, workspaceBootstrapped, playlists]);
 
@@ -775,15 +839,39 @@ export default function PlaylistManager() {
   }
 
   async function loadSelectedPlaylist() {
+    const loadPlaylistId = playlistId;
+    const loadSeq = playlistLoadSeqRef.current + 1;
+    playlistLoadSeqRef.current = loadSeq;
+    setPlaylistLoading(true);
     return run("Tracks loaded", async () => {
-      const [detail, items] = await Promise.all([
-        api(`/api/playlists/get?playlist_id=${encodeURIComponent(playlistId)}`, { accessToken: accessToken() }),
-        api(`/api/playlist-items/list?playlist_row_id=${encodeURIComponent(playlistId)}`, { accessToken: accessToken() }),
+      let [detail, itemPayload] = await Promise.all([
+        api(`/api/playlists/get?playlist_id=${encodeURIComponent(loadPlaylistId)}`, { accessToken: accessToken() }),
+        api(`/api/playlist-items/list?playlist_row_id=${encodeURIComponent(loadPlaylistId)}&meta=1`, { accessToken: accessToken() }),
       ]);
+      let items = normalizePlaylistItems(Array.isArray(itemPayload) ? itemPayload : (itemPayload?.items || []));
+      let itemMeta = Array.isArray(itemPayload) ? null : itemPayload?.meta;
+      const expectedTracks = Number(detail?.tracks_total || 0);
+      const loadedTracks = Array.isArray(items) ? items.length : 0;
+      const looksPartial = !!itemMeta?.partial || (expectedTracks > 0 && loadedTracks > 0 && loadedTracks < Math.max(1, Math.floor(expectedTracks * 0.8)));
+      if ((!loadedTracks || looksPartial) && expectedTracks > 0) {
+        await api("/api/playlists/sync-items", {
+          method: "POST",
+          accessToken: accessToken(),
+          body: { playlist_row_id: loadPlaylistId, read_only: true },
+        }).catch(() => null);
+        [detail, itemPayload] = await Promise.all([
+          api(`/api/playlists/get?playlist_id=${encodeURIComponent(loadPlaylistId)}`, { accessToken: accessToken() }),
+          api(`/api/playlist-items/list?playlist_row_id=${encodeURIComponent(loadPlaylistId)}&meta=1&repair=0`, { accessToken: accessToken() }),
+        ]);
+        items = normalizePlaylistItems(Array.isArray(itemPayload) ? itemPayload : (itemPayload?.items || []));
+        itemMeta = Array.isArray(itemPayload) ? null : itemPayload?.meta;
+      }
+      assertCompletePlaylistItems(items, itemMeta);
       const [settings, slots] = await Promise.all([
-        api(`/api/flex/settings/get?playlist_id=${encodeURIComponent(playlistId)}`, { accessToken: accessToken() }).catch(() => null),
-        api(`/api/flex/slots/list?playlist_id=${encodeURIComponent(playlistId)}`, { accessToken: accessToken() }).catch(() => []),
+        api(`/api/flex/settings/get?playlist_id=${encodeURIComponent(loadPlaylistId)}`, { accessToken: accessToken() }).catch(() => null),
+        api(`/api/flex/slots/list?playlist_id=${encodeURIComponent(loadPlaylistId)}`, { accessToken: accessToken() }).catch(() => []),
       ]);
+      if (playlistLoadSeqRef.current !== loadSeq || selectedPlaylistIdRef.current !== loadPlaylistId) return { detail, items, stale: true };
       setPlaylist(detail);
       setAutoWeeks(detail?.auto_remove_weeks ? String(detail.auto_remove_weeks) : "4");
       setTracks(items);
@@ -800,14 +888,9 @@ export default function PlaylistManager() {
       setFlexMaxPopularity(settings?.max_popularity ?? "");
       setFlexMaxReleaseAgeWeeks(settings?.max_release_age_weeks ?? "");
       await Promise.all([loadBackups(), loadFlexHistory()]);
-      if (!items.length && Number(detail?.tracks_total || 0) > 0) {
-        api("/api/playlists/sync-items", {
-          method: "POST",
-          accessToken: accessToken(),
-          body: { playlist_row_id: playlistId },
-        }).then(() => loadSelectedPlaylist()).catch(() => {});
-      }
       return { detail, items };
+    }).finally(() => {
+      if (playlistLoadSeqRef.current === loadSeq && playlistId === loadPlaylistId) setPlaylistLoading(false);
     });
   }
 
@@ -823,6 +906,31 @@ export default function PlaylistManager() {
     const rows = await api(`/api/backups/list?playlist_id=${encodeURIComponent(playlistId)}&limit=8`, { accessToken: accessToken() });
     setBackups(Array.isArray(rows) ? rows : []);
     return rows;
+  }
+
+  function normalizePlaylistItems(items = []) {
+    return [...(Array.isArray(items) ? items : [])]
+      .filter((item) => Number.isFinite(Number(item?.position)))
+      .sort((a, b) => Number(a.position) - Number(b.position));
+  }
+
+  function assertCompletePlaylistItems(items, meta, playlistLabel = "Playlist") {
+    const expected = Number(meta?.expected_tracks || 0);
+    const loaded = Array.isArray(items) ? items.length : 0;
+    const partial = !!meta?.partial || (expected > 0 && loaded > 0 && loaded < Math.max(1, Math.floor(expected * 0.8)));
+    if (partial) {
+      throw new Error(`${playlistLabel} sync incomplete: loaded ${formatNumber(loaded)} of ${formatNumber(expected)} tracks. Please try again in a moment.`);
+    }
+  }
+
+  async function fetchPlaylistItemsSafe(targetPlaylistId, { repair = true } = {}) {
+    const qs = new URLSearchParams({ playlist_row_id: targetPlaylistId, meta: "1" });
+    if (!repair) qs.set("repair", "0");
+    const payload = await api(`/api/playlist-items/list?${qs.toString()}`, { accessToken: accessToken() });
+    const items = normalizePlaylistItems(Array.isArray(payload) ? payload : (payload?.items || []));
+    const meta = Array.isArray(payload) ? null : payload?.meta;
+    assertCompletePlaylistItems(items, meta);
+    return { items, meta };
   }
 
   async function openBackupDetails(backup) {
@@ -912,11 +1020,13 @@ export default function PlaylistManager() {
   }
 
   async function reconcileTracksAndFlex() {
-    if (!playlistId) return;
-    const [items, slots] = await Promise.all([
-      api(`/api/playlist-items/list?playlist_row_id=${encodeURIComponent(playlistId)}`, { accessToken: accessToken() }),
-      api(`/api/flex/slots/list?playlist_id=${encodeURIComponent(playlistId)}`, { accessToken: accessToken() }).catch(() => []),
+    const targetPlaylistId = selectedPlaylistIdRef.current || playlistId;
+    if (!targetPlaylistId) return;
+    const [{ items }, slots] = await Promise.all([
+      fetchPlaylistItemsSafe(targetPlaylistId),
+      api(`/api/flex/slots/list?playlist_id=${encodeURIComponent(targetPlaylistId)}`, { accessToken: accessToken() }).catch(() => []),
     ]);
+    if (selectedPlaylistIdRef.current !== targetPlaylistId) return;
     setTracks(items);
     setFlexSlots(Array.isArray(slots) ? slots : []);
   }
@@ -1127,24 +1237,40 @@ export default function PlaylistManager() {
     return run("Dashboard loaded", async () => {
       const customStart = dashboardRange === "custom" && dashboardStartDate ? new Date(`${dashboardStartDate}T00:00:00`) : null;
       const customEnd = dashboardRange === "custom" && dashboardEndDate ? new Date(`${dashboardEndDate}T00:00:00`) : new Date();
+      const now = new Date();
+      const yearStart = new Date(now.getFullYear(), 0, 1);
       const customDays = customStart && !Number.isNaN(customStart.getTime())
         ? Math.max(1, Math.ceil((customEnd.getTime() - customStart.getTime()) / (24 * 3600 * 1000)))
         : null;
-      const rangeDays = customDays || (dashboardRange === "year" ? 365 : dashboardRange === "week" ? 7 : 30);
-      const granularity = dashboardGranularity || (dashboardRange === "year" ? "monthly" : "daily");
+      const yearDays = Math.max(1, Math.ceil((now.getTime() - yearStart.getTime()) / (24 * 3600 * 1000)) + 1);
+      const rangeDays = customDays || (dashboardRange === "year" ? yearDays : dashboardRange === "week" ? 7 : 30);
+      const granularity = dashboardRange === "year" ? "monthly" : (dashboardGranularity || "daily");
       const seriesQs = new URLSearchParams({
         days: String(rangeDays),
         granularity,
         scope: "total",
       });
+      const summaryQs = new URLSearchParams({
+        days: String(rangeDays),
+        removals_limit: "12",
+      });
+      if (dashboardRange === "year") {
+        seriesQs.set("from", `${now.getFullYear()}-01-01`);
+        seriesQs.set("to", now.toISOString().slice(0, 10));
+        summaryQs.set("from", `${now.getFullYear()}-01-01`);
+        summaryQs.set("to", now.toISOString().slice(0, 10));
+      }
       if (dashboardRange === "custom") {
         if (dashboardStartDate) seriesQs.set("from", dashboardStartDate);
         if (dashboardEndDate) seriesQs.set("to", dashboardEndDate);
+        if (dashboardStartDate) summaryQs.set("from", dashboardStartDate);
+        if (dashboardEndDate) summaryQs.set("to", dashboardEndDate);
       }
       if (dashboardConnectionId) seriesQs.set("connection_id", dashboardConnectionId);
       if (dashboardPlaylistId) seriesQs.set("playlist_id", dashboardPlaylistId);
+      if (dashboardConnectionId) summaryQs.set("connection_id", dashboardConnectionId);
       const [summary, series] = await Promise.all([
-        api(`/api/dashboard/summary?days=${rangeDays}&removals_limit=12`, { accessToken: accessToken() }),
+        api(`/api/dashboard/summary?${summaryQs.toString()}`, { accessToken: accessToken() }),
         api(`/api/dashboard/series?${seriesQs.toString()}`, { accessToken: accessToken() }),
       ]);
       setDashboardSummary(summary);
@@ -1751,39 +1877,38 @@ export default function PlaylistManager() {
             <button disabled={busy} onClick={loadDashboard}>Refresh</button>
           </div>
         </div>
-        <div className="metricGrid">
+        <div className="metricGrid metricGrid--primary">
           <article>
-            <span>Total Followers</span>
-            <strong>{formatNumber(dashboardSummary?.totals?.total_followers)}</strong>
+            <span className="metricLabel">Total Followers</span>
+            <strong className="metricValue">{formatNumber(dashboardSummary?.totals?.total_followers)}</strong>
+            <small className="metricMeta">{dashboardConnectionId ? "selected account" : "active portfolio"}</small>
           </article>
           <article>
-            <span>Selected Growth</span>
-            <strong>{growthReady ? formatNumber(dashboardSummary?.totals?.net_growth_last_days) : "Warming up"}</strong>
-            <small>{growthReady ? `${formatNumber(dashboardSummary?.totals?.growth_snapshot_days)} snapshot days` : "needs 2+ days"}</small>
+            <span className="metricLabel">Portfolio Growth</span>
+            <strong className="metricValue">{growthReady ? formatNumber(dashboardSummary?.totals?.net_growth_last_days) : "Warming up"}</strong>
+            <small className="metricMeta">{growthReady ? `${formatNumber(dashboardSummary?.totals?.growth_snapshot_days)} snapshot days` : "needs 2+ days"}</small>
           </article>
           <article>
-            <span>Playlists</span>
-            <strong>{formatNumber(dashboardSummary?.totals?.playlists_count)}</strong>
+            <span className="metricLabel">Tracked Playlists</span>
+            <strong className="metricValue">{formatNumber(dashboardSummary?.totals?.playlists_count)}</strong>
+            <small className="metricMeta">owned public lists</small>
           </article>
           <article>
-            <span>Upcoming Removals</span>
-            <strong>{formatNumber(dashboardSummary?.upcoming_removals?.length)}</strong>
-            <small>next 14 days</small>
+            <span className="metricLabel">Actions Soon</span>
+            <strong className="metricValue">{formatNumber((dashboardSummary?.upcoming_removals?.length || 0) + (dashboardSummary?.totals?.flex_due_count || 0))}</strong>
+            <small className="metricMeta">{formatNumber(dashboardSummary?.upcoming_removals?.length)} removals · {formatNumber(dashboardSummary?.totals?.flex_due_count)} rotations</small>
+          </article>
+        </div>
+        <div className="automationHealth">
+          <article>
+            <span>Automation Health</span>
+            <strong>{formatNumber(dashboardSummary?.totals?.automation_enabled_count)} expiry rules</strong>
+            <small>{formatNumber(dashboardSummary?.totals?.flex_enabled_count)} rotator slots · {formatNumber(dashboardSummary?.totals?.cooldown_count)} in safe edit</small>
           </article>
           <article>
-            <span>Auto-Remove Active</span>
-            <strong>{formatNumber(dashboardSummary?.totals?.automation_enabled_count)}</strong>
-            <small>{formatNumber(dashboardSummary?.totals?.cooldown_count)} on cooldown</small>
-          </article>
-          <article>
-            <span>Track Rotator</span>
-            <strong>{formatNumber(dashboardSummary?.totals?.flex_enabled_count)}</strong>
-            <small>{formatNumber(dashboardSummary?.totals?.flex_due_count)} due soon</small>
-          </article>
-          <article>
-            <span>Needs Fresh Check</span>
-            <strong>{formatNumber(dashboardSummary?.totals?.stale_count)}</strong>
-            <small>older than 24h</small>
+            <span>Data Freshness</span>
+            <strong>{formatNumber(dashboardSummary?.totals?.stale_count)} stale playlists</strong>
+            <small>{formatNumber(dashboardSummary?.totals?.growth_data_points)} growth snapshots in range</small>
           </article>
         </div>
         <div className="dashboardFocusGrid">
@@ -1791,9 +1916,14 @@ export default function PlaylistManager() {
             <div className="panelHeader">
               <div>
                 <h2>Growth Trend</h2>
-                <p>Total follower development for the selected scope</p>
+                <p>{dashboardPlaylistId ? "Follower development for the selected playlist" : "Follower development for the selected portfolio scope"}</p>
               </div>
               <div className="chartFilters">
+                <div className="modeToggle" aria-label="Growth display mode">
+                  <button className={dashboardGrowthMode === "followers" ? "active" : ""} onClick={() => setDashboardGrowthMode("followers")}>Followers</button>
+                  <button className={dashboardGrowthMode === "growth" ? "active" : ""} onClick={() => setDashboardGrowthMode("growth")}>Growth</button>
+                  <button className={dashboardGrowthMode === "cumulative" ? "active" : ""} onClick={() => setDashboardGrowthMode("cumulative")}>Cumulative</button>
+                </div>
                 <select value={dashboardConnectionId} onChange={(e) => {
                   setDashboardConnectionId(e.target.value);
                   setDashboardPlaylistId("");
@@ -1805,7 +1935,7 @@ export default function PlaylistManager() {
                 </select>
                 <select value={dashboardPlaylistId} onChange={(e) => setDashboardPlaylistId(e.target.value)} aria-label="Dashboard playlist">
                   <option value="">All playlists</option>
-                  {playlists.map((p) => (
+                  {dashboardPlaylistOptions.map((p) => (
                     <option key={p.id} value={p.id}>{p.name}</option>
                   ))}
                 </select>
@@ -1813,21 +1943,48 @@ export default function PlaylistManager() {
             </div>
             {growthReady ? (
               <>
+                <div className="chartStats">
+                  <article><span>Tracked</span><strong>{formatNumber(growthQuality.tracked_playlists || dashboardSeries?.eligible_playlists || 0)}</strong></article>
+                  <article><span>Warming up</span><strong>{formatNumber(growthQuality.limited_playlists || 0)}</strong></article>
+                  <article><span>No data yet</span><strong>{formatNumber(growthQuality.missing_playlists || 0)}</strong></article>
+                </div>
                 <GrowthChart
-                  values={dashboardSeries?.followers || dashboardSeries?.growth || []}
+                  values={dashboardChartData.values}
                   labels={dashboardSeries?.labels || []}
-                  growth={dashboardSeries?.growth || []}
+                  growth={dashboardChartData.growth}
                   granularity={dashboardSeries?.granularity || dashboardGranularity}
+                  valueLabel={dashboardChartData.label}
                 />
-                <div className="sparkLabels">
+                <div className="sparkLabels chartAxis">
                   <span>{dashboardSeries?.labels?.[0] ? formatShortDate(dashboardSeries.labels[0]) : ""}</span>
                   <strong>{formatDelta((dashboardSeries?.growth || []).reduce((sum, value) => sum + (Number(value) || 0), 0))}</strong>
                   <span>{dashboardSeries?.labels?.at?.(-1) ? formatShortDate(dashboardSeries.labels.at(-1)) : ""}</span>
                 </div>
+                <p className="chartCoverageNote">{growthQuality.note || "Trend uses playlists with enough snapshots in this range."}</p>
               </>
             ) : (
               <DashboardWarmup summary={dashboardSummary} series={dashboardSeries} onRefresh={refreshDashboardBaseline} busy={busy} />
             )}
+            {selectedDashboardPlaylist ? (
+              <aside className="playlistDetailDrawer">
+                <div>
+                  <Artwork src={selectedDashboardPlaylist.image} alt="" size="sm" />
+                  <span>
+                    <strong>{selectedDashboardPlaylist.name || "Untitled playlist"}</strong>
+                    <small>{formatNumber(selectedDashboardPlaylist.followers_now ?? selectedDashboardPlaylist.followers)} followers · {formatNumber(selectedDashboardPlaylist.tracks_total)} tracks</small>
+                  </span>
+                </div>
+                <section>
+                  <article><span>Growth</span><strong>{selectedDashboardPlaylist.has_growth_data ? formatDelta(selectedDashboardPlaylist.delta) : "warming"}</strong></article>
+                  <article><span>Relative</span><strong>{formatPercent(selectedDashboardPlaylist.percent_delta)}</strong></article>
+                  <article><span>Snapshots</span><strong>{formatNumber(selectedDashboardPlaylist.snapshot_days || 0)}</strong></article>
+                </section>
+                <button onClick={() => {
+                  setPlaylistId(dashboardPlaylistId);
+                  setView("manager");
+                }}>Open in Manager</button>
+              </aside>
+            ) : null}
           </section>
           <section className="dashboardPanel rankPanel">
             <div>
@@ -1852,7 +2009,7 @@ export default function PlaylistManager() {
           <section className="dashboardPanel topPlaylistsPanel">
             <div>
               <h2>Playlist Portfolio</h2>
-              <p>Largest playlists by current follower count</p>
+              <p>Largest playlists in the current account scope</p>
             </div>
             <div className="playlistTable">
               {(dashboardSummary?.top_playlists || []).map((item) => (
@@ -1879,7 +2036,10 @@ export default function PlaylistManager() {
                   <span>
                     <strong>{item.track_name || item.track_id || "Unknown track"}</strong>
                     <em>{item.artist_names || "Unknown artist"}</em>
-                    <small>{item.playlist_name || "Playlist"} · {formatShortDate(item.removes_on)} · pos {Number(item.position) + 1}</small>
+                    <small>
+                      {item.playlist_name || "Playlist"} · {formatShortDate(item.removes_on)}
+                      {Number.isFinite(Number(item.position)) ? ` · pos ${Number(item.position) + 1}` : ""}
+                    </small>
                   </span>
                 </div>
               ))}
@@ -1944,9 +2104,11 @@ export default function PlaylistManager() {
             <Artwork src={playlist?.image} alt="" size="xl" />
             <div>
               <h2>Selected Playlist</h2>
-              <h3>{playlist?.name || "No playlist selected"}</h3>
+              <h3>{playlistLoading && !playlist ? "Loading playlist..." : playlist?.name || "No playlist selected"}</h3>
               <p>
-                {formatNumber(playlist?.tracks_total)} Tracks · {formatNumber(playlist?.followers)} Followers
+                {playlistLoading && !playlist
+                  ? "Fetching playlist details and tracks from Spotify"
+                  : `${formatNumber(playlist?.tracks_total)} Tracks · ${formatNumber(playlist?.followers)} Followers`}
               </p>
             </div>
           </div>
@@ -2226,6 +2388,19 @@ export default function PlaylistManager() {
               />
             </div>
             <div className="trackList">
+              {playlistLoading ? (
+                <div className="trackLoadingState" role="status" aria-live="polite">
+                  <span><i className="miniSpinner" aria-hidden="true" />Loading tracks</span>
+                  {[0, 1, 2, 3, 4].map((item) => (
+                    <div className="trackSkeleton" key={item}>
+                      <i />
+                      <b />
+                      <span />
+                      <em />
+                    </div>
+                  ))}
+                </div>
+              ) : null}
               {filteredTracks.map((track) => {
                 const isFlexTrack = activeFlexTrackIds.has(track.track_id);
                 return (
@@ -2275,7 +2450,7 @@ export default function PlaylistManager() {
                       </small>
                     </div>
                     <div className="badges">
-                      {isFlexTrack ? <span className="flexBadge"><Shuffle aria-hidden="true" /> Rotator</span> : null}
+                      {isFlexTrack ? <span className="flexBadge">Rotator</span> : null}
                       {track.is_locked ? <span className="locked">Locked</span> : null}
                       {track.expiry_weeks ? <span className="expiry">{track.expiry_weeks}w</span> : null}
                     </div>
@@ -2322,6 +2497,12 @@ export default function PlaylistManager() {
                   </article>
                 );
               })}
+              {!playlistLoading && playlistId && !filteredTracks.length ? (
+                <div className="emptyTrackState">
+                  <strong>No tracks loaded yet</strong>
+                  <span>Refresh the playlist or wait for the Spotify sync to finish.</span>
+                </div>
+              ) : null}
             </div>
           </div>
         </section>
@@ -2649,6 +2830,10 @@ export default function PlaylistManager() {
         }
         @keyframes spin {
           to { transform: rotate(360deg); }
+        }
+        @keyframes shimmer {
+          0% { background-position: 120% 0; }
+          100% { background-position: -120% 0; }
         }
         .onboardingOverlay {
           position: fixed;
@@ -3257,6 +3442,9 @@ export default function PlaylistManager() {
           grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
           gap: 14px;
         }
+        .metricGrid--primary {
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+        }
         .metricGrid article,
         .dashboardPanel {
           border: 1px solid #2a303b;
@@ -3266,18 +3454,54 @@ export default function PlaylistManager() {
         }
         .metricGrid article {
           display: grid;
-          gap: 10px;
-          min-height: 128px;
-          align-content: space-between;
+          grid-template-rows: 20px minmax(38px, auto) 18px;
+          gap: 8px;
+          min-height: 132px;
+          align-content: center;
         }
-        .metricGrid span {
+        .metricLabel {
           color: #a6adba;
+          font-size: 12px;
           font-weight: 700;
+          line-height: 1.2;
+          text-transform: uppercase;
         }
-        .metricGrid strong {
+        .metricValue {
+          align-self: center;
           font-size: 30px;
+          line-height: 1.05;
+          letter-spacing: 0;
         }
-        .metricGrid small {
+        .metricMeta {
+          color: #7f8794;
+          font-size: 13px;
+          line-height: 1.25;
+        }
+        .automationHealth {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 14px;
+        }
+        .automationHealth article {
+          display: grid;
+          gap: 7px;
+          padding: 14px 16px;
+          border: 1px solid #252c37;
+          border-radius: 8px;
+          background: #12161d;
+        }
+        .automationHealth span {
+          color: #a6adba;
+          font-size: 12px;
+          font-weight: 800;
+          text-transform: uppercase;
+        }
+        .automationHealth strong {
+          font-size: 18px;
+          line-height: 1.2;
+        }
+        .automationHealth small {
+          color: #7f8794;
           font-size: 13px;
         }
         .dashboardFocusGrid {
@@ -3292,9 +3516,9 @@ export default function PlaylistManager() {
           gap: 14px;
         }
         .growthPanel {
-          min-height: 430px;
-          display: grid;
-          align-content: start;
+          min-height: 560px;
+          display: flex;
+          flex-direction: column;
           overflow: visible;
         }
         .panelHeader {
@@ -3306,17 +3530,66 @@ export default function PlaylistManager() {
         .chartFilters {
           justify-content: flex-end;
         }
+        .modeToggle {
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+          padding: 4px;
+          border: 1px solid #252c37;
+          border-radius: 8px;
+          background: #12161d;
+        }
+        .modeToggle button {
+          height: 32px;
+          padding: 0 10px;
+          border: 0;
+          background: transparent;
+          color: #a6adba;
+          font-size: 12px;
+          font-weight: 800;
+        }
+        .modeToggle button.active {
+          background: rgba(24, 224, 111, 0.12);
+          color: #18e06f;
+        }
         .chartFilters select:last-child {
           min-width: 220px;
           max-width: 320px;
         }
+        .chartStats {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 10px;
+          margin-top: 18px;
+        }
+        .chartStats article {
+          display: grid;
+          gap: 3px;
+          padding: 10px 12px;
+          border: 1px solid #252c37;
+          border-radius: 8px;
+          background: rgba(18, 22, 29, 0.72);
+        }
+        .chartStats span {
+          color: #a6adba;
+          font-size: 11px;
+          font-weight: 800;
+          text-transform: uppercase;
+        }
+        .chartStats strong {
+          color: #f4f6fb;
+          font-size: 18px;
+        }
         :global(.growthChart) {
           position: relative;
           width: 100%;
-          height: 310px;
-          margin-top: 18px;
-          padding: 2px 0 0;
+          height: clamp(260px, 30vw, 340px);
+          min-height: 260px;
+          margin-top: 14px;
+          padding: 0;
           overflow: visible;
+          border-radius: 8px;
+          background: rgba(18, 22, 29, 0.42);
         }
         :global(.growthChart) svg {
           display: block;
@@ -3361,10 +3634,10 @@ export default function PlaylistManager() {
         }
         :global(.chartTooltip) {
           position: absolute;
-          top: 8px;
+          top: 14px;
           z-index: 8;
-          min-width: 150px;
-          padding: 9px 10px;
+          min-width: 176px;
+          padding: 10px 12px;
           border: 1px solid rgba(24, 224, 111, 0.28);
           border-radius: 8px;
           background: rgba(15, 18, 23, 0.96);
@@ -3373,29 +3646,34 @@ export default function PlaylistManager() {
           pointer-events: none;
           transform: translateX(-50%);
           backdrop-filter: blur(8px);
+          display: grid;
+          gap: 5px;
         }
         :global(.chartTooltip) strong,
         :global(.chartTooltip) span,
         :global(.chartTooltip) em {
           display: block;
-          line-height: 1.25;
+          line-height: 1.3;
           white-space: nowrap;
         }
         :global(.chartTooltip) strong {
-          font-size: 12px;
+          font-size: 13px;
           color: #f4f6fb;
         }
         :global(.chartTooltip) span {
-          margin-top: 4px;
           color: #a6adba;
           font-size: 12px;
         }
         :global(.chartTooltip) em {
-          margin-top: 4px;
           color: #18e06f;
           font-size: 13px;
           font-style: normal;
+          font-weight: 700;
+        }
+        :global(.chartTooltip) em b {
+          color: #18e06f;
           font-weight: 900;
+          margin-right: 5px;
         }
         :global(.growthChart--empty) {
           display: grid;
@@ -3460,7 +3738,9 @@ export default function PlaylistManager() {
           justify-content: space-between;
           color: #a6adba;
           font-size: 13px;
-          margin-top: 8px;
+          margin-top: 14px;
+          padding-top: 10px;
+          border-top: 1px solid rgba(166, 173, 186, 0.12);
         }
         .sparkLabels strong {
           color: #18e06f;
@@ -3469,9 +3749,73 @@ export default function PlaylistManager() {
         .sparkLabels span:last-child {
           text-align: right;
         }
+        .chartCoverageNote {
+          margin-top: 10px;
+          color: #7f8794;
+          font-size: 12px;
+          line-height: 1.4;
+        }
+        .playlistDetailDrawer {
+          display: grid;
+          gap: 14px;
+          margin-top: 16px;
+          padding: 14px;
+          border: 1px solid rgba(24, 224, 111, 0.24);
+          border-radius: 8px;
+          background: rgba(18, 22, 29, 0.78);
+        }
+        .playlistDetailDrawer > div {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          min-width: 0;
+        }
+        .playlistDetailDrawer > div span {
+          display: grid;
+          gap: 3px;
+          min-width: 0;
+        }
+        .playlistDetailDrawer strong,
+        .playlistDetailDrawer small {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .playlistDetailDrawer small {
+          color: #a6adba;
+          font-size: 12px;
+        }
+        .playlistDetailDrawer section {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 8px;
+        }
+        .playlistDetailDrawer article {
+          display: grid;
+          gap: 3px;
+          padding: 10px;
+          border: 1px solid #252c37;
+          border-radius: 8px;
+          background: #101318;
+        }
+        .playlistDetailDrawer article span {
+          color: #a6adba;
+          font-size: 11px;
+          font-weight: 800;
+          text-transform: uppercase;
+        }
+        .playlistDetailDrawer article strong {
+          color: #f4f6fb;
+          font-size: 16px;
+        }
+        .playlistDetailDrawer button {
+          justify-self: start;
+        }
         .rankPanel {
-          min-height: 0;
-          align-self: start;
+          min-height: 560px;
+          align-self: stretch;
+          display: grid;
+          grid-template-rows: auto minmax(390px, 1fr) auto;
         }
         .topPlaylistsPanel,
         .removalsPanel {
@@ -3481,10 +3825,12 @@ export default function PlaylistManager() {
           display: grid;
           gap: 10px;
           margin-top: 14px;
+          min-height: 390px;
+          align-content: start;
         }
         :global(.growthBar) {
           display: grid;
-          grid-template-columns: 24px 44px minmax(0, 1fr);
+          grid-template-columns: 24px 44px minmax(0, 1fr) auto;
           align-items: center;
           gap: 11px;
           width: 100%;
@@ -3496,6 +3842,10 @@ export default function PlaylistManager() {
           color: #f4f6fb;
           text-align: left;
           min-width: 0;
+        }
+        :global(.growthBar--empty) {
+          visibility: hidden;
+          pointer-events: none;
         }
         :global(.growthBar):hover,
         :global(.growthBar):focus-visible,
@@ -3520,27 +3870,49 @@ export default function PlaylistManager() {
           width: 44px;
           height: 44px;
         }
-        :global(.growthBar) div {
+        :global(.growthBarCopy) {
+          display: grid;
+          gap: 4px;
           min-width: 0;
         }
-        :global(.growthBar) strong,
-        :global(.growthBar) span {
+        :global(.growthBarCopy) strong,
+        :global(.growthBarCopy) span {
           display: block;
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
         }
+        :global(.growthBarCopy) span {
+          font-size: 12px;
+          line-height: 1.25;
+        }
         :global(.growthBar) b {
-          color: #18e06f;
           font-size: 14px;
         }
-        :global(.growthSignal) {
-          grid-column: 3;
-          display: grid;
-          grid-template-columns: auto minmax(0, 1fr);
+        :global(.growthDelta) {
+          justify-self: end;
+          display: inline-flex;
           align-items: center;
-          gap: 10px;
-          min-width: 0;
+          min-width: 64px;
+          justify-content: center;
+          padding: 7px 9px;
+          border-radius: 999px;
+          border: 1px solid rgba(24, 224, 111, 0.42);
+          background: rgba(24, 224, 111, 0.08);
+          color: #18e06f;
+          white-space: nowrap;
+        }
+        :global(.growthDelta.negative) {
+          border-color: rgba(255, 77, 77, 0.48);
+          background: rgba(255, 77, 77, 0.08);
+          color: #ff6464;
+        }
+        :global(.growthDelta.muted) {
+          min-width: 74px;
+          border-color: rgba(166, 173, 186, 0.28);
+          background: rgba(166, 173, 186, 0.08);
+          color: #a6adba;
+          font-size: 12px;
         }
         :global(.barTrack) {
           height: 6px;
@@ -4307,6 +4679,63 @@ export default function PlaylistManager() {
           align-content: start;
           min-height: 0;
         }
+        .trackLoadingState {
+          display: grid;
+          gap: 10px;
+          padding: 16px;
+          border-top: 1px solid #202630;
+          background: rgba(18, 22, 29, 0.72);
+        }
+        .trackLoadingState > span {
+          display: inline-flex;
+          align-items: center;
+          gap: 9px;
+          color: #18e06f;
+          font-size: 13px;
+          font-weight: 900;
+        }
+        .trackSkeleton {
+          display: grid;
+          grid-template-columns: 28px 52px minmax(0, 1fr) 156px;
+          align-items: center;
+          gap: 12px;
+          min-height: 64px;
+          padding: 8px 0;
+        }
+        .trackSkeleton i,
+        .trackSkeleton b,
+        .trackSkeleton span,
+        .trackSkeleton em {
+          display: block;
+          border-radius: 8px;
+          background: linear-gradient(90deg, #232a35 0%, #303846 48%, #232a35 100%);
+          background-size: 220% 100%;
+          animation: shimmer 1.05s linear infinite;
+        }
+        .trackSkeleton i {
+          height: 16px;
+          border-radius: 999px;
+        }
+        .trackSkeleton b {
+          width: 52px;
+          height: 52px;
+        }
+        .trackSkeleton span {
+          height: 18px;
+        }
+        .trackSkeleton em {
+          height: 32px;
+        }
+        .emptyTrackState {
+          display: grid;
+          gap: 6px;
+          padding: 28px 18px;
+          border-top: 1px solid #202630;
+          color: #a6adba;
+        }
+        .emptyTrackState strong {
+          color: #f4f6fb;
+        }
         .trackRow {
           position: relative;
           display: grid;
@@ -4399,44 +4828,26 @@ export default function PlaylistManager() {
           justify-content: flex-end;
         }
         .badges span {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          min-width: 62px;
+          height: 24px;
           border-radius: 999px;
-          padding: 4px 8px;
+          padding: 0 8px;
           font-size: 12px;
           font-weight: 800;
+          line-height: 1;
         }
-        .locked {
+        .locked,
+        .flexBadge {
           color: #18e06f;
           background: rgba(24, 224, 111, 0.12);
+          border: 1px solid rgba(24, 224, 111, 0.35);
         }
         .expiry {
           color: #ffbd4a;
           background: rgba(255, 189, 74, 0.12);
-        }
-        .flexBadge {
-          display: inline-flex;
-          align-items: center;
-          gap: 5px;
-          color: #18e06f;
-          background: rgba(24, 224, 111, 0.18);
-          border: 1px solid rgba(24, 224, 111, 0.35);
-        }
-        .flexBadge svg {
-          width: 7px;
-          height: 7px;
-          stroke: currentColor;
-          stroke-width: 2;
-          stroke-linecap: round;
-          stroke-linejoin: round;
-          fill: none;
-        }
-        :global(.flexBadge svg) {
-          width: 7px;
-          height: 7px;
-          stroke: currentColor;
-          stroke-width: 2;
-          stroke-linecap: round;
-          stroke-linejoin: round;
-          fill: none;
         }
         .danger {
           border-color: #ff4d4d;
@@ -4612,6 +5023,8 @@ export default function PlaylistManager() {
             justify-content: flex-start;
           }
           .metricGrid,
+          .metricGrid--primary,
+          .automationHealth,
           .dashboardFocusGrid,
           .dashboardSplitGrid,
           .removalList {

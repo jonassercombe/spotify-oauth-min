@@ -15,7 +15,7 @@ jobs:
       group: ext-crons-daily
       cancel-in-progress: false
     env:
-      BASE_URL: "https://spotify-oauth-min-jonas-sercombes-projects.vercel.app"
+      BASE_URL: "https://playlist-pilot.com"
       CRON_SECRET: ${{ secrets.CRON_SECRET }}
     steps:
       - name: Check secret

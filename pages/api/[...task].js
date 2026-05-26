@@ -2,6 +2,7 @@
 export const config = { api: { bodyParser: false } };
 
 import Stripe from "stripe";
+import { randomUUID } from "crypto";
 
 /* ==============================
    Shared Utils (Server-only)
@@ -75,6 +76,193 @@ async function scopedPlaylistUpsert(batch) {
     headers: { Prefer: "resolution=merge-duplicates,return=representation" },
     body: JSON.stringify(rows),
   });
+}
+
+function workerId(prefix = "worker") {
+  return `${prefix}:${Date.now()}:${randomUUID()}`;
+}
+
+async function enqueueSyncJob({
+  job_type,
+  scope_type = "global",
+  scope_id = "",
+  playlist_id = null,
+  connection_id = null,
+  bubble_user_id = null,
+  priority = 50,
+  payload = {},
+  run_after = null,
+  max_attempts = 5,
+}) {
+  const row = {
+    job_type,
+    scope_type,
+    scope_id: String(scope_id || ""),
+    playlist_id,
+    connection_id,
+    bubble_user_id,
+    priority,
+    payload,
+    run_after: run_after || new Date().toISOString(),
+    max_attempts,
+    status: "pending",
+    updated_at: new Date().toISOString(),
+  };
+  const insert = await sb(`/rest/v1/sync_jobs`, {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify([row]),
+  });
+  if (insert.ok) {
+    const rows = await insert.json().catch(() => []);
+    return { ok: true, created: true, job: rows?.[0] || null };
+  }
+  const text = await insert.text().catch(() => "");
+  if (!/duplicate key|23505|sync_jobs_active_dedupe/i.test(text)) {
+    return { ok: false, error: text || "sync_job_insert_failed" };
+  }
+  const existing = await sb(
+    `/rest/v1/sync_jobs?select=id,attempts,status` +
+    `&job_type=eq.${encodeURIComponent(row.job_type)}` +
+    `&scope_type=eq.${encodeURIComponent(row.scope_type)}` +
+    `&scope_id=eq.${encodeURIComponent(row.scope_id)}` +
+    `&status=in.(pending,running)&limit=1`
+  );
+  const existingRows = existing.ok ? await existing.json().catch(() => []) : [];
+  const current = existingRows?.[0];
+  if (!current?.id || current.status === "running") {
+    return { ok: true, created: false, job: current || null };
+  }
+  const patch = await sb(`/rest/v1/sync_jobs?id=eq.${encodeURIComponent(current.id)}&status=eq.pending`, {
+    method: "PATCH",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({
+      priority: Math.max(Number(priority) || 50, Number(row.priority) || 50),
+      run_after: row.run_after,
+      payload,
+      playlist_id,
+      connection_id,
+      bubble_user_id,
+      updated_at: new Date().toISOString(),
+    }),
+  });
+  return { ok: patch.ok, created: false, job: patch.ok ? (await patch.json().catch(() => []))?.[0] : current };
+}
+
+async function acquireSyncLock(lock_key, { scope_type = "global", scope_id = "", owner = workerId("lock"), ttl_seconds = 900, metadata = {} } = {}) {
+  const nowIso = new Date().toISOString();
+  await sb(`/rest/v1/sync_locks?lock_key=eq.${encodeURIComponent(lock_key)}&expires_at=lt.${encodeURIComponent(nowIso)}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=minimal" },
+  }).catch(() => null);
+  const expires_at = new Date(Date.now() + ttl_seconds * 1000).toISOString();
+  const r = await sb(`/rest/v1/sync_locks`, {
+    method: "POST",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify([{ lock_key, scope_type, scope_id: String(scope_id || ""), owner, expires_at, metadata }]),
+  });
+  if (r.ok) return { ok: true, owner, expires_at };
+  return { ok: false, owner, expires_at, error: await r.text().catch(() => "lock_failed") };
+}
+
+async function releaseSyncLock(lock_key, owner) {
+  if (!lock_key || !owner) return;
+  await sb(`/rest/v1/sync_locks?lock_key=eq.${encodeURIComponent(lock_key)}&owner=eq.${encodeURIComponent(owner)}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=minimal" },
+  }).catch(() => null);
+}
+
+function syncJobLockKey(job) {
+  if (job?.playlist_id) return `playlist:${job.playlist_id}`;
+  if (job?.connection_id) return `connection:${job.connection_id}`;
+  return `${job?.scope_type || "global"}:${job?.scope_id || job?.job_type || "global"}`;
+}
+
+function internalRouteReq(req, { method = "POST", url = "/", query = {}, body = {} } = {}) {
+  return {
+    ...req,
+    method,
+    url,
+    query,
+    headers: {
+      ...(req.headers || {}),
+      "x-app-secret": process.env.APP_WEBHOOK_SECRET || "",
+      authorization: req.headers?.authorization || "",
+    },
+    body,
+  };
+}
+
+function captureRouteRes() {
+  const result = { code: 200, payload: null };
+  return {
+    result,
+    status(code) {
+      result.code = code;
+      return {
+        json(payload) {
+          result.payload = payload;
+          return payload;
+        },
+        end() {
+          result.payload = null;
+          return null;
+        },
+      };
+    },
+    setHeader() {},
+  };
+}
+
+async function executeSyncJob(job, req) {
+  const payload = job?.payload || {};
+  if (job.job_type === "connection_playlist_discovery") {
+    const rr = internalRouteReq(req, {
+      method: "POST",
+      url: "/api/playlists/sync?with_followers=1",
+      query: { with_followers: "1" },
+      body: { connection_id: job.connection_id || payload.connection_id },
+    });
+    const cr = captureRouteRes();
+    await routes["playlists/sync"](rr, cr);
+    if (cr.result.code >= 400) throw new Error(cr.result.payload?.error || `playlist_discovery_failed_${cr.result.code}`);
+    return cr.result.payload;
+  }
+  if (job.job_type === "connection_followers_refresh") {
+    const qs = {
+      stale_hours: String(payload.stale_hours || "6"),
+      max: String(payload.max || "120"),
+      concurrency: String(payload.concurrency || "2"),
+      batch: String(payload.batch || "100"),
+    };
+    const rr = internalRouteReq(req, {
+      method: "POST",
+      url: `/api/playlists/refresh-followers?stale_hours=${qs.stale_hours}&max=${qs.max}&concurrency=${qs.concurrency}&batch=${qs.batch}`,
+      query: qs,
+      body: { connection_id: job.connection_id || payload.connection_id },
+    });
+    const cr = captureRouteRes();
+    await routes["playlists/refresh-followers"](rr, cr);
+    if (cr.result.code >= 400) throw new Error(cr.result.payload?.error || `followers_refresh_failed_${cr.result.code}`);
+    return cr.result.payload;
+  }
+  if (job.job_type === "playlist_sync_items") {
+    const rr = internalRouteReq(req, {
+      method: "POST",
+      url: "/api/playlists/sync-items",
+      query: {},
+      body: {
+        playlist_row_id: job.playlist_id || payload.playlist_id || payload.playlist_row_id,
+        read_only: !!payload.read_only,
+      },
+    });
+    const cr = captureRouteRes();
+    await routes["playlists/sync-items"](rr, cr);
+    if (cr.result.code >= 400) throw new Error(cr.result.payload?.error || `playlist_sync_items_failed_${cr.result.code}`);
+    return cr.result.payload;
+  }
+  throw new Error(`unknown_job_type:${job.job_type}`);
 }
 
 function checkCronAuth(req) {
@@ -1127,9 +1315,10 @@ async function rotateFlexSlot(slot, settings) {
       updated_at: nowIso
     })
   });
-  await sb(`/rest/v1/playlist_flex_history`, {
+  let historySaved = false;
+  const historyR = await sb(`/rest/v1/playlist_flex_history`, {
     method: "POST",
-    headers: { Prefer: "return=minimal" },
+    headers: { Prefer: "return=representation" },
     body: JSON.stringify([{
       playlist_id: slot.playlist_id,
       slot_id: slot.id,
@@ -1140,7 +1329,13 @@ async function rotateFlexSlot(slot, settings) {
       source_playlist_id: refPlaylistId,
       rotated_at: nowIso
     }])
-  }).catch(() => {});
+  }).catch((e) => ({ ok: false, text: async () => String(e?.message || e) }));
+  if (historyR?.ok) {
+    historySaved = true;
+  } else {
+    const historyError = historyR?.text ? await historyR.text().catch(() => "") : "";
+    console.warn("rotateFlexSlot:history_insert_failed", historyError);
+  }
   await sb(`/rest/v1/playlist_flex_settings?playlist_id=eq.${encodeURIComponent(slot.playlist_id)}`, {
     method: "PATCH",
     headers: { Prefer: "return=minimal" },
@@ -1158,16 +1353,22 @@ async function rotateFlexSlot(slot, settings) {
     body: JSON.stringify({ needs_sync: true, next_check_at: cooldownUntil })
   }).catch(() => {});
 
-  const base = internalBaseUrl();
-  if (base) {
-    fetch(`${base}/api/playlists/dispatch-sync`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
-      body: JSON.stringify({ playlist_id: slot.playlist_id })
-    }).catch(() => {});
-  }
+  return { picked_track_id: picked.id, picked_track_name: picked.name || null, position: desired, cooldown_until: cooldownUntil, history_saved: historySaved };
+}
 
-  return { picked_track_id: picked.id, picked_track_name: picked.name || null, position: desired, cooldown_until: cooldownUntil };
+async function syncPlaylistItemsNow(playlistId) {
+  const base = internalBaseUrl();
+  if (!base || !playlistId) return null;
+  const r = await fetch(`${base}/api/playlists/sync-items`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+    body: JSON.stringify({ playlist_row_id: playlistId })
+  });
+  const text = await r.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+  if (!r.ok) throw new Error(`playlist_sync_failed:${r.status}:${text}`);
+  return data;
 }
 
 
@@ -1355,6 +1556,156 @@ const routes = {
     });
   },
 
+  /* ---------- sync/jobs/enqueue (POST) ---------- */
+  "sync/jobs/enqueue": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    if (!checkAppSecret(req) && !checkCronAuth(req)) return bad(res, 401, "unauthorized");
+    const body = await readBody(req);
+    const result = await enqueueSyncJob(body || {});
+    if (!result.ok) return bad(res, 500, result.error || "enqueue_failed");
+    return json(res, 200, result);
+  },
+
+  /* ---------- sync/jobs/run (GET/POST, Cron) ---------- */
+  "sync/jobs/run": async (req, res) => {
+    if (!checkCronAuth(req) && !checkAppSecret(req)) return bad(res, 401, "unauthorized_cron");
+    const limit = Math.max(1, Math.min(25, Number(req.query.limit || "8")));
+    const maxMs = Math.max(5000, Math.min(55000, Number(req.query.max_ms || "45000")));
+    const owner = workerId("sync-jobs");
+    const startedAt = Date.now();
+    const nowIso = new Date().toISOString();
+    const staleRunningBefore = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+
+    await sb(
+      `/rest/v1/sync_jobs?status=eq.running&locked_at=lt.${encodeURIComponent(staleRunningBefore)}`,
+      {
+        method: "PATCH",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({
+          status: "pending",
+          locked_at: null,
+          locked_by: null,
+          run_after: nowIso,
+          last_error: "worker_timeout_recovered",
+          updated_at: nowIso,
+        }),
+      }
+    ).catch(() => null);
+
+    await sb(
+      `/rest/v1/sync_locks?expires_at=lt.${encodeURIComponent(nowIso)}`,
+      { method: "DELETE", headers: { Prefer: "return=minimal" } }
+    ).catch(() => null);
+
+    const dueR = await sb(
+      `/rest/v1/sync_jobs?select=*` +
+      `&status=eq.pending` +
+      `&run_after=lte.${encodeURIComponent(nowIso)}` +
+      `&order=priority.desc,created_at.asc` +
+      `&limit=${encodeURIComponent(limit)}`
+    );
+    if (!dueR.ok) return bad(res, 500, `sync_jobs_select_failed:${await dueR.text()}`);
+    const due = await dueR.json().catch(() => []);
+    const results = [];
+
+    for (const candidate of due) {
+      if (Date.now() - startedAt > maxMs) break;
+      const attempts = Number(candidate.attempts || 0) + 1;
+      const claimR = await sb(`/rest/v1/sync_jobs?id=eq.${encodeURIComponent(candidate.id)}&status=eq.pending`, {
+        method: "PATCH",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify({
+          status: "running",
+          attempts,
+          locked_at: new Date().toISOString(),
+          locked_by: owner,
+          updated_at: new Date().toISOString(),
+        }),
+      });
+      if (!claimR.ok) {
+        results.push({ id: candidate.id, ok: false, skipped: true, reason: "claim_failed" });
+        continue;
+      }
+      const claimedRows = await claimR.json().catch(() => []);
+      const job = claimedRows?.[0];
+      if (!job) {
+        results.push({ id: candidate.id, ok: false, skipped: true, reason: "already_claimed" });
+        continue;
+      }
+
+      const lockKey = syncJobLockKey(job);
+      const lock = await acquireSyncLock(lockKey, {
+        scope_type: job.scope_type,
+        scope_id: job.scope_id,
+        owner,
+        ttl_seconds: Number(job.payload?.lock_ttl_seconds || 900),
+        metadata: { job_id: job.id, job_type: job.job_type },
+      });
+      if (!lock.ok) {
+        const retryAt = new Date(Date.now() + 30 * 1000).toISOString();
+        await sb(`/rest/v1/sync_jobs?id=eq.${encodeURIComponent(job.id)}`, {
+          method: "PATCH",
+          headers: { Prefer: "return=minimal" },
+          body: JSON.stringify({
+            status: "pending",
+            run_after: retryAt,
+            locked_at: null,
+            locked_by: null,
+            last_error: "lock_busy",
+            updated_at: new Date().toISOString(),
+          }),
+        }).catch(() => null);
+        results.push({ id: job.id, ok: false, skipped: true, reason: "lock_busy" });
+        continue;
+      }
+
+      try {
+        const output = await executeSyncJob(job, req);
+        await sb(`/rest/v1/sync_jobs?id=eq.${encodeURIComponent(job.id)}`, {
+          method: "PATCH",
+          headers: { Prefer: "return=minimal" },
+          body: JSON.stringify({
+            status: "done",
+            completed_at: new Date().toISOString(),
+            locked_at: null,
+            locked_by: null,
+            last_error: null,
+            updated_at: new Date().toISOString(),
+          }),
+        });
+        results.push({ id: job.id, type: job.job_type, ok: true, output });
+      } catch (e) {
+        const message = String(e?.message || e).slice(0, 1000);
+        const retryable = attempts < Number(job.max_attempts || 5);
+        const delaySec = Math.min(3600, 30 * Math.pow(2, Math.max(0, attempts - 1)));
+        await sb(`/rest/v1/sync_jobs?id=eq.${encodeURIComponent(job.id)}`, {
+          method: "PATCH",
+          headers: { Prefer: "return=minimal" },
+          body: JSON.stringify({
+            status: retryable ? "pending" : "failed",
+            run_after: retryable ? new Date(Date.now() + delaySec * 1000).toISOString() : job.run_after,
+            locked_at: null,
+            locked_by: null,
+            last_error: message,
+            updated_at: new Date().toISOString(),
+          }),
+        }).catch(() => null);
+        results.push({ id: job.id, type: job.job_type, ok: false, retryable, error: message });
+      } finally {
+        await releaseSyncLock(lockKey, owner);
+      }
+    }
+
+    return json(res, 200, {
+      ok: true,
+      worker: owner,
+      selected: due.length,
+      processed: results.length,
+      results,
+      elapsed_ms: Date.now() - startedAt,
+    });
+  },
+
   /* ---------- health/status (GET) ---------- */
   "health/status": async (req, res) => {
     if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
@@ -1372,6 +1723,10 @@ const routes = {
     const connections = connR.ok ? await connR.json() : [];
     const playlists = playlistR.ok ? await playlistR.json() : [];
     const flex = flexR?.ok ? await flexR.json() : [];
+    const jobsR = await sb(
+      `/rest/v1/sync_jobs?select=status,bubble_user_id&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}&status=in.(pending,running,failed)`
+    ).catch(() => null);
+    const jobs = jobsR?.ok ? await jobsR.json().catch(() => []) : [];
     return json(res, 200, {
       ok: true,
       checked_at: now.toISOString(),
@@ -1390,6 +1745,11 @@ const routes = {
       rotator: {
         enabled: flex.filter((f) => f.enabled).length,
         due: flex.filter((f) => f.enabled && (!f.next_rotation_at || new Date(f.next_rotation_at) <= now)).length,
+      },
+      jobs: {
+        pending: jobs.filter((j) => j.status === "pending").length,
+        running: jobs.filter((j) => j.status === "running").length,
+        failed: jobs.filter((j) => j.status === "failed").length,
       },
     });
   },
@@ -2728,28 +3088,38 @@ const routes = {
      const toFilter = /^\d{4}-\d{2}-\d{2}$/.test(toParam) ? `&day=lte.${encodeURIComponent(toParam)}` : "";
    
      let playlistFilter = "";
+     let currentPlaylists = [];
      if (playlist_id) {
        const plR = await fetch(
          SUPABASE_URL +
-           `/rest/v1/playlists?select=id,playlist_id&limit=1&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+           `/rest/v1/playlists?select=id,playlist_id,name,followers&limit=1&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
            `&id=eq.${encodeURIComponent(playlist_id)}`,
          { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" }
        );
        const selectedPlaylist = plR.ok ? JSON.parse(await plR.text() || "[]")?.[0] : null;
        if (!selectedPlaylist) return json(res, 200, { ok: true, granularity: gran, labels: [], followers: [], growth: [] });
+       currentPlaylists = [selectedPlaylist];
        playlistFilter = `&or=(playlist_id.eq.${encodeURIComponent(selectedPlaylist.id)},spotify_playlist_id.eq.${encodeURIComponent(selectedPlaylist.playlist_id || "")})`;
      } else if (connection_id) {
        const plR = await fetch(
          SUPABASE_URL +
-           `/rest/v1/playlists?select=id,playlist_id&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+           `/rest/v1/playlists?select=id,playlist_id,name,followers&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
            `&connection_id=eq.${encodeURIComponent(connection_id)}&is_owner=is.true&is_public=is.true`,
          { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" }
        );
-       const accountPlaylists = plR.ok ? JSON.parse(await plR.text() || "[]") : [];
-       const ids = accountPlaylists.map((p) => p.id).filter(Boolean);
+       currentPlaylists = plR.ok ? JSON.parse(await plR.text() || "[]") : [];
+       const ids = currentPlaylists.map((p) => p.id).filter(Boolean);
        if (!ids.length) return json(res, 200, { ok: true, granularity: gran, labels: [], followers: [], growth: [] });
-       const spotifyIds = accountPlaylists.map((p) => p.playlist_id).filter(Boolean);
+       const spotifyIds = currentPlaylists.map((p) => p.playlist_id).filter(Boolean);
        playlistFilter = `&or=(playlist_id.in.(${ids.map((id) => `"${id}"`).join(",")}),spotify_playlist_id.in.(${spotifyIds.map((id) => `"${id}"`).join(",")}))`;
+     } else {
+       const plR = await fetch(
+         SUPABASE_URL +
+           `/rest/v1/playlists?select=id,playlist_id,name,followers&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+           `&is_owner=is.true&is_public=is.true`,
+         { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" }
+       );
+       currentPlaylists = plR.ok ? JSON.parse(await plR.text() || "[]") : [];
      }
 
      const snapPath =
@@ -2782,25 +3152,61 @@ const routes = {
        return isoDay;
      };
    
-     // Aggregiere Followers TOTAL pro Bucket (Summe über Playlists),
-     // danach in Growth (Delta zum vorherigen Bucket) umrechnen
-     const agg = new Map(); // key -> { followersTotalByPlaylist?:Map, followersTotal }
+     const currentByStableId = new Map();
+     const currentStableByRowId = new Map();
+     for (const p of currentPlaylists) {
+       const stableKey = p.playlist_id || p.id;
+       if (stableKey) currentByStableId.set(stableKey, p);
+       if (p.id && stableKey) currentStableByRowId.set(p.id, stableKey);
+     }
+     const stableSnapshotKey = (row) =>
+       currentStableByRowId.get(row.playlist_id) ||
+       row.spotify_playlist_id ||
+       row.playlist_id;
+
+     const rowsByStablePlaylist = new Map();
      for (const r of rows) {
+       const stableKey = stableSnapshotKey(r);
+       if (!stableKey) continue;
+       let list = rowsByStablePlaylist.get(stableKey);
+       if (!list) { list = []; rowsByStablePlaylist.set(stableKey, list); }
+       list.push(r);
+     }
+     const trackedPlaylistIds = new Set();
+     const limitedPlaylistIds = new Set();
+     const missingPlaylistIds = new Set();
+     for (const [stableKey, list] of rowsByStablePlaylist) {
+       const daysWithData = new Set(list.map((row) => row.day).filter(Boolean));
+       if (daysWithData.size >= 2 || playlist_id) trackedPlaylistIds.add(stableKey);
+       else limitedPlaylistIds.add(stableKey);
+     }
+     for (const stableKey of currentByStableId.keys()) {
+       if (!rowsByStablePlaylist.has(stableKey)) missingPlaylistIds.add(stableKey);
+     }
+
+     const agg = new Map(); // key -> { byPl: Map, followersTotal }
+     for (const r of rows) {
+       const stableKey = stableSnapshotKey(r);
+       if (!trackedPlaylistIds.has(stableKey)) continue;
        const k = bucketKey(r.day);
        let o = agg.get(k);
        if (!o) { o = { followersTotal: 0, byPl: new Map() }; agg.set(k, o); }
        // wir nehmen den letzten Wert pro playlist_id im Bucket als "Stand"
-       o.byPl.set(r.spotify_playlist_id || r.playlist_id, r.followers);
-     }
-     // jetzt pro Bucket Summen bilden
-     for (const [, o] of agg) {
-       let sum = 0;
-       for (const v of o.byPl.values()) sum += v || 0;
-       o.followersTotal = sum;
+       o.byPl.set(stableKey, r.followers);
      }
    
      // sortierte Buckets
      const labels = Array.from(agg.keys()).sort();
+     const lastByPlaylist = new Map();
+     for (const label of labels) {
+       const o = agg.get(label);
+       for (const [pid, value] of o.byPl) lastByPlaylist.set(pid, value);
+       let sum = 0;
+       for (const pid of trackedPlaylistIds) {
+         if (lastByPlaylist.has(pid)) sum += Number(lastByPlaylist.get(pid) || 0);
+       }
+       o.followersTotal = sum;
+     }
      // Growth total:
      const growth = [];
      const followers = [];
@@ -2812,6 +3218,16 @@ const routes = {
      }
    
      if (scope === "total") {
+       const quality = {
+         mode: trackedPlaylistIds.size ? "tracked" : (rows.length ? "limited" : "empty"),
+         tracked_playlists: trackedPlaylistIds.size,
+         limited_playlists: limitedPlaylistIds.size,
+         missing_playlists: missingPlaylistIds.size,
+         current_playlists: currentPlaylists.length,
+         note: trackedPlaylistIds.size
+           ? "Trend uses playlists with enough snapshots in the selected range."
+           : "Not enough historical snapshots yet. Current playlist stats are still shown outside the trend.",
+       };
        return json(res, 200, {
          ok: true,
          granularity: gran,
@@ -2819,6 +3235,8 @@ const routes = {
          followers,
          growth,               // Delta followers pro Bucket (gesamt)
          data_points: rows.length,
+         eligible_playlists: trackedPlaylistIds.size,
+         quality,
          history_days: uniqueDays.size,
          ready: labels.length >= 2 && uniqueDays.size >= 2,
          warmup: labels.length < 2 || uniqueDays.size < 2,
@@ -2865,36 +3283,56 @@ const routes = {
 
   const days = Math.max(1, Math.min(365, Number(req.query.days || "7")));
   const removals_limit = Math.max(1, Math.min(500, Number(req.query.removals_limit || "50")));
+  const fromParam = String(req.query.from || "").slice(0, 10);
+  const toParam = String(req.query.to || "").slice(0, 10);
+  const connection_id = String(req.query.connection_id || "").trim();
+  const playlist_id = String(req.query.playlist_id || "").trim();
 
   // 1) aktuelle Playlists ziehen (für total followers + Namen)
-  const plistPath =
-    `/rest/v1/playlists?select=id,playlist_id,name,followers,image,tracks_total,connection_id,auto_remove_enabled,auto_remove_weeks,updated_at,last_checked_at,next_check_at` +
+  let plistPath =
+    `/rest/v1/playlists?select=id,playlist_id,name,followers,image,tracks_total,connection_id,auto_remove_enabled,auto_remove_weeks,updated_at,last_checked_at,next_check_at,followers_checked_at` +
     `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
     `&is_owner=is.true&is_public=is.true`;
+  if (connection_id) plistPath += `&connection_id=eq.${encodeURIComponent(connection_id)}`;
+  if (playlist_id) plistPath += `&id=eq.${encodeURIComponent(playlist_id)}`;
   const pResp = await fetch(SUPABASE_URL + plistPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
   const playlists = pResp.ok ? JSON.parse(await pResp.text() || "[]") : [];
+  const playlistIds = playlists.map((p) => p.id).filter(Boolean);
   const total_followers = playlists.reduce((a, p) => a + (p.followers || 0), 0);
 
   // 2) Growth über N Tage: minimaler/ maximaler Snapshot pro Playlist vergleichen
   const fromDay = new Date(Date.now() - days*24*3600*1000);
-  const fromStr = fromDay.toISOString().slice(0,10); // YYYY-MM-DD
+  const fromStr = /^\d{4}-\d{2}-\d{2}$/.test(fromParam) ? fromParam : fromDay.toISOString().slice(0,10); // YYYY-MM-DD
+  const toFilter = /^\d{4}-\d{2}-\d{2}$/.test(toParam) ? `&day=lte.${encodeURIComponent(toParam)}` : "";
 
   const snapPath =
     `/rest/v1/playlist_followers_daily` +
     `?select=playlist_id,spotify_playlist_id,day,followers` +
     `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
     `&day=gte.${encodeURIComponent(fromStr)}` +
+    toFilter +
+    (playlistIds.length ? `&playlist_id=in.(${playlistIds.map((id) => `"${id}"`).join(",")})` : `&playlist_id=eq.__none__`) +
     `&order=day.asc`;
   const sResp = await fetch(SUPABASE_URL + snapPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
   const snaps = sResp.ok ? JSON.parse(await sResp.text() || "[]") : [];
   const snapshotDays = new Set(snaps.map((row) => row.day).filter(Boolean));
 
-  // map: stable spotify_playlist_id -> {firstFollowers, lastFollowers}
+  const playlistStableByRowId = new Map();
+  for (const p of playlists) {
+    playlistStableByRowId.set(p.id, p.playlist_id || p.id);
+  }
+  const stableSnapshotKey = (row) =>
+    playlistStableByRowId.get(row.playlist_id) ||
+    row.spotify_playlist_id ||
+    row.playlist_id;
+
+  // map: stable spotify playlist id -> {firstFollowers, lastFollowers}
   const snapMap = new Map();
   for (const r of snaps) {
-    const stableKey = r.spotify_playlist_id || r.playlist_id;
+    const stableKey = stableSnapshotKey(r);
     let o = snapMap.get(stableKey);
-    if (!o) { o = { first: r.followers, last: r.followers }; snapMap.set(stableKey, o); }
+    if (!o) { o = { first: r.followers, last: r.followers, days: new Set() }; snapMap.set(stableKey, o); }
+    if (r.day) o.days.add(r.day);
     o.last = r.followers; // wegen day.asc ist die letzte Zeile am Ende
   }
 
@@ -2903,7 +3341,10 @@ const routes = {
   const growth_rank = [];
   for (const p of playlists) {
     const s = snapMap.get(p.playlist_id) || snapMap.get(p.id);
-    const delta = s ? (s.last - s.first) : 0;
+    const hasEnoughData = !!(s && s.days?.size >= 2);
+    const delta = hasEnoughData ? (s.last - s.first) : 0;
+    const firstFollowers = hasEnoughData ? Number(s.first || 0) : null;
+    const percent_delta = hasEnoughData && firstFollowers > 0 ? (delta / firstFollowers) * 100 : null;
     net_growth += delta;
     if (!top_growing || delta > top_growing.delta) {
       top_growing = { playlist_id: p.id, name: p.name, image: p.image, delta, followers_now: p.followers || 0 };
@@ -2913,6 +3354,9 @@ const routes = {
       name: p.name,
       image: p.image,
       delta,
+      percent_delta,
+      snapshot_days: s?.days?.size || 0,
+      has_growth_data: hasEnoughData,
       followers_now: p.followers || 0,
       tracks_total: p.tracks_total || 0,
     });
@@ -2932,7 +3376,6 @@ const routes = {
     }));
 
 	  // 3) kommende Auto-Removals
-	  const playlistIds = playlists.map((p) => p.id).filter(Boolean);
 	  const todayStr = new Date().toISOString().slice(0,10);
 	  const horizonStr = new Date(Date.now() + 14*24*3600*1000).toISOString().slice(0,10);
 	  let upcoming_removals = [];
@@ -2946,13 +3389,15 @@ const routes = {
 	      const rpcRows = JSON.parse(await rpcResp.text() || "[]");
 	      upcoming_removals = rpcRows.map((row) => {
 	        const daysUntil = Number(row.days_until_remove ?? row.days_until_removal);
+	        const rawPosition = row.position ?? row.track_position ?? row.playlist_position ?? row.position0 ?? row.pos;
+	        const position = Number(rawPosition);
 	        const removesOn = row.removes_on || row.remove_on || (Number.isFinite(daysUntil)
 	          ? new Date(Date.now() + Math.max(0, daysUntil) * 24*3600*1000).toISOString().slice(0,10)
 	          : null);
 	        return {
 	          playlist_id: row.playlist_id,
 	          playlist_name: row.playlist_name || row.name,
-	          position: row.position,
+	          position: Number.isFinite(position) ? position : null,
 	          track_id: row.track_id,
 	          track_name: row.track_name || row.title,
 	          artist_names: row.artist_names || row.artist,
@@ -2975,6 +3420,11 @@ const routes = {
 	      const uResp = await fetch(SUPABASE_URL + upcPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
 	      upcoming_removals = uResp.ok ? JSON.parse(await uResp.text() || "[]") : [];
 	    }
+	    upcoming_removals = upcoming_removals.map((row) => {
+	      const rawPosition = row.position ?? row.track_position ?? row.playlist_position ?? row.position0 ?? row.pos;
+	      const position = Number(rawPosition);
+	      return { ...row, position: Number.isFinite(position) ? position : null };
+	    });
 	    if (upcoming_removals.length) {
 	      const removalTrackIds = [...new Set(upcoming_removals.map((row) => row.track_id).filter(Boolean))];
 	      if (removalTrackIds.length) {
@@ -3556,19 +4006,27 @@ const routes = {
          }
        }
 
-       const base = internalBaseUrl();
-       await fetch(`${base}/api/playlists/dispatch-sync`, {
-         method: "POST",
-         headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
-         body: JSON.stringify({ playlist_id: row.id })
-       }).catch(() => {});
+       let syncResult = null;
+       try {
+         syncResult = await syncPlaylistItemsNow(row.id);
+       } catch (syncError) {
+         console.warn("playlist-items/add:sync_after_add_failed", String(syncError?.message || syncError));
+         const base = internalBaseUrl();
+         await fetch(`${base}/api/playlists/dispatch-sync`, {
+           method: "POST",
+           headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+           body: JSON.stringify({ playlist_id: row.id })
+         }).catch(() => {});
+       }
 
        return json(res, 200, {
          ok: true,
          added: trackUri,
          position_used: (wantPosition !== null && wantPosition !== undefined) ? wantPosition : "append",
          snapshot_id: addRes.json?.snapshot_id || null,
-         cooldown_until: cooldownUntil
+         cooldown_until: cooldownUntil,
+         synced: !!syncResult,
+         sync: syncResult
        });
      } catch (e) {
        return bad(res, 500, `add_track_exception: ${e && e.stack ? e.stack : String(e)}`);
@@ -4332,14 +4790,16 @@ const routes = {
     if (!bubbleUserId) return bad(res, 401, "not_authenticated");
 
     const owner = await sb(
-      `/rest/v1/playlists?select=id&limit=1` +
+      `/rest/v1/playlists?select=id,tracks_total,last_synced_at,sync_started_at&limit=1` +
       `&id=eq.${encodeURIComponent(playlist_row_id)}` +
       `&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`
     );
     const ownerRows = owner.ok ? await owner.json().catch(() => []) : [];
     if (!ownerRows?.[0]) return bad(res, 403, "playlist_not_owned");
 
-    const path =
+    const ownerRow = ownerRows[0];
+    const expectedTracks = Number(ownerRow?.tracks_total || 0);
+    const selectPath =
        `/rest/v1/playlist_items_ui` +
        `?select=playlist_id,position,track_id,track_name,artist_names,album_name,` +
        `duration_ms,duration_formatted,added_at,age_days,age_label,track_uri,` +
@@ -4347,14 +4807,55 @@ const routes = {
        `&playlist_id=eq.${encodeURIComponent(playlist_row_id)}` +
        `&order=position.asc`;
 
+    const fetchItems = async () => {
+      const r = await fetch(SUPABASE_URL + selectPath, {
+        headers: { apikey: SRK, Authorization: `Bearer ${SRK}` },
+        cache: "no-store"
+      });
+      const txt = await r.text();
+      if (!r.ok) throw new Error(`supabase_error:${r.status}:${txt}`);
+      return txt ? JSON.parse(txt) : [];
+    };
 
-    const r = await fetch(SUPABASE_URL + path, {
-      headers: { apikey: SRK, Authorization: `Bearer ${SRK}` },
-      cache: "no-store"
-    });
-    const txt = await r.text();
-    if (!r.ok) return json(res, 500, { error: "supabase_error", status: r.status, body: txt });
-    return json(res, 200, txt ? JSON.parse(txt) : []);
+    let items = await fetchItems();
+    const isPartial = () => {
+      const loadedTracks = Array.isArray(items) ? items.length : 0;
+      return expectedTracks > 0 && loadedTracks < Math.max(1, Math.floor(expectedTracks * 0.8));
+    };
+    let repaired = false;
+    let repairAttempted = false;
+    if (isPartial() && req.query.repair !== "0") {
+      repairAttempted = true;
+      try {
+        const base = internalBaseUrl();
+        const syncR = await fetch(`${base}/api/playlists/sync-items`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+          body: JSON.stringify({ playlist_row_id, read_only: true })
+        });
+        if (syncR.ok) {
+          const syncJson = await syncR.json().catch(() => null);
+          repaired = !!syncJson?.ok && !syncJson?.already_in_progress && !syncJson?.paused;
+        }
+      } catch (e) {
+        console.warn("playlist-items/list:repair_sync_failed", String(e?.message || e));
+      }
+      items = await fetchItems();
+    }
+    const partial = isPartial();
+    if (req.query.meta === "1") {
+      return json(res, 200, {
+        items,
+        meta: {
+          expected_tracks: expectedTracks,
+          loaded_tracks: Array.isArray(items) ? items.length : 0,
+          partial,
+          repair_attempted: repairAttempted,
+          repaired
+        }
+      });
+    }
+    return json(res, 200, items);
   },
 
   /* ---------- playlists/list (GET) ---------- */
@@ -4498,17 +4999,17 @@ const routes = {
    
        // 4) Pro Playlist frischen Wert holen (sequentiell + Backoff, robust)
        const nowIso = new Date().toISOString();
-       const freshResults = []; // { row, followers }
+      const freshResults = []; // { row, followers }
    
        for (const row of playlistsToUpdate) {
          const id = row.playlist_id;
-         let followers = null, ok = false, attempt = 0;
+        let playlistMeta = null, followers = null, ok = false, attempt = 0;
    
          while (attempt < 8) {
-           const r = await fetch(
-             `https://api.spotify.com/v1/playlists/${encodeURIComponent(id)}?fields=followers(total)`,
-             { headers: { Authorization: `Bearer ${access_token}` } }
-           );
+          const r = await fetch(
+            `https://api.spotify.com/v1/playlists/${encodeURIComponent(id)}?fields=name,description,images(url),followers(total),tracks(total),snapshot_id,public`,
+            { headers: { Authorization: `Bearer ${access_token}` } }
+          );
            if (r.status === 429) {
              const ra = Number(r.headers.get("retry-after") || "1");
              const wait = Math.min(60, Math.max(1, ra) * Math.pow(2, attempt)) + Math.random()*0.5;
@@ -4526,10 +5027,11 @@ const routes = {
              }).catch(()=>{});
              break;
            }
-           followers = json?.followers?.total ?? null;
-           ok = typeof followers === "number";
-           break;
-         }
+          playlistMeta = json || null;
+          followers = json?.followers?.total ?? null;
+          ok = typeof followers === "number";
+          break;
+        }
    
          if (ok) {
            console.log("followers:fresh", {
@@ -4542,12 +5044,19 @@ const routes = {
            const patch = await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(row.id)}`, {
              method: "PATCH",
              headers: { Prefer: "return=minimal" },
-             body: JSON.stringify({
-               followers,
-               followers_checked_at: nowIso,
-               updated_at: nowIso
-             })
-           });
+           body: JSON.stringify({
+              name: playlistMeta?.name || null,
+              description: playlistMeta?.description || null,
+              image: playlistMeta?.images?.[0]?.url || null,
+              followers,
+              followers_checked_at: nowIso,
+              is_public: typeof playlistMeta?.public === "boolean" ? playlistMeta.public : row.is_public,
+              tracks_total: playlistMeta?.tracks?.total ?? row.tracks_total ?? null,
+              snapshot_id: playlistMeta?.snapshot_id || row.snapshot_id || null,
+              last_checked_at: nowIso,
+              updated_at: nowIso
+            })
+          });
            if (!patch.ok) return bad(res, 500, `supabase playlists patch failed: ${await patch.text()}`);
    
            freshResults.push({ row, followers });
@@ -4653,6 +5162,7 @@ const routes = {
    
      const bodyRaw = await readBody(req);
      let { playlist_row_id, spotify_playlist_id, connection_id } = bodyRaw;
+     const readOnlySync = bodyRaw?.read_only === true || bodyRaw?.read_only === "1" || bodyRaw?.mode === "read";
    
      const timeLabel = `sync-items:${playlist_row_id || spotify_playlist_id || "unknown"}`;
      console.time(timeLabel);
@@ -4662,6 +5172,7 @@ const routes = {
        spotify_playlist_id,
        ts: new Date().toISOString(),
        vercel_url: process.env.VERCEL_URL || null,
+       read_only: readOnlySync,
      });
    
      const chunk = (arr, n) => { const out=[]; for (let i=0;i<arr.length;i+=n) out.push(arr.slice(i,i+n)); return out; };
@@ -4897,8 +5408,11 @@ const routes = {
        const liveCooldownRows = liveCooldownR?.ok ? await liveCooldownR.json().catch(() => []) : [];
        const liveCooldownUntil = liveCooldownRows?.[0]?.next_check_at ? new Date(liveCooldownRows[0].next_check_at) : null;
        const automationOnCooldown = !!(liveCooldownUntil && liveCooldownUntil > new Date());
-       const USER_ALLOW_AUTO = !automationOnCooldown && uf.auto_remove_enabled !== false;
-       const USER_ALLOW_LOCKS = !automationOnCooldown && uf.position_lock_enabled !== false;
+       const USER_ALLOW_AUTO = !readOnlySync && !automationOnCooldown && uf.auto_remove_enabled !== false;
+       const USER_ALLOW_LOCKS = !readOnlySync && !automationOnCooldown && uf.position_lock_enabled !== false;
+       if (readOnlySync) {
+         console.log("sync-items:read_only_no_automation", { playlist_row_id: p.id });
+       }
        if (automationOnCooldown && !playlistOnCooldown) {
          console.log("sync-items:automation_skipped_live_playlist_cooldown", {
            playlist_row_id: p.id,
@@ -5373,6 +5887,28 @@ const routes = {
       upserts += batch.length;
     }
 
+    if (withFollowers && syncedRows.length) {
+      const today = new Date().toISOString().slice(0, 10);
+      const dailyRows = syncedRows
+        .filter((p) => p?.id && Number.isFinite(Number(p.followers)))
+        .map((p) => ({
+          playlist_id: p.id,
+          spotify_playlist_id: p.playlist_id || null,
+          bubble_user_id: p.bubble_user_id || conn.bubble_user_id || null,
+          connection_id: conn.id,
+          day: today,
+          followers: Number(p.followers || 0)
+        }));
+      for (const batch of chunk(dailyRows, 100)) {
+        const daily = await sb(`/rest/v1/playlist_followers_daily?on_conflict=playlist_id,day`, {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify(batch)
+        });
+        if (!daily.ok) console.warn("playlists/sync:daily_snapshot_failed", await daily.text().catch(() => ""));
+      }
+    }
+
     const initialItems = String(req.query.with_items || "0") === "1";
     let itemSyncDispatched = 0;
     if (initialItems && syncedRows.length) {
@@ -5757,48 +6293,76 @@ const routes = {
      const maxTotal   = Number(qp.get("max") || "600");
      const conc       = Number(qp.get("concurrency") || "3");
      const perWrite   = Number(qp.get("batch") || "100");
+     const discoverPlaylists = qp.get("discover") !== "0";
+     const forceDiscovery = qp.get("force_discovery") === "1";
    
      const bucketOverride = qp.get("bucket");
-     const nowUtcMin = new Date().getUTCMinutes();
+     const now = new Date();
+     const nowUtcMin = now.getUTCMinutes();
      const bucket = bucketOverride !== null ? Number(bucketOverride) : nowUtcMin;
+     const discoverySlot = (now.getUTCHours() % 5) * 12 + Math.floor(nowUtcMin / 5);
+     const shouldDiscoverPlaylists = discoverPlaylists && (forceDiscovery || bucket === discoverySlot);
    
      // Nur aktive Connections im aktuellen Bucket
      const conns = await sb(
        `/rest/v1/spotify_connections?select=id&is_active=is.true&cron_bucket=eq.${encodeURIComponent(bucket)}`
      ).then(r => r.json());
    
-     let ok=0, fail=0;
+     let ok=0, fail=0, discovered=0, discoveryFail=0;
      for (const c of conns) {
-       // interner Aufruf deiner bestehenden Subroute (mit Secret-Header)
-       const reqOne = {
-         ...req,
-         method: "POST",
-         headers: { ...req.headers, "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
-         // Query-Params an Subroute durchreichen
-         url: `/api/playlists/refresh-followers?stale_hours=${encodeURIComponent(String(staleHours))}` +
-              `&max=${encodeURIComponent(String(maxTotal))}` +
-              `&concurrency=${encodeURIComponent(String(conc))}` +
-              `&batch=${encodeURIComponent(String(perWrite))}`,
-         query: {
-           stale_hours: String(staleHours),
-           max: String(maxTotal),
-           concurrency: String(conc),
-           batch: String(perWrite)
-         },
-         body: { connection_id: c.id }
-       };
-   
-       const dummyRes = { status: () => ({ json: () => {} }) };
-       try {
-         const r = await routes["playlists/refresh-followers"](reqOne, dummyRes);
-         r?.ok ? ok++ : fail++;
-       } catch {
-         fail++;
+       if (shouldDiscoverPlaylists) {
+         const enqDiscovery = await enqueueSyncJob({
+           job_type: "connection_playlist_discovery",
+           scope_type: "connection",
+           scope_id: c.id,
+           connection_id: c.id,
+           priority: 70,
+           payload: { connection_id: c.id },
+           max_attempts: 4,
+         });
+         enqDiscovery.ok ? discovered++ : discoveryFail++;
        }
+
+       const enqFollowers = await enqueueSyncJob({
+         job_type: "connection_followers_refresh",
+         scope_type: "connection",
+         scope_id: c.id,
+         connection_id: c.id,
+         priority: 50,
+         payload: {
+           connection_id: c.id,
+           stale_hours: staleHours,
+           max: maxTotal,
+           concurrency: conc,
+           batch: perWrite,
+         },
+         max_attempts: 5,
+       });
+       enqFollowers.ok ? ok++ : fail++;
        await sleep(60); // leichter Jitter zwischen Connections
      }
+
+     const runnerReq = {
+       ...req,
+       method: "POST",
+       headers: { ...(req.headers || {}), "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+       url: `/api/sync/jobs/run?limit=8&max_ms=45000`,
+       query: { limit: "8", max_ms: "45000" },
+       body: {}
+     };
+     const runnerRes = captureRouteRes();
+     await routes["sync/jobs/run"](runnerReq, runnerRes).catch((e) => {
+       console.warn("followers:job_runner_failed", String(e?.message || e));
+     });
    
-     return json(res, 200, { ok:true, bucket, connections: conns.length, dispatched_ok: ok, dispatched_fail: fail });
+     return json(res, 200, {
+       ok:true,
+       bucket,
+       connections: conns.length,
+       enqueued_followers_ok: ok,
+       enqueued_followers_fail: fail,
+       discovery: { attempted: shouldDiscoverPlaylists, ok: discovered, fail: discoveryFail }
+     });
    },
 
    /* ---------- followers/cron-refresh-6h (GET/POST) ---------- */
@@ -6609,7 +7173,29 @@ const routes = {
       await sleep(250);
     }
     const okCount = results.filter(r => r.ok).length;
-    return json(res, okCount ? 200 : 500, { ok: !!okCount, rotated: okCount, failed: results.length - okCount, results });
+    let syncResult = null;
+    if (okCount) {
+      const syncPlaylistId = slots.find((slot) => slot?.playlist_id)?.playlist_id || playlist_id;
+      try {
+        syncResult = await syncPlaylistItemsNow(syncPlaylistId);
+      } catch (syncError) {
+        console.warn("flex/rotate:sync_after_rotate_failed", String(syncError?.message || syncError));
+        const base = internalBaseUrl();
+        await fetch(`${base}/api/playlists/dispatch-sync`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+          body: JSON.stringify({ playlist_id: syncPlaylistId })
+        }).catch(() => {});
+      }
+    }
+    return json(res, okCount ? 200 : 500, {
+      ok: !!okCount,
+      rotated: okCount,
+      failed: results.length - okCount,
+      results,
+      synced: !!syncResult,
+      sync: syncResult
+    });
   },
 
   /* ---------- flex/cron-rotate-due (GET/POST) ---------- */
@@ -6642,7 +7228,22 @@ const routes = {
           body: JSON.stringify({ next_rotation_at: nextFlexRotationAt(settings.interval), updated_at: new Date().toISOString() })
         }).catch(() => {});
       }
-      results.push({ playlist_id: settings.playlist_id, rotated, failed });
+      let synced = false;
+      if (rotated) {
+        try {
+          await syncPlaylistItemsNow(settings.playlist_id);
+          synced = true;
+        } catch (syncError) {
+          console.warn("flex/cron-rotate-due:sync_after_rotate_failed", String(syncError?.message || syncError));
+          const base = internalBaseUrl();
+          await fetch(`${base}/api/playlists/dispatch-sync`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+            body: JSON.stringify({ playlist_id: settings.playlist_id })
+          }).catch(() => {});
+        }
+      }
+      results.push({ playlist_id: settings.playlist_id, rotated, failed, synced });
     }
     return json(res, 200, { ok: true, playlists: due.length, results });
   },
@@ -6655,34 +7256,39 @@ const routes = {
     const { playlist_id } = body;
     if (!playlist_id) return bad(res, 400, "missing_playlist_id");
 
-    // pg_net-Aufruf an Supabase: ruft asynchron deinen /api/playlists/sync-items Endpoint auf
-    const base = internalBaseUrl();
-    const targetUrl = `${base}/api/playlists/sync-items`;
-    const syncBody = JSON.stringify({ playlist_row_id: playlist_id });
+    const pR = await sb(
+      `/rest/v1/playlists?select=id,connection_id,bubble_user_id&limit=1&id=eq.${encodeURIComponent(playlist_id)}`
+    );
+    const playlist = pR.ok ? (await pR.json().catch(() => []))?.[0] : null;
+    if (!playlist) return bad(res, 404, "playlist_not_found");
 
-    const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK, APP_WEBHOOK_SECRET } = process.env;
-    // net.http_post einmalig starten – nicht darauf warten, dass der Sync fertig ist
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/net_http_post`, {
-      method: 'POST',
-      headers: {
-        apikey: SRK,
-        Authorization: `Bearer ${SRK}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        body: syncBody,
-        headers: {
-          'Content-Type': 'application/json',
-          'x-app-secret': APP_WEBHOOK_SECRET
-        },
-        url: targetUrl
-      })
+    const enqueued = await enqueueSyncJob({
+      job_type: "playlist_sync_items",
+      scope_type: "playlist",
+      scope_id: playlist.id,
+      playlist_id: playlist.id,
+      connection_id: playlist.connection_id,
+      bubble_user_id: playlist.bubble_user_id,
+      priority: 80,
+      payload: { playlist_row_id: playlist.id },
+      max_attempts: 4,
+    });
+    if (!enqueued.ok) return bad(res, 500, enqueued.error || "sync_enqueue_failed");
+
+    const runnerReq = {
+      ...req,
+      method: "POST",
+      headers: { ...(req.headers || {}), "x-app-secret": process.env.APP_WEBHOOK_SECRET || "" },
+      url: `/api/sync/jobs/run?limit=2&max_ms=25000`,
+      query: { limit: "2", max_ms: "25000" },
+      body: {}
+    };
+    const runnerRes = captureRouteRes();
+    await routes["sync/jobs/run"](runnerReq, runnerRes).catch((e) => {
+      console.warn("dispatch-sync:runner_failed", String(e?.message || e));
     });
 
-    // Wir erwarten 200 von rpc-Aufruf; selbst wenn der spätere Sync 10–60s läuft, ist dieser Call sofort fertig
-    if (!r.ok) return bad(res, 500, `pg_net_http_post_failed: ${await r.text()}`);
-
-    return json(res, 202, { ok: true, dispatched: true });
+    return json(res, 202, { ok: true, queued: true, job: enqueued.job || null, runner: runnerRes.result.payload || null });
   },
 
   /* ---------- ping ---------- */
