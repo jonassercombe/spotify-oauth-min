@@ -850,6 +850,101 @@ function normalizeMetaCreativeProjectInput(body = {}) {
   return { playlist_id: playlistId, name, language, format };
 }
 
+const CREATIVE_CONCEPT_FIELDS = [
+  "title", "hook", "angle", "story", "primary_emotion", "visual_direction",
+  "visual_search_terms", "text_design_direction", "audio_direction", "cta",
+  "hypothesis", "rationale",
+];
+
+function creativeBriefSchema() {
+  const stringField = { type: "string" };
+  const stringArray = { type: "array", items: stringField };
+  const conceptProperties = Object.fromEntries(CREATIVE_CONCEPT_FIELDS.map((field) => [field, field === "visual_search_terms" ? stringArray : stringField]));
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["brief", "concepts"],
+    properties: {
+      brief: {
+        type: "object",
+        additionalProperties: false,
+        required: ["title", "description", "mood_summary", "audience_summary", "use_cases", "core_angles", "extracted_artists", "extracted_tracks"],
+        properties: {
+          title: stringField,
+          description: stringField,
+          mood_summary: stringField,
+          audience_summary: stringField,
+          use_cases: stringArray,
+          core_angles: stringArray,
+          extracted_artists: stringArray,
+          extracted_tracks: stringArray,
+        },
+      },
+      concepts: {
+        type: "array",
+        minItems: 8,
+        maxItems: 8,
+        items: { type: "object", additionalProperties: false, required: CREATIVE_CONCEPT_FIELDS, properties: conceptProperties },
+      },
+    },
+  };
+}
+
+function extractOpenAIText(payload) {
+  if (typeof payload?.output_text === "string" && payload.output_text.trim()) return payload.output_text;
+  for (const item of payload?.output || []) {
+    for (const content of item?.content || []) {
+      if (content?.type === "refusal") throw new Error(`openai_refusal: ${content.refusal || "request refused"}`);
+      if (content?.type === "output_text" && content.text) return content.text;
+    }
+  }
+  throw new Error(`openai_empty_response: ${payload?.status || "unknown"}`);
+}
+
+async function generateCreativeBriefWithOpenAI({ project, playlist, tracks }) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 110000);
+  const languageName = project.language === "de" ? "German" : "English";
+  const source = {
+    playlist: {
+      name: playlist.name || project.name,
+      description: playlist.description || "",
+      followers: Number(playlist.followers || 0),
+      tracks_total: Number(playlist.tracks_total || tracks.length),
+    },
+    tracks: tracks.slice(0, 80).map((track) => ({
+      position: Number(track.position || 0),
+      name: track.track_name || "",
+      artists: Array.isArray(track.artist_names) ? track.artist_names : [],
+      album: track.album_name || "",
+    })),
+  };
+  const system = `You are a performance creative strategist for paid social ads promoting Spotify playlists. Create one evidence-based playlist brief and exactly eight materially different short-form video concepts. All user-facing copy must be in ${languageName}. Hooks must be overlay-ready (maximum 6 words and 38 characters). Use realistic, stock-video-findable scenes. Avoid generic playlist clichés and duplicate angles. Each concept needs a concrete human moment and a testable hypothesis.`;
+  const user = `Analyze this playlist snapshot and create the creative brief and concept portfolio. The primary ad format is ${project.format}.\n\n${JSON.stringify(source)}`;
+  try {
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${need("OPENAI_API_KEY")}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: process.env.OPENAI_MODEL || "gpt-5.6",
+        input: [{ role: "system", content: system }, { role: "user", content: user }],
+        text: { format: { type: "json_schema", name: "playlist_creative_brief", strict: true, schema: creativeBriefSchema() } },
+        max_output_tokens: 8000,
+        store: false,
+      }),
+    });
+    const parsed = await parseJsonSafe(response);
+    if (!response.ok) throw new Error(`openai_${response.status}: ${parsed.json?.error?.message || parsed.text.slice(0, 500)}`);
+    return JSON.parse(extractOpenAIText(parsed.json));
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function fallbackSpotifyCredentials({ requireRedirect = false } = {}) {
   const client_id = process.env.SPOTIFY_CLIENT_ID || "";
   const client_secret = process.env.SPOTIFY_CLIENT_SECRET || "";
@@ -2429,7 +2524,7 @@ const routes = {
     if (!connection) return bad(res, 400, "meta_connection_not_configured");
     if (req.method === "GET") {
       const response = await sb(
-        `/rest/v1/meta_creative_projects?select=*,playlists(name,image,playlist_id,followers,tracks_total),meta_creative_concepts(id,status),meta_creative_render_jobs(id,status)` +
+        `/rest/v1/meta_creative_projects?select=*,playlists(name,image,playlist_id,followers,tracks_total),meta_creative_concepts(*),meta_creative_render_jobs(id,status)` +
         `&connection_id=eq.${encodeURIComponent(connection.id)}&order=created_at.desc&limit=50`
       );
       if (!response.ok) return bad(res, 500, `meta_creative_projects_load_failed: ${(await response.text()).slice(0, 1000)}`);
@@ -2468,6 +2563,108 @@ const routes = {
     const text = await response.text();
     if (!response.ok) return bad(res, 500, `meta_creative_project_save_failed: ${text.slice(0, 1000)}`);
     return json(res, 201, { project: JSON.parse(text || "[]")[0] });
+  },
+
+  /* ---------- meta/creative-projects/generate (POST) ---------- */
+  "meta/creative-projects/generate": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+    const body = await readBody(req);
+    const projectId = String(body.project_id || "").trim();
+    if (!/^[0-9a-f-]{36}$/i.test(projectId)) return bad(res, 400, "creative_project_required");
+
+    const projectResponse = await sb(
+      `/rest/v1/meta_creative_projects?select=*&limit=1&id=eq.${encodeURIComponent(projectId)}` +
+      `&connection_id=eq.${encodeURIComponent(connection.id)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}`
+    );
+    const project = projectResponse.ok ? (await projectResponse.json().catch(() => []))[0] : null;
+    if (!project) return bad(res, 404, "creative_project_not_found");
+
+    const existingResponse = await sb(`/rest/v1/meta_creative_concepts?select=*&project_id=eq.${encodeURIComponent(project.id)}&order=position.asc`);
+    const existing = existingResponse.ok ? await existingResponse.json().catch(() => []) : [];
+    if (existing.length >= 8 && project.brief?.mood_summary) {
+      return json(res, 200, { project, concepts: existing, reused: true });
+    }
+
+    const playlistResponse = await sb(
+      `/rest/v1/playlists?select=id,name,description,image,playlist_id,followers,tracks_total&limit=1&id=eq.${encodeURIComponent(project.playlist_id)}` +
+      `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}`
+    );
+    const playlist = playlistResponse.ok ? (await playlistResponse.json().catch(() => []))[0] : null;
+    if (!playlist) return bad(res, 404, "creative_playlist_not_found");
+    const tracksResponse = await sb(
+      `/rest/v1/playlist_items?select=position,track_name,artist_names,album_name&playlist_id=eq.${encodeURIComponent(playlist.id)}` +
+      `&order=position.asc&limit=100`
+    );
+    const tracks = tracksResponse.ok ? await tracksResponse.json().catch(() => []) : [];
+    if (!tracks.length) return bad(res, 409, "creative_playlist_tracks_missing_sync_playlist_first");
+
+    await sb(`/rest/v1/meta_creative_projects?id=eq.${encodeURIComponent(project.id)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ status: "concepts_pending", current_step: 2, last_error: null, updated_at: new Date().toISOString() }),
+    });
+
+    try {
+      const generated = await generateCreativeBriefWithOpenAI({ project, playlist, tracks });
+      if (!Array.isArray(generated.concepts) || generated.concepts.length !== 8) throw new Error("openai_invalid_concept_count");
+      const now = new Date().toISOString();
+      const rows = generated.concepts.map((concept, index) => ({
+        project_id: project.id,
+        position: index + 1,
+        title: String(concept.title || "").slice(0, 200),
+        hook: String(concept.hook || "").slice(0, 200),
+        angle: String(concept.angle || "").slice(0, 500),
+        story: String(concept.story || "").slice(0, 2000),
+        primary_emotion: String(concept.primary_emotion || "").slice(0, 200),
+        visual_direction: String(concept.visual_direction || "").slice(0, 2000),
+        visual_search_terms: (concept.visual_search_terms || []).map((term) => String(term).slice(0, 100)).filter(Boolean).slice(0, 8),
+        text_design_direction: String(concept.text_design_direction || "").slice(0, 1000),
+        audio_direction: String(concept.audio_direction || "").slice(0, 1000),
+        cta: String(concept.cta || "").slice(0, 200),
+        hypothesis: String(concept.hypothesis || "").slice(0, 1000),
+        status: "concept",
+        render_spec: { rationale: String(concept.rationale || "").slice(0, 1000), source: "openai", format: project.format },
+        updated_at: now,
+      }));
+      const conceptsResponse = await sb(`/rest/v1/meta_creative_concepts?on_conflict=project_id,position`, {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+        body: JSON.stringify(rows),
+      });
+      const conceptsText = await conceptsResponse.text();
+      if (!conceptsResponse.ok) throw new Error(`creative_concepts_save_failed: ${conceptsText.slice(0, 500)}`);
+      const brief = {
+        ...project.brief,
+        ...generated.brief,
+        playlist_name: playlist.name || project.brief?.playlist_name || "",
+        spotify_playlist_id: playlist.playlist_id || project.brief?.spotify_playlist_id || "",
+        cover_image: playlist.image || project.brief?.cover_image || "",
+        followers: Number(playlist.followers || 0),
+        tracks_total: Number(playlist.tracks_total || tracks.length),
+        snapshot_track_count: tracks.length,
+        generated_at: now,
+        model: process.env.OPENAI_MODEL || "gpt-5.6",
+      };
+      const updatedResponse = await sb(`/rest/v1/meta_creative_projects?id=eq.${encodeURIComponent(project.id)}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify({ brief, status: "media_pending", current_step: 3, last_error: null, updated_at: now }),
+      });
+      const updated = updatedResponse.ok ? (await updatedResponse.json().catch(() => []))[0] : { ...project, brief, status: "media_pending", current_step: 3 };
+      return json(res, 200, { project: updated, concepts: JSON.parse(conceptsText || "[]"), reused: false });
+    } catch (error) {
+      const message = String(error?.name === "AbortError" ? "creative_generation_timed_out" : error?.message || error).slice(0, 1000);
+      await sb(`/rest/v1/meta_creative_projects?id=eq.${encodeURIComponent(project.id)}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({ status: "error", last_error: message, updated_at: new Date().toISOString() }),
+      }).catch(() => null);
+      return bad(res, 502, message);
+    }
   },
 
   /* ---------- meta/campaign-drafts (GET/POST) ---------- */

@@ -625,6 +625,7 @@ export default function PlaylistManager() {
   const [metaDrafts, setMetaDrafts] = useState([]);
   const [creativeProjects, setCreativeProjects] = useState([]);
   const [creativeProjectForm, setCreativeProjectForm] = useState({ playlist_id: "", name: "", language: "en", format: "9:16" });
+  const [openCreativeProjectId, setOpenCreativeProjectId] = useState("");
   const [adsSection, setAdsSection] = useState("overview");
   const [adsWizardStep, setAdsWizardStep] = useState(1);
   const [metaDraftForm, setMetaDraftForm] = useState({
@@ -2092,6 +2093,18 @@ export default function PlaylistManager() {
     });
   }
 
+  async function generateCreativeProject(projectId) {
+    setOpenCreativeProjectId(projectId);
+    await run("Creative brief and concepts generated", async () => {
+      await api("/api/meta/creative-projects/generate", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { project_id: projectId },
+      });
+      return loadCreativeProjects();
+    });
+  }
+
   async function saveMetaDraft() {
     await run("Campaign draft saved", async () => {
       await api("/api/meta/campaign-drafts", { method: "POST", accessToken: accessToken(), body: metaDraftForm });
@@ -3328,13 +3341,21 @@ export default function PlaylistManager() {
             <div className="panelHeader"><div><h2>Creative projects</h2><p>Persistent workspaces shared by concept generation, media, and rendering.</p></div><span className="jobStatus jobStatus--pending">{creativeProjects.length}</span></div>
             <div className="creativeProjectCards">
               {creativeProjects.map((project) => {
-                const concepts = project.meta_creative_concepts || [];
+                const concepts = [...(project.meta_creative_concepts || [])].sort((a, b) => Number(a.position || 0) - Number(b.position || 0));
                 const renders = project.meta_creative_render_jobs || [];
                 const completedRenders = renders.filter((job) => job.status === "completed").length;
-                return <article key={project.id}>
-                  <Artwork src={project.playlists?.image || project.brief?.cover_image} alt="" size="lg" />
-                  <div className="creativeProjectCopy"><div><span>{project.status.replaceAll("_", " ")}</span><strong>{project.name}</strong></div><small>{project.playlists?.name || project.brief?.playlist_name || "Playlist"} · {project.format} · {project.language.toUpperCase()}</small><div className="creativeProjectMetrics"><b>{concepts.length}<small>concepts</small></b><b>{renders.length}<small>render jobs</small></b><b>{completedRenders}<small>finished</small></b></div></div>
-                  <button disabled title="Brief generation is the next integration step">Open project</button>
+                const isOpen = openCreativeProjectId === project.id;
+                const hasBrief = Boolean(project.brief?.mood_summary);
+                return <article key={project.id} className={isOpen ? "isOpen" : ""}>
+                  <div className="creativeProjectSummary">
+                    <Artwork src={project.playlists?.image || project.brief?.cover_image} alt="" size="lg" />
+                    <div className="creativeProjectCopy"><div><span>{project.status.replaceAll("_", " ")}</span><strong>{project.name}</strong></div><small>{project.playlists?.name || project.brief?.playlist_name || "Playlist"} · {project.format} · {project.language.toUpperCase()}</small><div className="creativeProjectMetrics"><b>{concepts.length}<small>concepts</small></b><b>{renders.length}<small>render jobs</small></b><b>{completedRenders}<small>finished</small></b></div></div>
+                    <button onClick={() => setOpenCreativeProjectId(isOpen ? "" : project.id)}>{isOpen ? "Close" : "Open project"}</button>
+                  </div>
+                  {isOpen ? <div className="creativeProjectDetail">
+                    {hasBrief ? <div className="creativeBriefPanel"><span>Creative brief</span><h3>{project.brief.title || project.name}</h3><p>{project.brief.mood_summary}</p><p>{project.brief.audience_summary}</p><div>{(project.brief.core_angles || []).map((angle) => <b key={angle}>{angle}</b>)}</div></div> : <div className="creativeEmptyState"><strong>Ready to analyze</strong><p>PlaylistPilot will read the local playlist snapshot and create a brief plus eight testable concepts.</p><button disabled={busy} onClick={() => generateCreativeProject(project.id)}>{project.status === "error" ? "Retry generation" : "Generate brief & concepts"}</button>{project.last_error ? <small>{project.last_error}</small> : null}</div>}
+                    {concepts.length ? <div className="creativeConceptGrid">{concepts.map((concept) => <article key={concept.id}><span>Concept {concept.position}</span><h3>{concept.title}</h3><strong>{concept.hook}</strong><p>{concept.story}</p><dl><div><dt>Angle</dt><dd>{concept.angle}</dd></div><div><dt>Visual</dt><dd>{concept.visual_direction}</dd></div><div><dt>Hypothesis</dt><dd>{concept.hypothesis}</dd></div></dl><div className="creativeConceptTerms">{(concept.visual_search_terms || []).map((term) => <b key={term}>{term}</b>)}</div></article>)}</div> : null}
+                  </div> : null}
                 </article>;
               })}
               {!creativeProjects.length ? <div className="creativeEmptyState"><strong>No creative projects yet</strong><p>Select a playlist to establish the first workspace.</p></div> : null}
@@ -6182,7 +6203,9 @@ export default function PlaylistManager() {
         .creativePlaylistSeed div { display: grid; gap: 3px; min-width: 0; }
         .creativePlaylistSeed span, .creativePlaylistSeed small { color: #7f8998; font-size: 11px; }
         .creativeProjectCards { display: grid; gap: 10px; }
-        .creativeProjectCards > article { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 13px; border: 1px solid #303744; border-radius: 10px; background: #11151b; }
+        .creativeProjectCards > article { display: grid; gap: 0; border: 1px solid #303744; border-radius: 10px; background: #11151b; overflow: hidden; }
+        .creativeProjectCards > article.isOpen { border-color: rgba(24, 224, 111, 0.42); }
+        .creativeProjectSummary { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 13px; }
         .creativeProjectCopy { display: grid; gap: 7px; min-width: 0; }
         .creativeProjectCopy > div:first-child { display: grid; gap: 3px; }
         .creativeProjectCopy > div:first-child span { color: #18e06f; font-size: 9px; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; }
@@ -6190,6 +6213,21 @@ export default function PlaylistManager() {
         .creativeProjectMetrics { display: flex; gap: 16px; }
         .creativeProjectMetrics b { display: grid; color: #f2f5f8; font-size: 14px; }
         .creativeProjectMetrics small { color: #707987; font-size: 9px; font-weight: 700; text-transform: uppercase; }
+        .creativeProjectDetail { display: grid; gap: 14px; padding: 16px; border-top: 1px solid #303744; background: #0d1116; }
+        .creativeBriefPanel { display: grid; gap: 8px; padding: 16px; border: 1px solid rgba(24, 224, 111, 0.24); border-radius: 10px; background: rgba(24, 224, 111, 0.035); }
+        .creativeBriefPanel > span, .creativeConceptGrid article > span { color: #18e06f; font-size: 9px; font-weight: 900; letter-spacing: 0.09em; text-transform: uppercase; }
+        .creativeBriefPanel h3, .creativeConceptGrid h3 { margin: 0; }
+        .creativeBriefPanel p { margin: 0; color: #a5aebb; line-height: 1.55; }
+        .creativeBriefPanel > div, .creativeConceptTerms { display: flex; flex-wrap: wrap; gap: 6px; }
+        .creativeBriefPanel b, .creativeConceptTerms b { padding: 5px 8px; border: 1px solid #343d49; border-radius: 999px; color: #aeb7c3; font-size: 9px; }
+        .creativeConceptGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+        .creativeConceptGrid article { display: grid; align-content: start; gap: 9px; padding: 14px; border: 1px solid #303744; border-radius: 10px; background: #131820; }
+        .creativeConceptGrid article > strong { color: #f4f7fa; font-size: 18px; line-height: 1.25; }
+        .creativeConceptGrid article > p { margin: 0; color: #929daa; line-height: 1.5; }
+        .creativeConceptGrid dl { display: grid; gap: 7px; margin: 2px 0; }
+        .creativeConceptGrid dl div { display: grid; gap: 2px; }
+        .creativeConceptGrid dt { color: #677282; font-size: 9px; font-weight: 800; text-transform: uppercase; }
+        .creativeConceptGrid dd { margin: 0; color: #b8c0cb; font-size: 11px; line-height: 1.45; }
         .creativeEmptyState, .creativeLibraryEmpty > div { display: grid; justify-items: start; gap: 8px; padding: 24px; border: 1px dashed #3a4351; border-radius: 10px; color: #8d96a4; }
         .creativeEmptyState p, .creativeLibraryEmpty p { margin: 0; color: #8d96a4; }
         .creativeLibraryEmpty { display: grid; gap: 14px; }
@@ -8493,8 +8531,9 @@ export default function PlaylistManager() {
           .adsWorkspaceNav { overflow-x: auto; }
           .adsWorkspaceNav button { flex: 1 0 135px; }
           .creativePipeline { grid-template-columns: 1fr 1fr; }
-          .creativeProjectCards > article { grid-template-columns: auto minmax(0, 1fr); }
-          .creativeProjectCards > article > button { grid-column: 1 / -1; }
+          .creativeProjectSummary { grid-template-columns: auto minmax(0, 1fr); }
+          .creativeProjectSummary > button { grid-column: 1 / -1; }
+          .creativeConceptGrid { grid-template-columns: 1fr; }
           .adsWizardSteps { grid-template-columns: 1fr; }
           .adsPlacementChoices { grid-template-columns: 1fr; }
           .adsDeliverySummary { grid-template-columns: 1fr; }
