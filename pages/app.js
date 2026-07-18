@@ -1981,6 +1981,18 @@ export default function PlaylistManager() {
     });
   }
 
+  async function selectMetaAsset(assetId) {
+    await run("Default Meta asset selected", async () => {
+      const data = await api("/api/meta/assets/select", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { asset_id: assetId },
+      });
+      setMetaWorkspace(data);
+      return data;
+    });
+  }
+
   async function saveSpotifyCredentials() {
     await run("Spotify app settings saved", async () => {
       const data = await api("/api/spotify/credentials/save", {
@@ -3059,7 +3071,7 @@ export default function PlaylistManager() {
             <div className="metaTitleLine">
               <h2>Meta Ads Manager</h2>
               <span className="adminBadge">Admin preview</span>
-              <span className="metaReadOnlyBadge">Read-only</span>
+              <span className="metaReadOnlyBadge">Setup mode</span>
             </div>
             <p>Connect and audit your Meta business assets before campaign publishing is enabled.</p>
           </div>
@@ -3086,9 +3098,9 @@ export default function PlaylistManager() {
             <small className="metricMeta">professional accounts</small>
           </article>
           <article>
-            <span className="metricLabel">Publishing</span>
-            <strong className="metricValue metaMetricText">Locked</strong>
-            <small className="metricMeta">no campaign writes in phase 1</small>
+            <span className="metricLabel">Draft preflight</span>
+            <strong className="metricValue metaMetricText">{metaWorkspace?.readiness?.publishing_ready ? "Ready" : "Locked"}</strong>
+            <small className="metricMeta">{metaWorkspace?.readiness?.publishing_ready ? "assets and permissions complete" : "no campaign writes enabled"}</small>
           </article>
         </div>
 
@@ -3132,16 +3144,19 @@ export default function PlaylistManager() {
 
         <section className="dashboardPanel metaAssetsPanel">
           <div className="panelHeader">
-            <div><h2>Business assets</h2><p>Read-only inventory. Asset selection and paused campaign drafts come next.</p></div>
+            <div><h2>Business assets</h2><p>Select one default asset per column. The Instagram identity must belong to the selected Page.</p></div>
           </div>
           <div className="metaAssetColumns">
             {[{ type: "ad_account", title: "Ad accounts" }, { type: "page", title: "Facebook pages" }, { type: "instagram_account", title: "Instagram accounts" }].map((group) => {
               const items = (metaWorkspace?.assets || []).filter((asset) => asset.asset_type === group.type);
               return <div className="metaAssetGroup" key={group.type}>
                 <div className="metaAssetGroupHeader"><strong>{group.title}</strong><span>{items.length}</span></div>
-                {items.map((asset) => <article key={asset.id}>
+                {items.map((asset) => <article className={asset.is_selected ? "selected" : ""} key={asset.id}>
                   <div><strong>{asset.name}</strong><small>{asset.meta_id}</small></div>
-                  {group.type === "ad_account" ? <span>{asset.metadata?.currency || ""} {asset.metadata?.timezone_name || ""}</span> : null}
+                  <div className="metaAssetActions">
+                    {group.type === "ad_account" ? <span>{asset.metadata?.currency || ""} {asset.metadata?.timezone_name || ""}</span> : null}
+                    <button disabled={busy || asset.is_selected} onClick={() => selectMetaAsset(asset.id)}>{asset.is_selected ? "Selected" : "Select"}</button>
+                  </div>
                 </article>)}
                 {!items.length ? <p>No assets found.</p> : null}
               </div>;
@@ -3149,7 +3164,7 @@ export default function PlaylistManager() {
           </div>
         </section>
 
-        <div className="metaPublishLock"><Lock aria-hidden="true" /><div><strong>Campaign publishing is locked</strong><p>The next phase will create paused drafts only after the connection, ad account, Page, and Instagram identity are explicitly selected.</p></div></div>
+        <div className={`metaPublishLock ${metaWorkspace?.readiness?.publishing_ready ? "ready" : ""}`}><Lock aria-hidden="true" /><div><strong>{metaWorkspace?.readiness?.publishing_ready ? "Preflight complete; campaign writes remain locked" : "Campaign publishing is locked"}</strong><p>{metaWorkspace?.readiness?.publishing_ready ? "The connection is ready for the next phase, which will create paused drafts with an explicit review step." : `Still required: ${(metaWorkspace?.readiness?.missing || ["successful audit and three selected assets"]).join(", ")}.`}</p></div></div>
       </section>
       ) : view === "admin" && isAdmin ? (
       <section className="adminPanel">
@@ -5904,6 +5919,10 @@ export default function PlaylistManager() {
           border-radius: 7px;
           background: #151920;
         }
+        .metaAssetGroup article.selected {
+          border-color: rgba(24, 224, 111, 0.58);
+          background: rgba(24, 224, 111, 0.06);
+        }
         .metaAssetGroup article div {
           display: grid;
           gap: 3px;
@@ -5911,14 +5930,23 @@ export default function PlaylistManager() {
         }
         .metaAssetGroup article strong,
         .metaAssetGroup article small,
-        .metaAssetGroup article > span {
+        .metaAssetActions span {
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
         }
         .metaAssetGroup article small,
-        .metaAssetGroup article > span {
+        .metaAssetActions span {
           color: #7f8998;
+          font-size: 11px;
+        }
+        .metaAssetGroup .metaAssetActions {
+          justify-items: end;
+          flex: 0 0 auto;
+        }
+        .metaAssetActions button {
+          min-height: 30px;
+          padding: 5px 9px;
           font-size: 11px;
         }
         .metaPublishLock {
@@ -5938,6 +5966,10 @@ export default function PlaylistManager() {
           margin: 3px 0 0;
           color: #8d96a4;
           font-size: 13px;
+        }
+        .metaPublishLock.ready {
+          border-color: rgba(24, 224, 111, 0.42);
+          background: rgba(24, 224, 111, 0.05);
         }
         .jobStatus {
           display: inline-flex;

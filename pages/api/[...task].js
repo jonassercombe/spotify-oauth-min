@@ -667,6 +667,27 @@ function normalizeMetaGraphVersion(value) {
   return /^v\d+\.\d+$/.test(version) ? version : "v25.0";
 }
 
+function metaConnectionReadiness(connection, assets = []) {
+  const granted = new Set(connection?.audit_summary?.permissions?.granted || []);
+  const selectedAssets = new Map(assets.filter((asset) => asset.is_selected).map((asset) => [asset.asset_type, asset]));
+  const missing = [];
+  if (!granted.has("ads_read")) missing.push("ads_read permission");
+  if (!granted.has("ads_management")) missing.push("ads_management permission");
+  if (!selectedAssets.has("ad_account")) missing.push("selected ad account");
+  if (!selectedAssets.has("page")) missing.push("selected Facebook Page");
+  if (!selectedAssets.has("instagram_account")) missing.push("selected Instagram account");
+  const selectedPage = selectedAssets.get("page");
+  const selectedInstagram = selectedAssets.get("instagram_account");
+  if (selectedPage && selectedInstagram && selectedInstagram.metadata?.page_id !== selectedPage.meta_id) {
+    missing.push("matching Facebook Page for the selected Instagram account");
+  }
+  return {
+    read_ready: connection?.status === "ready" && granted.has("ads_read"),
+    publishing_ready: connection?.status === "ready" && missing.length === 0,
+    missing,
+  };
+}
+
 function sanitizeMetaConnection(connection, assets = []) {
   if (!connection) return { configured: false, assets: [] };
   return {
@@ -682,6 +703,7 @@ function sanitizeMetaConnection(connection, assets = []) {
     audit_summary: connection.audit_summary || {},
     has_app_secret: !!connection.app_secret_enc,
     assets,
+    readiness: metaConnectionReadiness(connection, assets),
   };
 }
 
@@ -2080,21 +2102,36 @@ const routes = {
 
     try {
       const fields = "id,name,account_status,currency,timezone_name,disable_reason";
-      const [identity, permissions, ownedAccounts, clientAccounts, pages, personalAccounts] = await Promise.all([
+      const pageFields = "id,name,instagram_business_account{id,username,name,profile_picture_url}";
+      const [identity, permissions] = await Promise.all([
         metaGraphRequest(connection, "me", { fields: "id,name" }),
         metaGraphRequest(connection, "me/permissions"),
-        metaGraphRequest(connection, `${connection.business_id}/owned_ad_accounts`, { fields, limit: 100 }).catch(() => ({ data: [] })),
-        metaGraphRequest(connection, `${connection.business_id}/client_ad_accounts`, { fields, limit: 100 }).catch(() => ({ data: [] })),
-        metaGraphRequest(connection, `${connection.business_id}/owned_pages`, {
-          fields: "id,name,instagram_business_account{id,username,name,profile_picture_url}",
-          limit: 100,
-        }).catch(() => ({ data: [] })),
-        metaGraphRequest(connection, "me/adaccounts", { fields, limit: 100 }).catch(() => ({ data: [] })),
       ]);
+      const endpointErrors = [];
+      const auditEndpoint = async (key, request) => {
+        try {
+          return { key, ok: true, payload: await request };
+        } catch (error) {
+          const message = String(error?.message || "Meta endpoint failed").slice(0, 500);
+          endpointErrors.push({ endpoint: key, error: message });
+          return { key, ok: false, payload: { data: [] } };
+        }
+      };
+      const endpointResults = await Promise.all([
+        auditEndpoint("business_owned_ad_accounts", metaGraphRequest(connection, `${connection.business_id}/owned_ad_accounts`, { fields, limit: 100 })),
+        auditEndpoint("business_client_ad_accounts", metaGraphRequest(connection, `${connection.business_id}/client_ad_accounts`, { fields, limit: 100 })),
+        auditEndpoint("token_ad_accounts", metaGraphRequest(connection, "me/adaccounts", { fields, limit: 100 })),
+        auditEndpoint("business_owned_pages", metaGraphRequest(connection, `${connection.business_id}/owned_pages`, { fields: pageFields, limit: 100 })),
+        auditEndpoint("business_client_pages", metaGraphRequest(connection, `${connection.business_id}/client_pages`, { fields: pageFields, limit: 100 })),
+        auditEndpoint("token_pages", metaGraphRequest(connection, "me/accounts", { fields: pageFields, limit: 100 })),
+      ]);
+      const endpoint = Object.fromEntries(endpointResults.map((result) => [result.key, result]));
+      const accountResults = [endpoint.business_owned_ad_accounts, endpoint.business_client_ad_accounts, endpoint.token_ad_accounts];
+      const pageResults = [endpoint.business_owned_pages, endpoint.business_client_pages, endpoint.token_pages];
 
       const assetMap = new Map();
       const addAsset = (asset) => asset?.meta_id && assetMap.set(`${asset.asset_type}:${asset.meta_id}`, asset);
-      [...(ownedAccounts.data || []), ...(clientAccounts.data || []), ...(personalAccounts.data || [])].forEach((account) => addAsset({
+      accountResults.flatMap((result) => result.payload.data || []).forEach((account) => addAsset({
         connection_id: connection.id,
         asset_type: "ad_account",
         meta_id: String(account.id || "").replace(/^act_/, ""),
@@ -2107,7 +2144,7 @@ const routes = {
         },
         updated_at: new Date().toISOString(),
       }));
-      (pages.data || []).forEach((page) => {
+      pageResults.flatMap((result) => result.payload.data || []).forEach((page) => {
         addAsset({ connection_id: connection.id, asset_type: "page", meta_id: page.id, name: page.name || page.id, metadata: {}, updated_at: new Date().toISOString() });
         const instagram = page.instagram_business_account;
         if (instagram?.id) addAsset({
@@ -2128,6 +2165,29 @@ const routes = {
         });
         if (!upsert.ok) throw new Error(`meta_asset_save_failed: ${await upsert.text()}`);
       }
+      const existingAssetsResponse = await sb(
+        `/rest/v1/meta_ads_assets?select=id,asset_type,meta_id&connection_id=eq.${encodeURIComponent(connection.id)}`
+      );
+      if (!existingAssetsResponse.ok) throw new Error(`meta_asset_reconcile_load_failed: ${await existingAssetsResponse.text()}`);
+      const existingAssets = await existingAssetsResponse.json().catch(() => []);
+      const completeAssetTypes = new Set();
+      if (accountResults.every((result) => result.ok)) completeAssetTypes.add("ad_account");
+      if (pageResults.every((result) => result.ok)) {
+        completeAssetTypes.add("page");
+        completeAssetTypes.add("instagram_account");
+      }
+      const discoveredKeys = new Set(assets.map((asset) => `${asset.asset_type}:${asset.meta_id}`));
+      const staleAssets = existingAssets.filter((asset) =>
+        completeAssetTypes.has(asset.asset_type) && !discoveredKeys.has(`${asset.asset_type}:${asset.meta_id}`)
+      );
+      if (staleAssets.length) {
+        const staleIds = staleAssets.map((asset) => asset.id).join(",");
+        const staleDelete = await sb(`/rest/v1/meta_ads_assets?id=in.(${staleIds})`, {
+          method: "DELETE",
+          headers: { Prefer: "return=minimal" },
+        });
+        if (!staleDelete.ok) throw new Error(`meta_asset_reconcile_delete_failed: ${await staleDelete.text()}`);
+      }
       const granted = (permissions.data || []).filter((item) => item.status === "granted").map((item) => item.permission);
       const denied = (permissions.data || []).filter((item) => item.status !== "granted").map((item) => item.permission);
       const accountCount = assets.filter((item) => item.asset_type === "ad_account").length;
@@ -2138,7 +2198,14 @@ const routes = {
       if (!instagramCount) warnings.push("No connected Instagram professional account found.");
       if (!granted.includes("ads_read")) warnings.push("ads_read permission is missing.");
       if (!granted.includes("ads_management")) warnings.push("ads_management permission is missing.");
-      const summary = { identity, permissions: { granted, denied }, counts: { ad_accounts: accountCount, pages: pageCount, instagram_accounts: instagramCount }, warnings };
+      endpointErrors.forEach((item) => warnings.push(`${item.endpoint}: ${item.error}`));
+      const summary = {
+        identity,
+        permissions: { granted, denied },
+        counts: { ad_accounts: accountCount, pages: pageCount, instagram_accounts: instagramCount },
+        endpoint_errors: endpointErrors,
+        warnings,
+      };
       const status = accountCount && granted.includes("ads_read") ? "ready" : "error";
       const auditedAt = new Date().toISOString();
       await Promise.all([
@@ -2165,6 +2232,43 @@ const routes = {
       ]);
       return bad(res, 502, message);
     }
+  },
+
+  /* ---------- meta/assets/select (POST) ---------- */
+  "meta/assets/select": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const body = await readBody(req);
+    const assetId = String(body.asset_id || "").trim();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(assetId)) {
+      return bad(res, 400, "invalid_meta_asset_id");
+    }
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+    const assetResponse = await sb(
+      `/rest/v1/meta_ads_assets?select=id,connection_id&limit=1&id=eq.${encodeURIComponent(assetId)}` +
+      `&connection_id=eq.${encodeURIComponent(connection.id)}`
+    );
+    const asset = assetResponse.ok ? (await assetResponse.json().catch(() => []))?.[0] : null;
+    if (!asset) return bad(res, 404, "meta_asset_not_found");
+
+    const selectedResponse = await sb(`/rest/v1/rpc/select_meta_ads_asset`, {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ p_connection_id: connection.id, p_asset_id: asset.id }),
+    });
+    if (!selectedResponse.ok) {
+      const message = (await selectedResponse.text()).slice(0, 1000);
+      return bad(res, 500, `meta_asset_select_failed: ${message}`);
+    }
+    const assetsResponse = await sb(
+      `/rest/v1/meta_ads_assets?select=id,asset_type,meta_id,name,is_selected,metadata,updated_at` +
+      `&connection_id=eq.${encodeURIComponent(connection.id)}&order=asset_type.asc,name.asc`
+    );
+    if (!assetsResponse.ok) return bad(res, 500, `meta_assets_reload_failed: ${(await assetsResponse.text()).slice(0, 1000)}`);
+    const assets = await assetsResponse.json().catch(() => []);
+    return json(res, 200, sanitizeMetaConnection(connection, assets));
   },
 
   /* ---------- admin/status (GET) ---------- */
