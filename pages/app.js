@@ -621,6 +621,8 @@ export default function PlaylistManager() {
     app_secret: "",
   });
   const [metaDrafts, setMetaDrafts] = useState([]);
+  const [adsSection, setAdsSection] = useState("overview");
+  const [adsWizardStep, setAdsWizardStep] = useState(1);
   const [metaDraftForm, setMetaDraftForm] = useState({
     name: "Bored Indie Kid — Spotify traffic",
     daily_budget_eur: "10",
@@ -638,6 +640,32 @@ export default function PlaylistManager() {
   const [spotifyRedirectUri, setSpotifyRedirectUri] = useState("https://playlist-pilot.com/api/oauth/spotify/callback");
   const [initialSpotifySyncPending, setInitialSpotifySyncPending] = useState(false);
   const [initialSpotifySyncUser, setInitialSpotifySyncUser] = useState("");
+
+  const adsDraftCounts = {
+    total: metaDrafts.length,
+    local: metaDrafts.filter((draft) => draft.status === "draft").length,
+    ready: metaDrafts.filter((draft) => draft.status === "review_ready").length,
+    created: metaDrafts.filter((draft) => draft.status === "created_paused").length,
+    errors: metaDrafts.filter((draft) => draft.status === "error").length,
+  };
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const syncAdsHash = () => {
+      const match = window.location.hash.match(/^#ads\/(overview|campaigns|new|settings)$/);
+      if (match) {
+        setView("ads");
+        setAdsSection(match[1]);
+      }
+    };
+    syncAdsHash();
+    window.addEventListener("hashchange", syncAdsHash);
+    window.addEventListener("popstate", syncAdsHash);
+    return () => {
+      window.removeEventListener("hashchange", syncAdsHash);
+      window.removeEventListener("popstate", syncAdsHash);
+    };
+  }, []);
 
   const billing = userContext?.billing || {};
   const billingActive = !!billing.is_active;
@@ -1973,6 +2001,12 @@ export default function PlaylistManager() {
     return data;
   }
 
+  function openAdsSection(section = "overview") {
+    setView("ads");
+    setAdsSection(section);
+    if (typeof window !== "undefined" && window.location.hash !== `#ads/${section}`) window.history.pushState(null, "", `#ads/${section}`);
+  }
+
   async function saveMetaConnection() {
     await run("Meta connection saved", async () => {
       const data = await api("/api/meta/connection/save", {
@@ -2019,7 +2053,10 @@ export default function PlaylistManager() {
   async function saveMetaDraft() {
     await run("Campaign draft saved", async () => {
       await api("/api/meta/campaign-drafts", { method: "POST", accessToken: accessToken(), body: metaDraftForm });
-      return loadMetaDrafts();
+      const result = await loadMetaDrafts();
+      openAdsSection("campaigns");
+      setAdsWizardStep(1);
+      return result;
     });
   }
 
@@ -2198,7 +2235,7 @@ export default function PlaylistManager() {
             <div className="navTabs">
               <button className={view === "dashboard" ? "navButton active" : "navButton"} onClick={() => setView("dashboard")}>Dashboard</button>
               <button className={view === "manager" ? "navButton active" : "navButton"} onClick={() => setView("manager")}>Playlist Manager</button>
-              {isAdmin ? <button className={view === "ads" ? "navButton active" : "navButton"} onClick={() => setView("ads")}>Ads Manager</button> : null}
+              {isAdmin ? <button className={view === "ads" ? "navButton active" : "navButton"} onClick={() => openAdsSection("overview")}>Ads Manager</button> : null}
               {isAdmin ? <button className={view === "admin" ? "navButton active" : "navButton"} onClick={() => setView("admin")}>Admin</button> : null}
             </div>
           ) : null}
@@ -3129,29 +3166,53 @@ export default function PlaylistManager() {
           </div>
         </div>
 
+        <nav className="adsWorkspaceNav" aria-label="Ads Manager sections">
+          {[{ id: "overview", label: "Overview" }, { id: "campaigns", label: "Campaigns" }, { id: "new", label: "New campaign" }, { id: "settings", label: "Settings" }].map((item) => (
+            <button key={item.id} className={adsSection === item.id ? "active" : ""} onClick={() => openAdsSection(item.id)}>{item.label}</button>
+          ))}
+        </nav>
+
+        {adsSection === "overview" ? <>
         <div className="metricGrid metricGrid--primary">
           <article>
-            <span className="metricLabel">Connection</span>
-            <strong className="metricValue metaMetricText">{metaWorkspace?.configured ? metaWorkspace.status : "Not set"}</strong>
-            <small className="metricMeta">{metaWorkspace?.last_audit_at ? `Audited ${formatShortDate(String(metaWorkspace.last_audit_at).slice(0, 10))}` : "Awaiting first audit"}</small>
+            <span className="metricLabel">Campaign records</span>
+            <strong className="metricValue">{adsDraftCounts.total}</strong>
+            <small className="metricMeta">drafts and paused packages</small>
           </article>
           <article>
-            <span className="metricLabel">Ad accounts</span>
-            <strong className="metricValue">{formatNumber(metaWorkspace?.audit_summary?.counts?.ad_accounts || 0)}</strong>
-            <small className="metricMeta">accessible to this token</small>
+            <span className="metricLabel">Ready to create</span>
+            <strong className="metricValue">{adsDraftCounts.ready}</strong>
+            <small className="metricMeta">review approved</small>
           </article>
           <article>
-            <span className="metricLabel">Instagram</span>
-            <strong className="metricValue">{formatNumber(metaWorkspace?.audit_summary?.counts?.instagram_accounts || 0)}</strong>
-            <small className="metricMeta">professional accounts</small>
+            <span className="metricLabel">Created paused</span>
+            <strong className="metricValue">{adsDraftCounts.created}</strong>
+            <small className="metricMeta">complete Meta packages</small>
           </article>
           <article>
-            <span className="metricLabel">Draft preflight</span>
-            <strong className="metricValue metaMetricText">{metaWorkspace?.readiness?.publishing_ready ? "Ready" : "Locked"}</strong>
-            <small className="metricMeta">{metaWorkspace?.readiness?.publishing_ready ? "assets and permissions complete" : "no campaign writes enabled"}</small>
+            <span className="metricLabel">Needs attention</span>
+            <strong className="metricValue">{adsDraftCounts.errors}</strong>
+            <small className="metricMeta">creation errors</small>
           </article>
         </div>
 
+        <div className="adsOverviewGrid">
+          <section className="dashboardPanel adsQuickStart">
+            <span className="metaReadOnlyBadge">Always PAUSED</span>
+            <h2>Create your next playlist campaign</h2>
+            <p>Build the audience, budget and creative in a guided flow. PlaylistPilot creates the complete package in Meta without activating it.</p>
+            <button disabled={!metaWorkspace?.readiness?.publishing_ready} onClick={() => openAdsSection(metaWorkspace?.readiness?.publishing_ready ? "new" : "settings")}>{metaWorkspace?.readiness?.publishing_ready ? "New campaign" : "Complete Meta setup"}</button>
+          </section>
+          <section className="dashboardPanel adsConnectionSummary">
+            <div className="panelHeader"><div><h2>Workspace status</h2><p>The selected identity used for new ads.</p></div><span className={`jobStatus jobStatus--${metaWorkspace?.readiness?.publishing_ready ? "done" : "pending"}`}>{metaWorkspace?.readiness?.publishing_ready ? "ready" : "setup"}</span></div>
+            <dl><div><dt>Connection</dt><dd>{metaWorkspace?.configured ? metaWorkspace.status : "Not configured"}</dd></div><div><dt>Ad account</dt><dd>{(metaWorkspace?.assets || []).find((asset) => asset.asset_type === "ad_account" && asset.is_selected)?.name || "Not selected"}</dd></div><div><dt>Identity</dt><dd>{(metaWorkspace?.assets || []).find((asset) => asset.asset_type === "instagram_account" && asset.is_selected)?.name || "Not selected"}</dd></div></dl>
+            <button onClick={() => openAdsSection("settings")}>Open settings</button>
+          </section>
+        </div>
+        <div className={`metaPublishLock ${metaWorkspace?.readiness?.publishing_ready ? "ready" : ""}`}><Lock aria-hidden="true" /><div><strong>{metaWorkspace?.readiness?.publishing_ready ? "Paused campaign workflow unlocked" : "Campaign publishing is locked"}</strong><p>{metaWorkspace?.readiness?.publishing_ready ? "Create and review complete PAUSED campaign packages. Active publishing remains unavailable." : `Still required: ${(metaWorkspace?.readiness?.missing || ["successful audit and three selected assets"]).join(", ")}.`}</p></div></div>
+        </> : null}
+
+        {adsSection === "settings" ? <>
         <div className="metaSetupGrid">
           <section className="dashboardPanel metaConnectionPanel">
             <div className="panelHeader">
@@ -3211,31 +3272,46 @@ export default function PlaylistManager() {
             })}
           </div>
         </section>
+        </> : null}
 
+        {adsSection === "new" ?
         <section className="dashboardPanel metaDraftComposer">
           <div className="panelHeader">
-            <div><h2>Paused campaign draft</h2><p>Prepare budget, targeting and creative. Nothing is sent to Meta until the reviewed draft is explicitly created.</p></div>
+            <div><h2>New campaign</h2><p>Build a paused campaign package in three steps. Nothing is sent to Meta while completing this form.</p></div>
             <span className="metaReadOnlyBadge">Always PAUSED</span>
           </div>
-          <div className="metaDraftGrid">
-            <label className="metaDraftWide"><span>Campaign name</span><input value={metaDraftForm.name} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, name: e.target.value })} /></label>
-            <label><span>Daily budget (EUR)</span><input type="number" min="1" step="1" value={metaDraftForm.daily_budget_eur} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, daily_budget_eur: e.target.value })} /></label>
-            <label><span>Countries</span><input value={metaDraftForm.countries} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, countries: e.target.value })} placeholder="DE, AT, CH" /></label>
-            <label><span>Minimum age</span><input type="number" min="13" max="65" value={metaDraftForm.age_min} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, age_min: e.target.value })} /></label>
-            <label><span>Maximum age</span><input type="number" min="13" max="65" value={metaDraftForm.age_max} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, age_max: e.target.value })} /></label>
-            <label className="metaDraftWide"><span>Spotify destination URL</span><input type="url" value={metaDraftForm.destination_url} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, destination_url: e.target.value })} placeholder="https://open.spotify.com/playlist/..." /></label>
-            <label className="metaDraftWide"><span>Creative image URL</span><input type="url" value={metaDraftForm.image_url} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, image_url: e.target.value })} placeholder="https://.../cover.jpg" /></label>
-            <label className="metaDraftWide"><span>Primary text</span><textarea rows="3" value={metaDraftForm.primary_text} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, primary_text: e.target.value })} /></label>
-            <label className="metaDraftWide"><span>Headline</span><input value={metaDraftForm.headline} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, headline: e.target.value })} /></label>
+          <div className="adsWizardSteps" aria-label="Campaign creation progress">
+            {["Destination", "Audience & budget", "Creative"].map((label, index) => <button key={label} className={adsWizardStep === index + 1 ? "active" : adsWizardStep > index + 1 ? "complete" : ""} onClick={() => setAdsWizardStep(index + 1)}><span>{index + 1}</span>{label}</button>)}
           </div>
-          <div className="metaFormActions">
-            <button disabled={busy || !metaWorkspace?.readiness?.publishing_ready} onClick={saveMetaDraft}>Save local draft</button>
-            <small>The server hard-codes <b>OUTCOME_TRAFFIC</b> and <b>PAUSED</b>. Campaign, ad set and ad are created paused.</small>
+          <div className="metaDraftGrid">
+            {adsWizardStep === 1 ? <>
+              <label className="metaDraftWide"><span>Campaign name</span><input value={metaDraftForm.name} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, name: e.target.value })} /></label>
+              <label className="metaDraftWide"><span>Spotify destination URL</span><input type="url" value={metaDraftForm.destination_url} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, destination_url: e.target.value })} placeholder="https://open.spotify.com/playlist/..." /></label>
+            </> : null}
+            {adsWizardStep === 2 ? <>
+              <label><span>Daily budget (EUR)</span><input type="number" min="1" step="1" value={metaDraftForm.daily_budget_eur} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, daily_budget_eur: e.target.value })} /></label>
+              <label><span>Countries</span><input value={metaDraftForm.countries} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, countries: e.target.value })} placeholder="DE, AT, CH" /></label>
+              <label><span>Minimum age</span><input type="number" min="13" max="65" value={metaDraftForm.age_min} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, age_min: e.target.value })} /></label>
+              <label><span>Maximum age</span><input type="number" min="13" max="65" value={metaDraftForm.age_max} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, age_max: e.target.value })} /></label>
+            </> : null}
+            {adsWizardStep === 3 ? <>
+              <label className="metaDraftWide"><span>Creative image URL</span><input type="url" value={metaDraftForm.image_url} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, image_url: e.target.value })} placeholder="https://.../cover.jpg" /></label>
+              <label className="metaDraftWide"><span>Headline</span><input value={metaDraftForm.headline} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, headline: e.target.value })} /></label>
+              <label className="metaDraftWide"><span>Primary text</span><textarea rows="4" value={metaDraftForm.primary_text} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, primary_text: e.target.value })} /></label>
+              <aside className="adsCreativePreview"><span>Instagram preview</span>{metaDraftForm.image_url ? <img src={metaDraftForm.image_url} alt="Campaign creative preview" /> : <div className="adsCreativePlaceholder">Image preview</div>}<strong>{metaDraftForm.headline || "Your headline"}</strong><p>{metaDraftForm.primary_text || "Your primary text"}</p><small>Learn more</small></aside>
+            </> : null}
+          </div>
+          <div className="metaFormActions adsWizardActions">
+            <button disabled={busy || adsWizardStep === 1} onClick={() => setAdsWizardStep((step) => Math.max(1, step - 1))}>Back</button>
+            {adsWizardStep < 3 ? <button disabled={busy} onClick={() => setAdsWizardStep((step) => Math.min(3, step + 1))}>Continue</button> : <button disabled={busy || !metaWorkspace?.readiness?.publishing_ready} onClick={saveMetaDraft}>Save campaign draft</button>}
+            <small>Objective and delivery status are locked to <b>Traffic</b> and <b>PAUSED</b>.</small>
           </div>
         </section>
+        : null}
 
+        {adsSection === "campaigns" ?
         <section className="dashboardPanel metaDraftList">
-          <div className="panelHeader"><div><h2>Campaign drafts</h2><p>Review is separate from the Meta write. Created campaigns remain paused in Ads Manager.</p></div><span>{metaDrafts.length}</span></div>
+          <div className="panelHeader"><div><h2>Campaigns</h2><p>Drafts and complete paused Meta packages in one place.</p></div><button onClick={() => openAdsSection("new")}>New campaign</button></div>
           <div className="metaDraftCards">
             {metaDrafts.map((draft) => <article key={draft.id}>
               <div className="metaDraftCardHeader"><div><strong>{draft.name}</strong><small>{draft.status.replaceAll("_", " ")}</small></div><span>€{(Number(draft.daily_budget_minor || 0) / 100).toFixed(2)}/day</span></div>
@@ -3250,8 +3326,7 @@ export default function PlaylistManager() {
             {!metaDrafts.length ? <p>No campaign drafts yet.</p> : null}
           </div>
         </section>
-
-        <div className={`metaPublishLock ${metaWorkspace?.readiness?.publishing_ready ? "ready" : ""}`}><Lock aria-hidden="true" /><div><strong>{metaWorkspace?.readiness?.publishing_ready ? "Paused campaign workflow unlocked" : "Campaign publishing is locked"}</strong><p>{metaWorkspace?.readiness?.publishing_ready ? "Save a local draft, approve its review, then explicitly create a complete PAUSED campaign package in Meta. Active publishing is not available." : `Still required: ${(metaWorkspace?.readiness?.missing || ["successful audit and three selected assets"]).join(", ")}.`}</p></div></div>
+        : null}
       </section>
       ) : view === "admin" && isAdmin ? (
       <section className="adminPanel">
@@ -5917,6 +5992,89 @@ export default function PlaylistManager() {
         .metaFormWide {
           grid-column: 1 / -1;
         }
+        .adsWorkspaceNav {
+          display: flex;
+          gap: 6px;
+          margin: 0 0 18px;
+          padding: 5px;
+          border: 1px solid #292f38;
+          border-radius: 10px;
+          background: #12161c;
+        }
+        .adsWorkspaceNav button {
+          flex: 0 1 170px;
+          border: 0;
+          background: transparent;
+          color: #8d96a4;
+        }
+        .adsWorkspaceNav button.active {
+          color: #07140c;
+          background: #18e06f;
+        }
+        .adsOverviewGrid {
+          display: grid;
+          grid-template-columns: 1.35fr 1fr;
+          gap: 16px;
+          margin: 16px 0;
+        }
+        .adsQuickStart {
+          display: grid;
+          align-content: center;
+          justify-items: start;
+          min-height: 230px;
+          background: radial-gradient(circle at 85% 15%, rgba(24, 224, 111, 0.15), transparent 42%), #171b22;
+        }
+        .adsQuickStart h2 { margin: 18px 0 8px; font-size: clamp(24px, 3vw, 38px); }
+        .adsQuickStart p { max-width: 620px; margin: 0 0 20px; color: #9aa3b1; line-height: 1.6; }
+        .adsConnectionSummary dl { display: grid; gap: 12px; margin: 18px 0; }
+        .adsConnectionSummary dl div { display: flex; justify-content: space-between; gap: 20px; padding-bottom: 10px; border-bottom: 1px solid #292f38; }
+        .adsConnectionSummary dt { color: #7f8998; }
+        .adsConnectionSummary dd { margin: 0; text-align: right; }
+        .adsWizardSteps {
+          display: grid;
+          grid-template-columns: repeat(3, 1fr);
+          gap: 8px;
+          margin: 20px 0 6px;
+        }
+        .adsWizardSteps button {
+          display: flex;
+          align-items: center;
+          justify-content: flex-start;
+          gap: 9px;
+          border-color: #303744;
+          color: #8d96a4;
+          background: #12161c;
+        }
+        .adsWizardSteps button span {
+          display: grid;
+          place-items: center;
+          width: 24px;
+          height: 24px;
+          border-radius: 50%;
+          background: #252b35;
+          font-size: 11px;
+        }
+        .adsWizardSteps button.active { border-color: #18e06f; color: #f4f6f8; }
+        .adsWizardSteps button.active span,
+        .adsWizardSteps button.complete span { color: #07140c; background: #18e06f; }
+        .adsCreativePreview {
+          grid-column: span 2;
+          display: grid;
+          gap: 10px;
+          overflow: hidden;
+          padding: 12px;
+          border: 1px solid #303744;
+          border-radius: 9px;
+          background: #11151b;
+        }
+        .adsCreativePreview > span { color: #7f8998; font-size: 11px; font-weight: 900; text-transform: uppercase; }
+        .adsCreativePreview img,
+        .adsCreativePlaceholder { width: 100%; height: 220px; border-radius: 6px; object-fit: cover; background: #202631; }
+        .adsCreativePlaceholder { display: grid; place-items: center; color: #657080; }
+        .adsCreativePreview p { margin: 0; color: #a6adba; font-size: 12px; }
+        .adsCreativePreview small { color: #18e06f; font-weight: 900; }
+        .adsWizardActions { justify-content: flex-end; }
+        .adsWizardActions small { margin-right: auto; order: -1; }
         .metaFormActions {
           display: flex;
           align-items: center;
@@ -8049,6 +8207,7 @@ export default function PlaylistManager() {
           .metaFormGrid,
           .metaDraftGrid,
           .metaDraftCards,
+          .adsOverviewGrid,
           .performanceHeroRow,
           .adControlGrid,
           .adPlaylistGrid,
@@ -8059,10 +8218,14 @@ export default function PlaylistManager() {
             grid-column: auto;
           }
           .metaDraftWide { grid-column: auto; }
+          .adsCreativePreview { grid-column: auto; }
           .metaFormActions {
             align-items: stretch;
             flex-direction: column;
           }
+          .adsWorkspaceNav { overflow-x: auto; }
+          .adsWorkspaceNav button { flex: 1 0 135px; }
+          .adsWizardSteps { grid-template-columns: 1fr; }
           .adEventForm {
             grid-template-columns: 1fr;
           }
