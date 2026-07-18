@@ -2421,34 +2421,90 @@ const routes = {
     const draftsResponse = await sb(`/rest/v1/meta_ads_campaign_drafts?select=*&id=eq.${encodeURIComponent(draftId)}&connection_id=eq.${encodeURIComponent(connection.id)}&limit=1`);
     const draft = draftsResponse.ok ? (await draftsResponse.json().catch(() => []))[0] : null;
     if (!draft) return bad(res, 404, "meta_draft_not_found");
-    if (draft.status !== "review_ready") return bad(res, 409, "meta_draft_review_required");
+    if (draft.status === "created_paused") return json(res, 200, { draft });
+    if (!draft.review_confirmed_at || !["review_ready", "error", "creating"].includes(draft.status)) {
+      return bad(res, 409, "meta_draft_review_required");
+    }
     const assetsResponse = await sb(`/rest/v1/meta_ads_assets?select=*&connection_id=eq.${encodeURIComponent(connection.id)}&is_selected=eq.true`);
     const assets = assetsResponse.ok ? await assetsResponse.json().catch(() => []) : [];
     const readiness = metaConnectionReadiness(connection, assets);
     if (!readiness.publishing_ready) return bad(res, 409, `meta_preflight_incomplete: ${readiness.missing.join(", ")}`);
     const adAccount = assets.find((asset) => asset.asset_type === "ad_account");
-    const startedAt = new Date().toISOString();
-    await sb(`/rest/v1/meta_ads_campaign_drafts?id=eq.${encodeURIComponent(draft.id)}`, {
-      method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "creating", updated_at: startedAt }),
-    });
-    try {
-      const created = await metaGraphMutation(connection, `act_${adAccount.meta_id}/campaigns`, {
-        name: draft.name,
-        objective: "OUTCOME_TRAFFIC",
-        status: "PAUSED",
-        special_ad_categories: "[]",
-      });
-      const finishedAt = new Date().toISOString();
-      const update = await sb(`/rest/v1/meta_ads_campaign_drafts?id=eq.${encodeURIComponent(draft.id)}`, {
+    const page = assets.find((asset) => asset.asset_type === "page");
+    const instagram = assets.find((asset) => asset.asset_type === "instagram_account");
+    if (!adAccount || !page || !instagram) return bad(res, 409, "meta_selected_assets_incomplete");
+    const persistDraft = async (patch, representation = false) => {
+      const response = await sb(`/rest/v1/meta_ads_campaign_drafts?id=eq.${encodeURIComponent(draft.id)}`, {
         method: "PATCH",
-        headers: { Prefer: "return=representation" },
-        body: JSON.stringify({ status: "created_paused", meta_campaign_id: String(created.id || ""), last_error: null, updated_at: finishedAt }),
+        headers: { Prefer: representation ? "return=representation" : "return=minimal" },
+        body: JSON.stringify({ ...patch, updated_at: new Date().toISOString() }),
       });
-      const text = await update.text();
-      if (!update.ok) throw new Error(`meta_draft_finalize_failed: ${text.slice(0, 1000)}`);
-      return json(res, 200, { draft: JSON.parse(text || "[]")[0] });
+      const text = await response.text();
+      if (!response.ok) throw new Error(`meta_draft_update_failed: ${text.slice(0, 1000)}`);
+      Object.assign(draft, patch);
+      return representation ? JSON.parse(text || "[]")[0] : draft;
+    };
+    const startedAt = new Date().toISOString();
+    await persistDraft({ status: "creating", last_error: null, updated_at: startedAt });
+    try {
+      if (!draft.meta_campaign_id) {
+        const campaign = await metaGraphMutation(connection, `act_${adAccount.meta_id}/campaigns`, {
+          name: draft.name, objective: "OUTCOME_TRAFFIC", status: "PAUSED", special_ad_categories: "[]",
+        });
+        if (!campaign.id) throw new Error("meta_campaign_id_missing");
+        await persistDraft({ meta_campaign_id: String(campaign.id), creation_stage: "campaign" });
+      }
+      if (!draft.meta_adset_id) {
+        const adset = await metaGraphMutation(connection, `act_${adAccount.meta_id}/adsets`, {
+          name: `${draft.name} — Ad Set`,
+          campaign_id: draft.meta_campaign_id,
+          daily_budget: String(draft.daily_budget_minor),
+          billing_event: "IMPRESSIONS",
+          optimization_goal: "LINK_CLICKS",
+          bid_strategy: "LOWEST_COST_WITHOUT_CAP",
+          targeting: JSON.stringify({
+            age_min: draft.age_min,
+            age_max: draft.age_max,
+            geo_locations: { countries: draft.countries },
+            publisher_platforms: ["facebook", "instagram"],
+          }),
+          status: "PAUSED",
+        });
+        if (!adset.id) throw new Error("meta_adset_id_missing");
+        await persistDraft({ meta_adset_id: String(adset.id), creation_stage: "adset" });
+      }
+      if (!draft.meta_creative_id) {
+        const creative = await metaGraphMutation(connection, `act_${adAccount.meta_id}/adcreatives`, {
+          name: `${draft.name} — Creative`,
+          object_story_spec: JSON.stringify({
+            page_id: page.meta_id,
+            instagram_actor_id: instagram.meta_id,
+            link_data: {
+              message: draft.primary_text,
+              link: draft.destination_url,
+              name: draft.headline,
+              picture: draft.image_url,
+              call_to_action: { type: "LEARN_MORE", value: { link: draft.destination_url } },
+            },
+          }),
+        });
+        if (!creative.id) throw new Error("meta_creative_id_missing");
+        await persistDraft({ meta_creative_id: String(creative.id), creation_stage: "creative" });
+      }
+      if (!draft.meta_ad_id) {
+        const ad = await metaGraphMutation(connection, `act_${adAccount.meta_id}/ads`, {
+          name: `${draft.name} — Ad`,
+          adset_id: draft.meta_adset_id,
+          creative: JSON.stringify({ creative_id: draft.meta_creative_id }),
+          status: "PAUSED",
+        });
+        if (!ad.id) throw new Error("meta_ad_id_missing");
+        await persistDraft({ meta_ad_id: String(ad.id), creation_stage: "ad" });
+      }
+      const completed = await persistDraft({ status: "created_paused", creation_stage: "complete", last_error: null }, true);
+      return json(res, 200, { draft: completed });
     } catch (error) {
-      const message = String(error?.message || "meta_campaign_create_failed").slice(0, 1000);
+      const message = String(error?.message || "meta_paused_package_create_failed").slice(0, 1000);
       await sb(`/rest/v1/meta_ads_campaign_drafts?id=eq.${encodeURIComponent(draft.id)}`, {
         method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "error", last_error: message, updated_at: new Date().toISOString() }),
       }).catch(() => null);

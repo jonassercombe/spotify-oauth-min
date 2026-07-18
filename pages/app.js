@@ -2031,7 +2031,7 @@ export default function PlaylistManager() {
   }
 
   async function createPausedMetaCampaign(draftId) {
-    await run("Paused Meta campaign created", async () => {
+    await run("Paused Meta campaign package created", async () => {
       await api("/api/meta/campaign-drafts/create-paused", {
         method: "POST",
         accessToken: accessToken(),
@@ -3230,7 +3230,7 @@ export default function PlaylistManager() {
           </div>
           <div className="metaFormActions">
             <button disabled={busy || !metaWorkspace?.readiness?.publishing_ready} onClick={saveMetaDraft}>Save local draft</button>
-            <small>The server hard-codes <b>OUTCOME_TRAFFIC</b> and <b>PAUSED</b>; this phase creates a campaign shell only.</small>
+            <small>The server hard-codes <b>OUTCOME_TRAFFIC</b> and <b>PAUSED</b>. Campaign, ad set and ad are created paused.</small>
           </div>
         </section>
 
@@ -3240,18 +3240,18 @@ export default function PlaylistManager() {
             {metaDrafts.map((draft) => <article key={draft.id}>
               <div className="metaDraftCardHeader"><div><strong>{draft.name}</strong><small>{draft.status.replaceAll("_", " ")}</small></div><span>€{(Number(draft.daily_budget_minor || 0) / 100).toFixed(2)}/day</span></div>
               <p>{draft.primary_text}</p>
-              <dl><div><dt>Target</dt><dd>{(draft.countries || []).join(", ")} · {draft.age_min}–{draft.age_max}</dd></div><div><dt>Destination</dt><dd>{draft.destination_url}</dd></div>{draft.meta_campaign_id ? <div><dt>Meta campaign</dt><dd>{draft.meta_campaign_id}</dd></div> : null}</dl>
+              <dl><div><dt>Target</dt><dd>{(draft.countries || []).join(", ")} · {draft.age_min}–{draft.age_max}</dd></div><div><dt>Destination</dt><dd>{draft.destination_url}</dd></div><div><dt>Creation stage</dt><dd>{(draft.creation_stage || "local").replaceAll("_", " ")}</dd></div>{draft.meta_campaign_id ? <div><dt>Meta campaign</dt><dd>{draft.meta_campaign_id}</dd></div> : null}{draft.meta_adset_id ? <div><dt>Meta ad set</dt><dd>{draft.meta_adset_id}</dd></div> : null}{draft.meta_creative_id ? <div><dt>Meta creative</dt><dd>{draft.meta_creative_id}</dd></div> : null}{draft.meta_ad_id ? <div><dt>Meta ad</dt><dd>{draft.meta_ad_id}</dd></div> : null}</dl>
               {draft.last_error ? <div className="metaWarnings"><p>{draft.last_error}</p></div> : null}
               <div className="metaDraftActions">
                 <button disabled={busy || draft.status !== "draft"} onClick={() => reviewMetaDraft(draft.id)}>{draft.status === "draft" ? "Approve review" : "Reviewed"}</button>
-                <button className="dangerButton" disabled={busy || draft.status !== "review_ready"} onClick={() => createPausedMetaCampaign(draft.id)}>Create PAUSED in Meta</button>
+                <button className="dangerButton" disabled={busy || !["review_ready", "error"].includes(draft.status)} onClick={() => createPausedMetaCampaign(draft.id)}>{draft.status === "error" ? "Resume PAUSED creation" : draft.status === "created_paused" ? "Created PAUSED" : "Create PAUSED package"}</button>
               </div>
             </article>)}
             {!metaDrafts.length ? <p>No campaign drafts yet.</p> : null}
           </div>
         </section>
 
-        <div className={`metaPublishLock ${metaWorkspace?.readiness?.publishing_ready ? "ready" : ""}`}><Lock aria-hidden="true" /><div><strong>{metaWorkspace?.readiness?.publishing_ready ? "Paused campaign workflow unlocked" : "Campaign publishing is locked"}</strong><p>{metaWorkspace?.readiness?.publishing_ready ? "Save a local draft, approve its review, then explicitly create a PAUSED campaign shell in Meta. Active publishing is not available." : `Still required: ${(metaWorkspace?.readiness?.missing || ["successful audit and three selected assets"]).join(", ")}.`}</p></div></div>
+        <div className={`metaPublishLock ${metaWorkspace?.readiness?.publishing_ready ? "ready" : ""}`}><Lock aria-hidden="true" /><div><strong>{metaWorkspace?.readiness?.publishing_ready ? "Paused campaign workflow unlocked" : "Campaign publishing is locked"}</strong><p>{metaWorkspace?.readiness?.publishing_ready ? "Save a local draft, approve its review, then explicitly create a complete PAUSED campaign package in Meta. Active publishing is not available." : `Still required: ${(metaWorkspace?.readiness?.missing || ["successful audit and three selected assets"]).join(", ")}.`}</p></div></div>
       </section>
       ) : view === "admin" && isAdmin ? (
       <section className="adminPanel">
