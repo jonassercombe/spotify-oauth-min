@@ -2561,11 +2561,23 @@ const routes = {
         await persistDraft({ meta_adset_id: String(adset.id), creation_stage: "adset" });
       }
       if (!draft.meta_creative_id) {
+        const adAccountInstagram = await metaGraphRequest(connection, `act_${adAccount.meta_id}/instagram_accounts`, {
+          fields: "id,username",
+          limit: 100,
+        });
+        const selectedInstagramUsername = String(instagram.metadata?.username || "").replace(/^@/, "").toLowerCase();
+        const instagramActor = (adAccountInstagram.data || []).find((candidate) =>
+          String(candidate.id) === String(instagram.meta_id) ||
+          (selectedInstagramUsername && String(candidate.username || "").toLowerCase() === selectedInstagramUsername)
+        );
+        if (!instagramActor?.id) {
+          throw new Error("meta_instagram_not_assigned_to_ad_account: assign the selected Instagram account to the selected Meta ad account");
+        }
         const creative = await metaGraphMutation(connection, `act_${adAccount.meta_id}/adcreatives`, {
           name: `${draft.name} — Creative`,
           object_story_spec: JSON.stringify({
             page_id: page.meta_id,
-            instagram_actor_id: instagram.meta_id,
+            instagram_actor_id: String(instagramActor.id),
             link_data: {
               message: draft.primary_text,
               link: draft.destination_url,
