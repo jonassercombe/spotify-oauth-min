@@ -638,6 +638,7 @@ export default function PlaylistManager() {
   const [creativeRenderPolling, setCreativeRenderPolling] = useState({});
   const [creativeBatchTemplates, setCreativeBatchTemplates] = useState({});
   const [creativeBatchRuns, setCreativeBatchRuns] = useState({});
+  const [creativeProjectMediaRuns, setCreativeProjectMediaRuns] = useState({});
   const [adsSection, setAdsSection] = useState("overview");
   const [adsWizardStep, setAdsWizardStep] = useState(1);
   const [metaDraftForm, setMetaDraftForm] = useState({
@@ -2158,6 +2159,71 @@ export default function PlaylistManager() {
     }
   }
 
+  async function recommendProjectMedia(project) {
+    const concepts = [...(project.meta_creative_concepts || [])].sort((a, b) => Number(a.position || 0) - Number(b.position || 0));
+    if (!concepts.length) return;
+    setError("");
+    setMessage("");
+    setCreativeProjectMediaRuns((current) => ({ ...current, [project.id]: { status: "running", completed: 0, total: concepts.length, results: {}, errors: [] } }));
+    const results = {};
+    const errors = [];
+    const usedVideoIds = new Set();
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < concepts.length) {
+        const concept = concepts[cursor];
+        cursor += 1;
+        try {
+          const query = concept.visual_search_terms?.[0] || concept.visual_direction || "people listening music";
+          const data = await api("/api/meta/creative-media/recommend", {
+            method: "POST",
+            accessToken: accessToken(),
+            body: { concept_id: concept.id, query },
+          });
+          const recommendations = data.recommendations || [];
+          const selected = recommendations.find((video) => !usedVideoIds.has(video.id)) || recommendations[0] || null;
+          if (selected) usedVideoIds.add(selected.id);
+          results[concept.id] = { concept, recommendations, selected_id: selected?.id || "", inspected: data.inspected || 0, queries: data.queries || [] };
+        } catch (error) {
+          errors.push({ concept_id: concept.id, title: concept.title, message: error.message || "AI shortlist failed" });
+        }
+        setCreativeProjectMediaRuns((current) => ({ ...current, [project.id]: { status: "running", completed: Object.keys(results).length + errors.length, total: concepts.length, results: { ...results }, errors: [...errors] } }));
+      }
+    };
+    await Promise.all([worker(), worker()]);
+    setCreativeProjectMediaRuns((current) => ({ ...current, [project.id]: { status: errors.length === concepts.length ? "failed" : "review", completed: concepts.length, total: concepts.length, results: { ...results }, errors: [...errors] } }));
+    setMessage(errors.length ? `AI media review finished with ${errors.length} failed concept${errors.length === 1 ? "" : "s"}.` : "AI media review ready");
+  }
+
+  function chooseProjectMedia(projectId, conceptId, videoId) {
+    setCreativeProjectMediaRuns((current) => ({
+      ...current,
+      [projectId]: {
+        ...current[projectId],
+        results: { ...current[projectId]?.results, [conceptId]: { ...current[projectId]?.results?.[conceptId], selected_id: videoId } },
+      },
+    }));
+  }
+
+  async function assignProjectMedia(project) {
+    const runState = creativeProjectMediaRuns[project.id];
+    const selections = Object.values(runState?.results || {}).map((result) => ({
+      concept: result.concept,
+      video: result.recommendations.find((candidate) => candidate.id === result.selected_id),
+      query: result.queries?.[0] || "",
+    })).filter((item) => item.video);
+    await run("Selected AI videos assigned", async () => {
+      for (const { concept, video, query } of selections) {
+        await api("/api/meta/creative-media/select", {
+          method: "POST",
+          accessToken: accessToken(),
+          body: { concept_id: concept.id, provider_id: video.id, source_url: video.source_url, width: video.source_width, height: video.source_height, duration: video.duration, image: video.image, pexels_url: video.url, creator_name: video.user?.name, creator_url: video.user?.url, query, ai: video.ai || null },
+        });
+      }
+      return loadCreativeProjects();
+    });
+  }
+
   async function selectCreativeMedia(concept, video) {
     await run("Video assigned to concept", async () => {
       await api("/api/meta/creative-media/select", {
@@ -3571,6 +3637,8 @@ export default function PlaylistManager() {
                 const batchCompleted = batchJobs.filter((job) => job.status === "completed").length || localBatch?.completed || 0;
                 const batchFailed = batchJobs.filter((job) => ["failed", "cancelled"].includes(job.status)).length || localBatch?.failed || 0;
                 const batchActive = batchJobs.some((job) => ["queued", "processing"].includes(job.status));
+                const projectMediaRun = creativeProjectMediaRuns[project.id];
+                const projectMediaResults = Object.values(projectMediaRun?.results || {}).sort((a, b) => Number(a.concept?.position || 0) - Number(b.concept?.position || 0));
                 return <article key={project.id} className={isOpen ? "isOpen" : ""}>
                   <div className="creativeProjectSummary">
                     <Artwork src={project.playlists?.image || project.brief?.cover_image} alt="" size="lg" />
@@ -3579,6 +3647,16 @@ export default function PlaylistManager() {
                   </div>
                   {isOpen ? <div className="creativeProjectDetail">
                     {hasBrief ? <div className="creativeBriefPanel"><span>Creative brief</span><h3>{project.brief.title || project.name}</h3><p>{project.brief.mood_summary}</p><p>{project.brief.audience_summary}</p><div>{(project.brief.core_angles || []).map((angle) => <b key={angle}>{angle}</b>)}</div></div> : <div className="creativeEmptyState"><strong>Ready to analyze</strong><p>PlaylistPilot will read the local playlist snapshot and create a brief plus eight testable concepts.</p><button disabled={busy} onClick={() => generateCreativeProject(project.id)}>{project.status === "error" ? "Retry generation" : "Generate brief & concepts"}</button>{project.last_error ? <small>{project.last_error}</small> : null}</div>}
+                    {concepts.length ? <section className="creativeMediaAutomation">
+                      <div className="creativeBatchHeader"><div><span>AI media director</span><h3>Find matching video for every concept</h3><p>Two searches and multi-frame Vision scoring per concept, with duplicate clips avoided across the project.</p></div><button className="aiMediaButton" disabled={busy || projectMediaRun?.status === "running"} onClick={() => recommendProjectMedia(project)}>{projectMediaRun?.status === "running" ? `Reviewing ${projectMediaRun.completed}/${projectMediaRun.total}…` : projectMediaRun?.status === "review" ? "Regenerate all" : `Generate media for all ${concepts.length}`}</button></div>
+                      {projectMediaRun ? <div className="creativeProjectMediaProgress"><div><span style={{ width: `${Math.round((projectMediaRun.completed / Math.max(1, projectMediaRun.total)) * 100)}%` }} /></div><small>{projectMediaRun.status === "running" ? "Pexels search and visual ranking are running with two concurrent jobs." : `${projectMediaResults.length} concepts ready for review${projectMediaRun.errors?.length ? ` · ${projectMediaRun.errors.length} failed` : ""}`}</small></div> : null}
+                      {projectMediaResults.length ? <div className="creativeProjectMediaReview">{projectMediaResults.map((result) => {
+                        const selected = result.recommendations.find((video) => video.id === result.selected_id) || result.recommendations[0];
+                        if (!selected) return null;
+                        return <article key={result.concept.id}><div className="creativeProjectMediaVisual"><img src={selected.image || selected.preview_images?.[0]} alt="" /><b>{selected.ai?.overall_score || 0}</b></div><div><span>Concept {result.concept.position}</span><h4>{result.concept.title}</h4><strong>{result.concept.hook}</strong><select aria-label={`AI video for ${result.concept.title}`} value={selected.id} onChange={(event) => chooseProjectMedia(project.id, result.concept.id, event.target.value)}>{result.recommendations.map((video, index) => <option key={video.id} value={video.id}>#{index + 1} · {video.ai?.overall_score || 0}/100 · {video.user?.name || "Pexels"}</option>)}</select><p>{selected.ai?.summary}</p><small>{selected.ai?.best_template?.replaceAll("_", " ")} · {selected.duration}s · {selected.source_width}×{selected.source_height}</small></div></article>;
+                      })}</div> : null}
+                      {projectMediaRun?.status === "review" && projectMediaResults.length ? <div className="creativeMediaReviewActions"><button disabled={busy} onClick={() => assignProjectMedia(project)}>Assign {projectMediaResults.length} selected clips</button><small>This saves the selected Pexels assets but does not render videos yet.</small></div> : null}
+                    </section> : null}
                     {readyConcepts.length ? <section className="creativeBatchPanel">
                       <div className="creativeBatchHeader"><div><span>Batch render</span><h3>Turn {readyConcepts.length} ready concept{readyConcepts.length === 1 ? "" : "s"} into variants</h3><p>Select one or more layouts. Every ready concept is rendered once per template.</p></div><button disabled={busy || !batchTemplateIds.length || batchActive} onClick={() => queueCreativeBatch(project)}>{batchActive ? "Rendering…" : `Render ${readyConcepts.length * batchTemplateIds.length} variant${readyConcepts.length * batchTemplateIds.length === 1 ? "" : "s"}`}</button></div>
                       <div className="creativeTemplateGrid">{CREATIVE_RENDER_TEMPLATES.map((template) => <label key={template.id} className={batchTemplateIds.includes(template.id) ? "isSelected" : ""}><input type="checkbox" checked={batchTemplateIds.includes(template.id)} onChange={() => toggleBatchTemplate(project.id, template.id)} /><span><strong>{template.name}</strong><small>{template.description}</small></span></label>)}</div>
@@ -6505,6 +6583,27 @@ export default function PlaylistManager() {
         .creativeBatchProgress > div { height: 7px; overflow: hidden; border-radius: 999px; background: #252d37; }
         .creativeBatchProgress > div > span { display: block; height: 100%; border-radius: inherit; background: #18e06f; transition: width .25s ease; }
         .creativeBatchProgress small { color: #8994a2; }
+        .creativeMediaAutomation { display: grid; gap: 13px; padding: 16px; border: 1px solid rgba(91, 132, 255, .42); border-radius: 11px; background: linear-gradient(135deg, rgba(91, 132, 255, .09), rgba(10, 14, 18, .96)); }
+        .creativeMediaAutomation .creativeBatchHeader > div > span { color: #88a5ff; }
+        .creativeMediaAutomation .aiMediaButton { color: #081121; background: #88a5ff; }
+        .creativeProjectMediaProgress { display: grid; gap: 6px; }
+        .creativeProjectMediaProgress > div { height: 7px; overflow: hidden; border-radius: 999px; background: #252d37; }
+        .creativeProjectMediaProgress > div > span { display: block; height: 100%; border-radius: inherit; background: #88a5ff; transition: width .25s ease; }
+        .creativeProjectMediaProgress small { color: #8994a2; }
+        .creativeProjectMediaReview { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+        .creativeProjectMediaReview > article { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 10px; overflow: hidden; padding: 9px; border: 1px solid #303a4d; border-radius: 9px; background: #10151d; }
+        .creativeProjectMediaVisual { position: relative; min-height: 150px; overflow: hidden; border-radius: 7px; background: #080b10; }
+        .creativeProjectMediaVisual img { width: 100%; height: 100%; object-fit: cover; }
+        .creativeProjectMediaVisual b { position: absolute; top: 6px; left: 6px; padding: 5px 7px; border-radius: 7px; color: #07140c; background: #18e06f; font-size: 14px; }
+        .creativeProjectMediaReview article > div:last-child { display: grid; align-content: start; gap: 5px; min-width: 0; }
+        .creativeProjectMediaReview article span { color: #88a5ff; font-size: 8px; font-weight: 900; text-transform: uppercase; }
+        .creativeProjectMediaReview h4 { margin: 0; }
+        .creativeProjectMediaReview strong { color: #f3f6fa; font-size: 12px; }
+        .creativeProjectMediaReview p { margin: 0; color: #9aa5b3; font-size: 9px; line-height: 1.4; }
+        .creativeProjectMediaReview small { color: #778291; font-size: 8px; text-transform: uppercase; }
+        .creativeProjectMediaReview select { width: 100%; min-width: 0; padding: 7px; font-size: 9px; }
+        .creativeMediaReviewActions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+        .creativeMediaReviewActions small { color: #8994a2; }
         .creativeBriefPanel b, .creativeConceptTerms b, .creativeConceptTerms button { padding: 5px 8px; border: 1px solid #343d49; border-radius: 999px; color: #aeb7c3; background: transparent; font-size: 9px; }
         .creativeConceptGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
         .creativeConceptGrid article { display: grid; align-content: start; gap: 9px; padding: 14px; border: 1px solid #303744; border-radius: 10px; background: #131820; }
@@ -8894,6 +8993,7 @@ export default function PlaylistManager() {
           .creativeMediaSearch > div:first-child input { grid-column: 1 / -1; }
           .creativeEditor { grid-template-columns: 1fr; }
           .creativeTemplateGrid { grid-template-columns: 1fr; }
+          .creativeProjectMediaReview { grid-template-columns: 1fr; }
           .creativeBatchHeader { align-items: stretch; flex-direction: column; }
           .creativeEditorControls { grid-template-columns: 1fr; }
           .creativeEditorWide, .creativeEditorActions { grid-column: auto; }
