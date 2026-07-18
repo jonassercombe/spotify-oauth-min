@@ -1,10 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Head from "next/head";
 import { useRouter } from "next/router";
-import { ArrowDown, ArrowUp, GripVertical, Lock, Settings, Shuffle, TimerReset, Trash2, Unlock, X } from "lucide-react";
+import { ArrowDown, ArrowUp, GripVertical, ListEnd, Lock, Settings, Shuffle, TimerReset, Trash2, Unlock, X } from "lucide-react";
+import { Turnstile } from "@marsidev/react-turnstile";
+import { Area, AreaChart, Bar, BarChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { getSupabaseBrowserClient } from "../lib/supabaseBrowser";
 
 const ENABLE_OPTIMISTIC_PLAYLIST_UI = true;
+const ENABLE_FAST_PLAYLIST_MOVES = true;
+const ENABLE_FAST_PLAYLIST_MUTATIONS = true;
+const USE_RECHARTS_GROWTH_CHART = true;
 
 async function api(path, { method = "GET", accessToken, body } = {}) {
   const headers = { "Content-Type": "application/json" };
@@ -48,6 +53,28 @@ function formatShortDate(value) {
   const d = new Date(`${value}T00:00:00`);
   if (Number.isNaN(d.getTime())) return value;
   return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(d);
+}
+
+function buildBackupSlots(backups = []) {
+  const rows = [...(Array.isArray(backups) ? backups : [])]
+    .filter((row) => row?.id && Number.isFinite(Date.parse(row.taken_at || "")))
+    .sort((a, b) => Date.parse(b.taken_at) - Date.parse(a.taken_at));
+  const used = new Set();
+  const manual = rows.find((row) => String(row.reason || "") === "manual") || null;
+  if (manual) used.add(manual.id);
+  const pickAtLeastDaysOld = (days) => {
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    const match = rows.find((row) => !used.has(row.id) && Date.parse(row.taken_at) <= cutoff) || null;
+    if (match) used.add(match.id);
+    return match;
+  };
+  return [
+    { key: "manual", label: "Latest manual", backup: manual, empty: "Create a manual backup to fill this slot." },
+    { key: "daily", label: "Daily", backup: pickAtLeastDaysOld(1), empty: "Available after one day of backup history." },
+    { key: "weekly", label: "Weekly", backup: pickAtLeastDaysOld(7), empty: "Available after one week of backup history." },
+    { key: "monthly", label: "Monthly", backup: pickAtLeastDaysOld(30), empty: "Available after one month of backup history." },
+    { key: "six_month", label: "Six-month", backup: pickAtLeastDaysOld(180), empty: "Available after six months of backup history." },
+  ];
 }
 
 function spotifySetupErrorMessage(code = "") {
@@ -199,7 +226,7 @@ function dropTargetPosition(source, target, placement = "before") {
   return from < targetPos ? targetPos - 1 : targetPos;
 }
 
-function GrowthChart({ values = [], labels = [], growth = [], granularity = "daily", valueLabel = "followers" }) {
+function LegacyGrowthChart({ values = [], labels = [], growth = [], granularity = "daily", valueLabel = "followers" }) {
   const [hoverIndex, setHoverIndex] = useState(null);
   const points = values.map((v) => Number(v) || 0);
   if (!points.length) return <div className="growthChart growthChart--empty"><span>No growth data yet</span></div>;
@@ -257,6 +284,160 @@ function GrowthChart({ values = [], labels = [], growth = [], granularity = "dai
         <span>{formatNumber(points[activeIndex])} {valueLabel}</span>
         <em><b>{formatDelta(tooltipGrowth)}</b> {growthLabel}</em>
       </div>
+    </div>
+  );
+}
+
+function GrowthChartTooltip({ active, payload, label, granularity, valueLabel }) {
+  if (!active || !payload?.length) return null;
+  const point = payload[0]?.payload || {};
+  const growthLabel = granularity === "monthly" ? "monthly growth" : granularity === "weekly" ? "weekly growth" : "daily growth";
+  return (
+    <div className="rechartsTooltip">
+      <strong>{label ? formatShortDate(label) : ""}</strong>
+      <span>{formatNumber(point.value)} {valueLabel}</span>
+      <em><b>{formatDelta(point.growth)}</b> {growthLabel}</em>
+    </div>
+  );
+}
+
+function RechartsGrowthChart({ values = [], labels = [], growth = [], granularity = "daily", valueLabel = "followers" }) {
+  const points = values.map((value, index) => ({
+    label: labels?.[index] || String(index + 1),
+    value: Number(value) || 0,
+    growth: Number(growth?.[index] || 0),
+  }));
+  if (!points.length) return <div className="growthChart growthChart--empty"><span>No growth data yet</span></div>;
+  const min = Math.min(...points.map((point) => point.value));
+  const max = Math.max(...points.map((point) => point.value));
+  const span = max - min || 1;
+  const domainPad = Math.max(1, Math.ceil(span * 0.08));
+  const tickFormatter = (value) => {
+    if (Math.abs(Number(value)) >= 1000000) return `${Math.round(Number(value) / 100000) / 10}M`;
+    if (Math.abs(Number(value)) >= 1000) return `${Math.round(Number(value) / 100) / 10}k`;
+    return formatNumber(value);
+  };
+  return (
+    <div className="growthChart growthChart--recharts">
+      <ResponsiveContainer width="100%" height="100%">
+        <AreaChart data={points} margin={{ top: 18, right: 18, bottom: 6, left: 4 }}>
+          <defs>
+            <linearGradient id="growthAreaGradient" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#18e06f" stopOpacity={0.28} />
+              <stop offset="72%" stopColor="#18e06f" stopOpacity={0.035} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid stroke="rgba(166, 173, 186, 0.16)" strokeDasharray="3 7" vertical={false} />
+          <XAxis
+            dataKey="label"
+            axisLine={false}
+            tickLine={false}
+            minTickGap={26}
+            tickMargin={10}
+            tick={{ fill: "#7f8794", fontSize: 11, fontWeight: 700 }}
+            tickFormatter={formatShortDate}
+          />
+          <YAxis
+            axisLine={false}
+            tickLine={false}
+            width={54}
+            domain={[Math.max(0, min - domainPad), max + domainPad]}
+            tick={{ fill: "#7f8794", fontSize: 11, fontWeight: 700 }}
+            tickFormatter={tickFormatter}
+          />
+          <Tooltip
+            cursor={{ stroke: "rgba(244, 246, 251, 0.28)", strokeDasharray: "3 4" }}
+            content={<GrowthChartTooltip granularity={granularity} valueLabel={valueLabel} />}
+          />
+          <Area
+            type="monotone"
+            dataKey="value"
+            stroke="#18e06f"
+            strokeWidth={2.4}
+            fill="url(#growthAreaGradient)"
+            activeDot={{ r: 4, fill: "#f4fff8", stroke: "#18e06f", strokeWidth: 2 }}
+            dot={points.length <= 14 ? { r: 2, fill: "#18e06f", stroke: "#11161d", strokeWidth: 1 } : false}
+            isAnimationActive={false}
+          />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function GrowthChart(props) {
+  return USE_RECHARTS_GROWTH_CHART ? <RechartsGrowthChart {...props} /> : <LegacyGrowthChart {...props} />;
+}
+
+function AdChartTooltip({ active, payload, label }) {
+  if (!active || !payload?.length) return null;
+  const point = payload[0]?.payload || {};
+  return (
+    <div className="rechartsTooltip">
+      <strong>{label ? formatShortDate(label) : ""}</strong>
+      <span>{formatNumber(point.followers)} followers total</span>
+      <em><b>{formatDelta(point.growth)}</b> follower delta</em>
+      <span>Ad spend: EUR {formatNumber(point.ad_spend || 0)}</span>
+    </div>
+  );
+}
+
+function AdPlaylistChart({ playlist }) {
+  const data = (playlist?.labels || []).map((label, index) => ({
+    label,
+    followers: Number(playlist.followers?.[index] || 0),
+    growth: Number(playlist.growth?.[index] || 0),
+    ad_spend: Number(playlist.ad_spend?.[index] || 0),
+    has_spend: Number(playlist.ad_spend?.[index] || 0) > 0,
+  }));
+  if (!data.length) return <div className="adChart adChart--empty"><span>No growth snapshots yet</span></div>;
+  const hasFollowerData = data.some((point) => Number(point.followers) > 0);
+  if (!hasFollowerData) return <div className="adChart adChart--empty"><span>Waiting for follower snapshots</span></div>;
+  const events = (playlist.events || []).filter((event) => event.bucket_label && data.some((point) => point.label === event.bucket_label));
+  const maxAbsGrowth = Math.max(1, ...data.map((point) => Math.abs(Number(point.growth || 0))));
+  const domainPad = Math.max(1, Math.ceil(maxAbsGrowth * 0.12));
+  return (
+    <div className="adChart">
+      <ResponsiveContainer width="100%" height={240} minWidth={240}>
+        <BarChart data={data} margin={{ top: 22, right: 18, bottom: 8, left: 0 }} className="adChartSvg">
+          <CartesianGrid stroke="rgba(166, 173, 186, 0.14)" strokeDasharray="3 7" vertical={false} />
+          <XAxis
+            dataKey="label"
+            axisLine={false}
+            tickLine={false}
+            minTickGap={22}
+            tick={{ fill: "#7f8794", fontSize: 10, fontWeight: 700 }}
+            tickFormatter={formatShortDate}
+          />
+          <YAxis axisLine={false} tickLine={false} width={54} domain={[-maxAbsGrowth - domainPad, maxAbsGrowth + domainPad]} tick={{ fill: "#7f8794", fontSize: 10, fontWeight: 700 }} tickFormatter={(value) => formatDelta(value)} />
+          <Tooltip content={<AdChartTooltip />} cursor={{ fill: "rgba(244, 246, 251, 0.04)" }} />
+          <ReferenceLine y={0} stroke="rgba(244, 246, 251, 0.52)" strokeWidth={1.2} />
+          <Bar dataKey="growth" radius={[4, 4, 4, 4]} fill="#18e06f" isAnimationActive={false} />
+          {events.map((event) => (
+            <ReferenceLine
+              key={event.id}
+              x={event.bucket_label}
+              stroke={Number(event.daily_spend || 0) > 0 ? "#7cc7ff" : "#ffd066"}
+              strokeDasharray="4 4"
+              label={{ value: event.label || (Number(event.daily_spend || 0) > 0 ? `EUR ${event.daily_spend}` : "note"), fill: "#a6adba", fontSize: 10, position: "top" }}
+            />
+          ))}
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function AdPlaylistFollowerChart({ playlist }) {
+  return (
+    <div className="adMiniGrowthChart">
+      <GrowthChart
+        values={playlist?.followers || []}
+        labels={playlist?.labels || []}
+        growth={playlist?.growth || []}
+        granularity="daily"
+        valueLabel="followers"
+      />
     </div>
   );
 }
@@ -339,7 +520,12 @@ export default function PlaylistManager() {
   const [trackSearchNotice, setTrackSearchNotice] = useState("");
   const [trackPosition, setTrackPosition] = useState("");
   const [trackExpiry, setTrackExpiry] = useState("");
+  const [futureAddEnabled, setFutureAddEnabled] = useState(false);
+  const [autoExpiryEnabled, setAutoExpiryEnabled] = useState(true);
   const [autoWeeks, setAutoWeeks] = useState("4");
+  const [trackLimitEnabled, setTrackLimitEnabled] = useState(false);
+  const [trackLimitCount, setTrackLimitCount] = useState("");
+  const [trackLimitStrategy, setTrackLimitStrategy] = useState("back");
   const [flexSettings, setFlexSettings] = useState(null);
   const [flexSlots, setFlexSlots] = useState([]);
   const [flexReference, setFlexReference] = useState("");
@@ -353,6 +539,13 @@ export default function PlaylistManager() {
   const [flexMaxPopularity, setFlexMaxPopularity] = useState("");
   const [flexMaxReleaseAgeWeeks, setFlexMaxReleaseAgeWeeks] = useState("");
   const [flexHistory, setFlexHistory] = useState([]);
+  const [futureAdds, setFutureAdds] = useState([]);
+  const [futureAddForm, setFutureAddForm] = useState({
+    release_date: "",
+    artist_name: "",
+    track_title: "",
+    position: "",
+  });
   const [backups, setBackups] = useState([]);
   const [restoringBackupId, setRestoringBackupId] = useState("");
   const [selectedBackupId, setSelectedBackupId] = useState("");
@@ -361,11 +554,28 @@ export default function PlaylistManager() {
   const [backupRestoreMode, setBackupRestoreMode] = useState("order");
   const [busy, setBusy] = useState(false);
   const moveInFlightRef = useRef(false);
+  const moveQueueRef = useRef(Promise.resolve());
+  const moveReconcileTimerRef = useRef(null);
+  const [pendingPlaylistEdits, setPendingPlaylistEdits] = useState(0);
+  const connectionsLoadSeqRef = useRef(0);
+  const lastAutoSetupStepRef = useRef(0);
+  const spotifyAccountsSectionRef = useRef(null);
+  const spotifyApiSectionRef = useRef(null);
   const playlistLoadSeqRef = useRef(0);
   const selectedPlaylistIdRef = useRef("");
   const [busyLabel, setBusyLabel] = useState("");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [spotifySetupAlert, setSpotifySetupAlert] = useState("");
+  const [authMode, setAuthMode] = useState("login");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authCaptchaToken, setAuthCaptchaToken] = useState("");
+  const [authCaptchaKey, setAuthCaptchaKey] = useState(0);
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authNotice, setAuthNotice] = useState("");
+  const [passwordRecoveryOpen, setPasswordRecoveryOpen] = useState(false);
+  const [recoveryPassword, setRecoveryPassword] = useState("");
   const [view, setView] = useState("manager");
   const [dashboardSummary, setDashboardSummary] = useState(null);
   const [dashboardSeries, setDashboardSeries] = useState(null);
@@ -376,7 +586,19 @@ export default function PlaylistManager() {
   const [dashboardConnectionId, setDashboardConnectionId] = useState("");
   const [dashboardPlaylistId, setDashboardPlaylistId] = useState("");
   const [dashboardGrowthMode, setDashboardGrowthMode] = useState("followers");
+  const [dashboardTab, setDashboardTab] = useState("stats");
+  const [adPerformance, setAdPerformance] = useState(null);
+  const [adForm, setAdForm] = useState({
+    playlist_id: "",
+    event_date: new Date().toISOString().slice(0, 10),
+    daily_spend: "",
+    label: "",
+    note: "",
+  });
+  const [adPlaylistView, setAdPlaylistView] = useState("chart");
+  const [adMobileChartMode, setAdMobileChartMode] = useState("delta");
   const [moversPage, setMoversPage] = useState(0);
+  const [portfolioPage, setPortfolioPage] = useState(0);
   const [toolsOpen, setToolsOpen] = useState(false);
   const [activeTool, setActiveTool] = useState("add");
   const [dragTrackId, setDragTrackId] = useState("");
@@ -390,6 +612,14 @@ export default function PlaylistManager() {
   const [playlistsLoaded, setPlaylistsLoaded] = useState(false);
   const [healthStatus, setHealthStatus] = useState(null);
   const [adminStatus, setAdminStatus] = useState(null);
+  const [metaWorkspace, setMetaWorkspace] = useState(null);
+  const [metaForm, setMetaForm] = useState({
+    app_id: "2767342386948629",
+    business_id: "1442789502837476",
+    graph_version: "v25.0",
+    access_token: "",
+    app_secret: "",
+  });
   const [spotifyClientId, setSpotifyClientId] = useState("");
   const [spotifyClientSecret, setSpotifyClientSecret] = useState("");
   const [spotifyAppName, setSpotifyAppName] = useState("");
@@ -405,6 +635,23 @@ export default function PlaylistManager() {
   const moversPageCount = Math.max(1, Math.ceil(movers.length / moversPageSize));
   const safeMoversPage = Math.min(moversPage, moversPageCount - 1);
   const visibleMovers = movers.slice(safeMoversPage * moversPageSize, safeMoversPage * moversPageSize + moversPageSize);
+  const portfolioItems = dashboardSummary?.top_playlists || [];
+  const portfolioPageSize = 12;
+  const portfolioPageCount = Math.max(1, Math.ceil(portfolioItems.length / portfolioPageSize));
+  const safePortfolioPage = Math.max(0, Math.min(portfolioPage, portfolioPageCount - 1));
+  const visiblePortfolioItems = portfolioItems.length > portfolioPageSize
+    ? portfolioItems.slice(safePortfolioPage * portfolioPageSize, safePortfolioPage * portfolioPageSize + portfolioPageSize)
+    : portfolioItems;
+  const performanceRanked = (dashboardSummary?.growth_rank || []).filter((item) => item?.has_growth_data);
+  const performanceCards = dashboardSummary?.performance_cards || {};
+  const performanceHighlights = {
+    bestMonth: performanceCards.best_month || performanceRanked[0] || null,
+    bestToday: performanceCards.best_today || null,
+    needsAttention: performanceCards.needs_attention || null,
+    worstMonth: performanceCards.worst_month || (performanceRanked.length
+      ? [...performanceRanked].sort((a, b) => Number(a.delta || 0) - Number(b.delta || 0))[0]
+      : null),
+  };
   const dashboardPlaylistOptions = useMemo(() => {
     const byId = new Map();
     const addOption = (item) => {
@@ -415,11 +662,12 @@ export default function PlaylistManager() {
         name: item.name || item.playlist_name || "Untitled playlist",
       });
     };
+    (dashboardSummary?.playlist_options || []).forEach(addOption);
     playlists.forEach(addOption);
     (dashboardSummary?.top_playlists || []).forEach(addOption);
     (dashboardSummary?.growth_rank || []).forEach(addOption);
     return Array.from(byId.values()).sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
-  }, [playlists, dashboardSummary?.top_playlists, dashboardSummary?.growth_rank]);
+  }, [playlists, dashboardSummary?.playlist_options, dashboardSummary?.top_playlists, dashboardSummary?.growth_rank]);
   const growthReady = !!(dashboardSeries?.ready && (dashboardSeries?.labels || []).length >= 2);
   const growthQuality = dashboardSeries?.quality || {};
   const dashboardChartData = useMemo(() => {
@@ -446,10 +694,11 @@ export default function PlaylistManager() {
     const candidates = [
       ...(dashboardSummary?.growth_rank || []),
       ...(dashboardSummary?.top_playlists || []),
+      ...(dashboardSummary?.playlist_options || []),
       ...playlists,
     ];
     return candidates.find((item) => (item?.id || item?.playlist_id) === dashboardPlaylistId) || null;
-  }, [dashboardPlaylistId, dashboardSummary?.growth_rank, dashboardSummary?.top_playlists, playlists]);
+  }, [dashboardPlaylistId, dashboardSummary?.growth_rank, dashboardSummary?.top_playlists, dashboardSummary?.playlist_options, playlists]);
   const onboardingBillingReady = billingActive;
   const onboardingCredentialsReady = !!spotifyCredentials?.configured;
   const onboardingConnectionsReady = connections.length > 0;
@@ -458,6 +707,7 @@ export default function PlaylistManager() {
   const onboardingMustConnect = billingActive && !onboardingConnectionsReady;
   const onboardingStep = onboardingNeedsBilling ? 1 : !onboardingCredentialsReady ? 2 : !onboardingConnectionsReady ? 3 : !onboardingPlaylistsReady ? 4 : 5;
   const workspaceBootstrapped = !!userContext?.linked && spotifyCredentials !== null && connectionsLoaded && (!connectionId || playlistsLoaded);
+  const showSetupProgress = !!userContext?.linked && billingActive && spotifyCredentials !== null && connectionsLoaded && onboardingStep < 5;
   const [isMobileViewport, setIsMobileViewport] = useState(false);
 
   useEffect(() => {
@@ -474,6 +724,7 @@ export default function PlaylistManager() {
 
     const { data: listener } = client.auth.onAuthStateChange((event, nextSession) => {
       setSession(nextSession || null);
+      if (event === "PASSWORD_RECOVERY") setPasswordRecoveryOpen(true);
       if (!nextSession || event === "SIGNED_OUT" || event === "USER_DELETED") {
         setUserContext(null);
         setConnections([]);
@@ -488,6 +739,7 @@ export default function PlaylistManager() {
         setFlexSlots([]);
         setFlexReferenceMeta(null);
         setFlexReferenceIssue(null);
+        setFutureAdds([]);
         return;
       }
       if (event === "SIGNED_IN" || event === "TOKEN_REFRESHED" || event === "INITIAL_SESSION") {
@@ -532,10 +784,21 @@ export default function PlaylistManager() {
     const key = `playlistpilot:onboarding-dismissed:${userContext.bubble_user_id || userContext.email}`;
     const dismissed = !onboardingMustConnect && typeof window !== "undefined" && window.localStorage.getItem(key) === "1";
     setOnboardingDismissed(dismissed);
-    if (onboardingMustConnect || (!dismissed && (onboardingNeedsBilling || !onboardingCredentialsReady || !onboardingConnectionsReady || !onboardingPlaylistsReady))) {
-      setOnboardingOpen(true);
+    if (onboardingStep < 5) {
+      setOnboardingOpen(false);
+      if (lastAutoSetupStepRef.current !== onboardingStep) {
+        lastAutoSetupStepRef.current = onboardingStep;
+        if (onboardingStep === 2) {
+          setSpotifyCredsOpen(true);
+          setSettingsOpen(true);
+        } else if (onboardingStep === 3) {
+          setSettingsOpen(true);
+        }
+      }
+    } else {
+      lastAutoSetupStepRef.current = 5;
     }
-  }, [workspaceBootstrapped, userContext?.bubble_user_id, userContext?.email, onboardingNeedsBilling, onboardingMustConnect, onboardingCredentialsReady, onboardingConnectionsReady, onboardingPlaylistsReady]);
+  }, [workspaceBootstrapped, userContext?.bubble_user_id, userContext?.email, onboardingMustConnect, onboardingStep]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -543,14 +806,22 @@ export default function PlaylistManager() {
     const spotifyError = params.get("spotify_error");
     const spotifyLinked = params.get("spotify_linked");
     if (spotifyError) {
-      setError(spotifySetupErrorMessage(spotifyError));
-      setOnboardingOpen(true);
+      const setupMessage = spotifySetupErrorMessage(spotifyError);
+      setError(setupMessage);
+      setSpotifySetupAlert(setupMessage);
+      if (spotifyError === "spotify_me_failed_403") {
+        setSettingsOpen(true);
+      } else {
+        setOnboardingOpen(true);
+      }
       params.delete("spotify_error");
     }
     if (spotifyLinked) {
       setMessage("Spotify account connected");
       setInitialSpotifySyncPending(true);
       setInitialSpotifySyncUser(params.get("spotify_user") || "");
+      setConnectionsLoaded(false);
+      setConnectionId("");
       params.delete("spotify_linked");
       params.delete("spotify_user");
     }
@@ -561,11 +832,18 @@ export default function PlaylistManager() {
   }, [router]);
 
   useEffect(() => {
+    if (!initialSpotifySyncPending || !initialSpotifySyncUser || !userContext?.linked || !session?.access_token) return;
+    loadConnections(initialSpotifySyncUser, { retryPreferred: true });
+  }, [initialSpotifySyncPending, initialSpotifySyncUser, userContext?.linked, session?.access_token]);
+
+  useEffect(() => {
     if (!initialSpotifySyncPending || !billingActive || !connectionId || !session?.access_token) return;
+    const linkedConnection = connections.find((item) => item.spotify_user_id === initialSpotifySyncUser);
+    if (!linkedConnection || linkedConnection.id !== connectionId) return;
     setInitialSpotifySyncPending(false);
     setInitialSpotifySyncUser("");
     importOnboardingPlaylists("New Spotify account connected. Syncing playlists and follower baselines");
-  }, [initialSpotifySyncPending, billingActive, connectionId, session?.access_token]);
+  }, [initialSpotifySyncPending, initialSpotifySyncUser, billingActive, connectionId, connections, session?.access_token]);
 
   useEffect(() => {
     if (!userContext?.linked || view !== "dashboard") return;
@@ -573,8 +851,18 @@ export default function PlaylistManager() {
   }, [dashboardRange, dashboardGranularity, dashboardStartDate, dashboardEndDate, dashboardConnectionId, dashboardPlaylistId, view]);
 
   useEffect(() => {
+    if (!userContext?.linked || view !== "dashboard" || dashboardTab !== "ad") return;
+    loadAdPerformance();
+  }, [dashboardRange, dashboardGranularity, dashboardStartDate, dashboardEndDate, dashboardConnectionId, dashboardTab, view]);
+
+  useEffect(() => {
     if (!userContext?.linked || !isAdmin || view !== "admin") return;
     loadAdminStatus();
+  }, [userContext?.linked, isAdmin, view]);
+
+  useEffect(() => {
+    if (!userContext?.linked || !isAdmin || view !== "ads") return;
+    loadMetaWorkspace();
   }, [userContext?.linked, isAdmin, view]);
 
   useEffect(() => {
@@ -585,7 +873,8 @@ export default function PlaylistManager() {
 
   useEffect(() => {
     setMoversPage(0);
-  }, [dashboardRange, dashboardConnectionId, dashboardSummary?.growth_rank?.length]);
+    setPortfolioPage(0);
+  }, [dashboardRange, dashboardConnectionId, dashboardSummary?.growth_rank?.length, dashboardSummary?.top_playlists?.length]);
 
   useEffect(() => {
     if (!userContext?.linked || !connectionId) return;
@@ -602,11 +891,25 @@ export default function PlaylistManager() {
       return;
     }
     if (!workspaceBootstrapped || !playlists.some((p) => p.id === playlistId)) return;
+    if (moveReconcileTimerRef.current) clearTimeout(moveReconcileTimerRef.current);
     if (userContext?.linked) writeStoredSelection(userContext, { playlistId });
     setPlaylist(null);
     setTracks([]);
     loadSelectedPlaylist();
   }, [playlistId, workspaceBootstrapped, playlists]);
+
+  useEffect(() => () => {
+    if (moveReconcileTimerRef.current) clearTimeout(moveReconcileTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+    if (!settingsOpen || (onboardingStep !== 2 && onboardingStep !== 3)) return;
+    const timer = setTimeout(() => {
+      const target = onboardingStep === 2 ? spotifyApiSectionRef.current : spotifyAccountsSectionRef.current;
+      target?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+    }, 80);
+    return () => clearTimeout(timer);
+  }, [settingsOpen, onboardingStep]);
 
   const filteredPlaylists = useMemo(() => {
     const q = playlistSearch.trim().toLowerCase();
@@ -667,6 +970,7 @@ export default function PlaylistManager() {
     () => new Set(flexSlots.map((slot) => slot.current_track_id).filter(Boolean)),
     [flexSlots]
   );
+  const backupSlots = useMemo(() => buildBackupSlots(backups), [backups]);
 
   async function run(label, fn) {
     setBusy(true);
@@ -700,8 +1004,85 @@ export default function PlaylistManager() {
     });
   }
 
+  function resetAuthCaptcha() {
+    setAuthCaptchaToken("");
+    setAuthCaptchaKey((value) => value + 1);
+  }
+
+  async function submitEmailAuth(event) {
+    event.preventDefault();
+    if (!supabase || authSubmitting) return;
+    const email = authEmail.trim().toLowerCase();
+    const turnstileSiteKey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY || "";
+    setError("");
+    setAuthNotice("");
+    if (!email) return setError("Enter your email address.");
+    if (!turnstileSiteKey) return setError("Email signup is temporarily unavailable while bot protection is being configured. Google login still works.");
+    if (!authCaptchaToken) return setError("Complete the security check first.");
+    if (authMode !== "reset" && authPassword.length < 10) return setError("Use a password with at least 10 characters.");
+
+    setAuthSubmitting(true);
+    try {
+      if (authMode === "signup") {
+        const { data, error: authError } = await supabase.auth.signUp({
+          email,
+          password: authPassword,
+          options: {
+            captchaToken: authCaptchaToken,
+            emailRedirectTo: `${window.location.origin}/app`,
+          },
+        });
+        if (authError) throw authError;
+        if (!data.session) {
+          setAuthNotice("Check your inbox and confirm your email before signing in.");
+          setAuthMode("login");
+          setAuthPassword("");
+        }
+      } else if (authMode === "reset") {
+        const { error: authError } = await supabase.auth.resetPasswordForEmail(email, {
+          captchaToken: authCaptchaToken,
+          redirectTo: `${window.location.origin}/app`,
+        });
+        if (authError) throw authError;
+        setAuthNotice("Password reset instructions have been sent if an account exists for this email.");
+        setAuthMode("login");
+      } else {
+        const { error: authError } = await supabase.auth.signInWithPassword({
+          email,
+          password: authPassword,
+          options: { captchaToken: authCaptchaToken },
+        });
+        if (authError) throw authError;
+      }
+    } catch (authError) {
+      setError(authError?.message || "Authentication failed. Please try again.");
+    } finally {
+      setAuthSubmitting(false);
+      resetAuthCaptcha();
+    }
+  }
+
   async function signOut() {
     await supabase.auth.signOut();
+  }
+
+  async function saveRecoveryPassword(event) {
+    event.preventDefault();
+    if (!supabase || recoveryPassword.length < 10) {
+      setError("Use a password with at least 10 characters.");
+      return;
+    }
+    setAuthSubmitting(true);
+    setError("");
+    const { error: authError } = await supabase.auth.updateUser({ password: recoveryPassword });
+    setAuthSubmitting(false);
+    if (authError) {
+      setError(authError.message || "Could not update your password.");
+      return;
+    }
+    setRecoveryPassword("");
+    setPasswordRecoveryOpen(false);
+    setMessage("Password updated");
   }
 
   function dismissOnboarding() {
@@ -721,6 +1102,22 @@ export default function PlaylistManager() {
     if (key && typeof window !== "undefined") window.localStorage.removeItem(key);
     setOnboardingDismissed(false);
     setOnboardingOpen(true);
+  }
+
+  function openCurrentSetupStep() {
+    setOnboardingOpen(false);
+    if (onboardingStep === 2) {
+      setSpotifyCredsOpen(true);
+      setSettingsOpen(true);
+      return;
+    }
+    if (onboardingStep === 3) {
+      setSettingsOpen(true);
+      return;
+    }
+    if (onboardingStep === 4) {
+      importOnboardingPlaylists("Importing playlists and creating your first follower baseline");
+    }
   }
 
   function startSpotifyConnect() {
@@ -791,13 +1188,21 @@ export default function PlaylistManager() {
     });
   }
 
-  async function loadConnections() {
+  async function loadConnections(preferredSpotifyUserId = "", { retryPreferred = false } = {}) {
+    const loadSeq = connectionsLoadSeqRef.current + 1;
+    connectionsLoadSeqRef.current = loadSeq;
     return run("Connections loaded", async () => {
-      const data = await api("/api/connections/list", { accessToken: accessToken() });
+      let data = await api("/api/connections/list", { accessToken: accessToken() });
+      if (retryPreferred && preferredSpotifyUserId && !data.some((c) => c.spotify_user_id === preferredSpotifyUserId)) {
+        await new Promise((resolve) => setTimeout(resolve, 650));
+        data = await api("/api/connections/list", { accessToken: accessToken() });
+      }
+      if (connectionsLoadSeqRef.current !== loadSeq) return data;
       setConnections(data);
       const stored = readStoredSelection(userContext);
-      const connectedConnectionId = initialSpotifySyncUser
-        ? data.find((c) => c.spotify_user_id === initialSpotifySyncUser)?.id || ""
+      const preferredId = preferredSpotifyUserId || initialSpotifySyncUser;
+      const connectedConnectionId = preferredId
+        ? data.find((c) => c.spotify_user_id === preferredId)?.id || ""
         : "";
       const storedConnectionId = stored.connectionId && data.some((c) => c.id === stored.connectionId)
         ? stored.connectionId
@@ -805,6 +1210,9 @@ export default function PlaylistManager() {
       const nextConnectionId = connectedConnectionId || storedConnectionId || data[0]?.id || "";
       if (connectionId !== nextConnectionId) setConnectionId(nextConnectionId);
       setConnectionsLoaded(true);
+      if (retryPreferred && preferredSpotifyUserId && !connectedConnectionId) {
+        throw new Error("Spotify authorization completed, but the account is not active in this workspace. Refresh accounts or reconnect Spotify.");
+      }
       return data;
     });
   }
@@ -879,8 +1287,13 @@ export default function PlaylistManager() {
         api(`/api/flex/slots/list?playlist_id=${encodeURIComponent(loadPlaylistId)}`, { accessToken: accessToken() }).catch(() => []),
       ]);
       if (playlistLoadSeqRef.current !== loadSeq || selectedPlaylistIdRef.current !== loadPlaylistId) return { detail, items, stale: true };
-      setPlaylist(detail);
+      const resolvedTrackCount = Number(itemMeta?.loaded_tracks || items.length || detail?.tracks_total || 0);
+      setPlaylist(detail ? { ...detail, tracks_total: resolvedTrackCount } : detail);
+      setAutoExpiryEnabled(!!detail?.auto_remove_enabled);
       setAutoWeeks(detail?.auto_remove_weeks ? String(detail.auto_remove_weeks) : "4");
+      setTrackLimitEnabled(!!detail?.track_limit_enabled);
+      setTrackLimitCount(detail?.track_limit_count ? String(detail.track_limit_count) : "");
+      setTrackLimitStrategy(detail?.track_limit_strategy || "back");
       setTracks(items);
       setFlexSettings(settings);
       setFlexSlots(Array.isArray(slots) ? slots : []);
@@ -894,7 +1307,7 @@ export default function PlaylistManager() {
       setFlexMinPopularity(settings?.min_popularity ?? "");
       setFlexMaxPopularity(settings?.max_popularity ?? "");
       setFlexMaxReleaseAgeWeeks(settings?.max_release_age_weeks ?? "");
-      await Promise.all([loadBackups(), loadFlexHistory()]);
+      await Promise.all([loadBackups(), loadFlexHistory(), loadFutureAdds()]);
       return { detail, items };
     }).finally(() => {
       if (playlistLoadSeqRef.current === loadSeq && playlistId === loadPlaylistId) setPlaylistLoading(false);
@@ -910,9 +1323,47 @@ export default function PlaylistManager() {
 
   async function loadBackups() {
     if (!playlistId) return [];
-    const rows = await api(`/api/backups/list?playlist_id=${encodeURIComponent(playlistId)}&limit=8`, { accessToken: accessToken() });
+    const rows = await api(`/api/backups/list?playlist_id=${encodeURIComponent(playlistId)}&limit=5`, { accessToken: accessToken() });
     setBackups(Array.isArray(rows) ? rows : []);
     return rows;
+  }
+
+  async function loadFutureAdds() {
+    if (!playlistId) return [];
+    const rows = await api(`/api/future-adds/list?playlist_id=${encodeURIComponent(playlistId)}`, { accessToken: accessToken() }).catch(() => []);
+    setFutureAdds(Array.isArray(rows) ? rows : []);
+    return rows;
+  }
+
+  async function createFutureAdd() {
+    if (!playlistId || !futureAddForm.release_date || !futureAddForm.artist_name.trim() || !futureAddForm.track_title.trim()) return;
+    await run("Future add saved", async () => {
+      await api("/api/future-adds/create", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: {
+          playlist_id: playlistId,
+          release_date: futureAddForm.release_date,
+          artist_name: futureAddForm.artist_name,
+          track_title: futureAddForm.track_title,
+          position: futureAddForm.position,
+        },
+      });
+      setFutureAddForm({ release_date: "", artist_name: "", track_title: "", position: "" });
+      await loadFutureAdds();
+    });
+  }
+
+  async function deleteFutureAdd(item) {
+    if (!playlistId || !item?.id) return;
+    await run("Future add removed", async () => {
+      await api("/api/future-adds/delete", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { playlist_id: playlistId, id: item.id },
+      });
+      await loadFutureAdds();
+    });
   }
 
   function normalizePlaylistItems(items = []) {
@@ -1018,24 +1469,64 @@ export default function PlaylistManager() {
       const result = await api("/api/backups/apply-retention", {
         method: "POST",
         accessToken: accessToken(),
-        body: { playlist_id: playlistId, keep_daily_days: 30, keep_weekly_months: 6 },
+        body: { playlist_id: playlistId },
       });
       await loadBackups();
-      setMessage(`Deleted ${formatNumber(result.deleted)} old backups`);
+      setMessage(`Kept ${formatNumber(result.kept)} backups, deleted ${formatNumber(result.deleted)}`);
       return result;
     });
   }
 
-  async function reconcileTracksAndFlex() {
+  async function reconcileTracksAndFlex({ repair = true } = {}) {
     const targetPlaylistId = selectedPlaylistIdRef.current || playlistId;
     if (!targetPlaylistId) return;
     const [{ items }, slots] = await Promise.all([
-      fetchPlaylistItemsSafe(targetPlaylistId),
+      fetchPlaylistItemsSafe(targetPlaylistId, { repair }),
       api(`/api/flex/slots/list?playlist_id=${encodeURIComponent(targetPlaylistId)}`, { accessToken: accessToken() }).catch(() => []),
     ]);
     if (selectedPlaylistIdRef.current !== targetPlaylistId) return;
     setTracks(items);
     setFlexSlots(Array.isArray(slots) ? slots : []);
+  }
+
+  function scheduleMoveReconcile(targetPlaylistId, delay = 1200) {
+    if (moveReconcileTimerRef.current) clearTimeout(moveReconcileTimerRef.current);
+    moveReconcileTimerRef.current = setTimeout(async () => {
+      await moveQueueRef.current.catch(() => null);
+      if (selectedPlaylistIdRef.current !== targetPlaylistId) return;
+      try {
+        await reconcileTracksAndFlex({ repair: false });
+        setMessage("Playlist synced");
+      } catch (e) {
+        setError(e.message || String(e));
+      }
+    }, delay);
+  }
+
+  function enqueuePlaylistMove(body) {
+    const targetPlaylistId = body.playlist_id;
+    setPendingPlaylistEdits((count) => count + 1);
+    setError("");
+    setMessage("Saving playlist changes");
+
+    const task = moveQueueRef.current
+      .catch(() => null)
+      .then(() => api("/api/playlist-items/move", {
+        method: "POST",
+        accessToken: accessToken(),
+        body,
+      }));
+    moveQueueRef.current = task;
+    task
+      .then(() => scheduleMoveReconcile(targetPlaylistId))
+      .catch(async (e) => {
+        setError(e.message || String(e));
+        if (selectedPlaylistIdRef.current === targetPlaylistId) {
+          await reconcileTracksAndFlex({ repair: false }).catch(() => null);
+        }
+      })
+      .finally(() => setPendingPlaylistEdits((count) => Math.max(0, count - 1)));
+    return task;
   }
 
   async function addTrack() {
@@ -1076,10 +1567,21 @@ export default function PlaylistManager() {
   }
 
   async function moveTrack(track, dir) {
+    const targetPosition = Number(track.position) + (dir === "up" ? -1 : 1);
+    if (ENABLE_FAST_PLAYLIST_MOVES) {
+      setTracks((current) => reorderTracks(current, track, targetPosition));
+      enqueuePlaylistMove({
+        playlist_id: playlistId,
+        track_id: track.track_id,
+        from_position: track.position,
+        dir,
+        steps: 1,
+      });
+      return;
+    }
     if (moveInFlightRef.current) return;
     moveInFlightRef.current = true;
     const previousTracks = tracks;
-    const targetPosition = Number(track.position) + (dir === "up" ? -1 : 1);
     if (ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(reorderTracks(tracks, track, targetPosition));
     await run("Track move queued", async () => {
       await api("/api/playlist-items/move", {
@@ -1102,10 +1604,21 @@ export default function PlaylistManager() {
   }
 
   async function moveTrackTo(track, targetPosition) {
-    if (moveInFlightRef.current) return;
     const from = Number(track.position);
     const to = Math.max(0, Math.min(tracks.length - 1, Number(targetPosition)));
     if (!Number.isFinite(from) || !Number.isFinite(to) || from === to) return;
+    if (ENABLE_FAST_PLAYLIST_MOVES) {
+      setTracks((current) => reorderTracks(current, track, to));
+      enqueuePlaylistMove({
+        playlist_id: playlistId,
+        track_id: track.track_id,
+        from_position: track.position,
+        dir: to < from ? "up" : "down",
+        steps: Math.abs(to - from),
+      });
+      return;
+    }
+    if (moveInFlightRef.current) return;
     moveInFlightRef.current = true;
     const previousTracks = tracks;
     if (ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(reorderTracks(tracks, track, to));
@@ -1179,7 +1692,9 @@ export default function PlaylistManager() {
           },
         });
       }
-      await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
+      if (!ENABLE_FAST_PLAYLIST_MUTATIONS) {
+        await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
+      }
     }).then((result) => {
       if (result === null && ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(previousTracks);
     });
@@ -1207,21 +1722,26 @@ export default function PlaylistManager() {
           exp_weeks: nextExpiry,
         },
       });
-      await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
+      if (!ENABLE_FAST_PLAYLIST_MUTATIONS) {
+        await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
+      }
     }).then((result) => {
       if (result === null && ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(previousTracks);
     });
   }
 
   async function saveAutoRemoval() {
-    await run("Auto-removal settings saved", async () => {
+    await run("Cleanup rules saved", async () => {
       await api("/api/playlists/settings/save", {
         method: "POST",
         accessToken: accessToken(),
         body: {
           playlist_id: playlistId,
-          auto_remove_enabled: true,
-          auto_remove_weeks: Number(autoWeeks),
+          auto_remove_enabled: autoExpiryEnabled,
+          auto_remove_weeks: autoExpiryEnabled ? Number(autoWeeks) : null,
+          track_limit_enabled: trackLimitEnabled,
+          track_limit_count: trackLimitEnabled && trackLimitCount !== "" ? Number(trackLimitCount) : null,
+          track_limit_strategy: trackLimitStrategy,
         },
       });
       await loadSelectedPlaylist();
@@ -1283,6 +1803,72 @@ export default function PlaylistManager() {
       setDashboardSummary(summary);
       setDashboardSeries(series);
       return { summary, series };
+    });
+  }
+
+  async function loadAdPerformance() {
+    if (!session?.access_token) return;
+    return run("Ad performance loaded", async () => {
+      const customStart = dashboardRange === "custom" && dashboardStartDate ? new Date(`${dashboardStartDate}T00:00:00`) : null;
+      const customEnd = dashboardRange === "custom" && dashboardEndDate ? new Date(`${dashboardEndDate}T00:00:00`) : new Date();
+      const now = new Date();
+      const yearStart = new Date(now.getFullYear(), 0, 1);
+      const customDays = customStart && !Number.isNaN(customStart.getTime())
+        ? Math.max(1, Math.ceil((customEnd.getTime() - customStart.getTime()) / (24 * 3600 * 1000)))
+        : null;
+      const yearDays = Math.max(1, Math.ceil((now.getTime() - yearStart.getTime()) / (24 * 3600 * 1000)) + 1);
+      const rangeDays = customDays || (dashboardRange === "year" ? yearDays : dashboardRange === "quarter" ? 90 : dashboardRange === "week" ? 7 : 30);
+      const granularity = dashboardRange === "year" ? "monthly" : dashboardRange === "week" ? "daily" : (dashboardGranularity || "weekly");
+      const qs = new URLSearchParams({ days: String(rangeDays), granularity });
+      if (dashboardRange === "year") {
+        qs.set("from", `${now.getFullYear()}-01-01`);
+        qs.set("to", now.toISOString().slice(0, 10));
+      }
+      if (dashboardRange === "custom") {
+        if (dashboardStartDate) qs.set("from", dashboardStartDate);
+        if (dashboardEndDate) qs.set("to", dashboardEndDate);
+      }
+      if (dashboardConnectionId) qs.set("connection_id", dashboardConnectionId);
+      const data = await api(`/api/dashboard/ad-performance?${qs.toString()}`, { accessToken: accessToken() });
+      setAdPerformance(data);
+      if (!adForm.playlist_id && data?.playlists?.[0]?.playlist_id) {
+        setAdForm((current) => ({ ...current, playlist_id: data.playlists[0].playlist_id }));
+      }
+      return data;
+    });
+  }
+
+  async function saveAdEvent() {
+    if (!adForm.playlist_id) {
+      setError("Choose a playlist first.");
+      return;
+    }
+    await run("Ad event saved", async () => {
+      await api("/api/dashboard/ad-events", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: {
+          playlist_id: adForm.playlist_id,
+          event_date: adForm.event_date,
+          daily_spend: adForm.daily_spend || 0,
+          label: adForm.label,
+          note: adForm.note,
+          currency: "EUR",
+        },
+      });
+      setAdForm((current) => ({ ...current, daily_spend: "", label: "", note: "" }));
+      await loadAdPerformance();
+    });
+  }
+
+  async function deleteAdEvent(id) {
+    if (!id) return;
+    await run("Ad event removed", async () => {
+      await api(`/api/dashboard/ad-events?id=${encodeURIComponent(id)}`, {
+        method: "DELETE",
+        accessToken: accessToken(),
+      });
+      await loadAdPerformance();
     });
   }
 
@@ -1351,6 +1937,47 @@ export default function PlaylistManager() {
       });
       await loadAdminStatus();
       return result;
+    });
+  }
+
+  async function loadMetaWorkspace() {
+    if (!session?.access_token || !isAdmin) return null;
+    const data = await api("/api/meta/connection", { accessToken: accessToken() }).catch((e) => {
+      setError(e.message || "Meta Ads workspace failed.");
+      return null;
+    });
+    if (data) {
+      setMetaWorkspace(data);
+      if (data.configured) setMetaForm((current) => ({
+        ...current,
+        app_id: data.app_id || current.app_id,
+        business_id: data.business_id || current.business_id,
+        graph_version: data.graph_version || current.graph_version,
+        access_token: "",
+        app_secret: "",
+      }));
+    }
+    return data;
+  }
+
+  async function saveMetaConnection() {
+    await run("Meta connection saved", async () => {
+      const data = await api("/api/meta/connection/save", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: metaForm,
+      });
+      setMetaWorkspace(data);
+      setMetaForm((current) => ({ ...current, access_token: "", app_secret: "" }));
+      return data;
+    });
+  }
+
+  async function auditMetaConnection() {
+    await run("Meta assets audited", async () => {
+      const data = await api("/api/meta/connection/audit", { method: "POST", accessToken: accessToken(), body: {} });
+      setMetaWorkspace(data);
+      return data;
     });
   }
 
@@ -1511,29 +2138,136 @@ export default function PlaylistManager() {
             <div className="navTabs">
               <button className={view === "dashboard" ? "navButton active" : "navButton"} onClick={() => setView("dashboard")}>Dashboard</button>
               <button className={view === "manager" ? "navButton active" : "navButton"} onClick={() => setView("manager")}>Playlist Manager</button>
+              {isAdmin ? <button className={view === "ads" ? "navButton active" : "navButton"} onClick={() => setView("ads")}>Ads Manager</button> : null}
               {isAdmin ? <button className={view === "admin" ? "navButton active" : "navButton"} onClick={() => setView("admin")}>Admin</button> : null}
             </div>
           ) : null}
-          {session && userContext?.linked && billingActive && onboardingConnectionsReady ? (
+          {session && userContext?.linked && billingActive ? (
             <button className="settingsButton topSettingsButton" onClick={() => setSettingsOpen(true)} aria-label="Open settings">
               <Settings aria-hidden="true" />
             </button>
           ) : null}
         </nav>
       </header>
+      {showSetupProgress ? (
+        <section className="setupProgress" aria-label="PlaylistPilot setup progress">
+          <div className="setupProgressHeader">
+            <div>
+              <span>Workspace setup</span>
+              <strong>{onboardingStep === 2 ? "Add your Spotify API app" : onboardingStep === 3 ? "Connect a Spotify account" : "Import your playlists"}</strong>
+            </div>
+            <small>{Math.max(1, onboardingStep - 1)} of 4 complete</small>
+          </div>
+          <div className="setupProgressTrack" aria-hidden="true"><span style={{ width: `${Math.max(0, onboardingStep - 1) * 25}%` }} /></div>
+          <ol className="setupProgressSteps">
+            {[
+              [1, "Plan", onboardingBillingReady],
+              [2, "API credentials", onboardingCredentialsReady],
+              [3, "Spotify account", onboardingConnectionsReady],
+              [4, "Playlist import", onboardingPlaylistsReady],
+            ].map(([step, label, done]) => (
+              <li key={step} className={done ? "done" : onboardingStep === step ? "active" : ""}>
+                <b>{done ? "✓" : step}</b><span>{label}</span>
+              </li>
+            ))}
+          </ol>
+          <button disabled={busy || (onboardingStep === 4 && !connectionId)} onClick={openCurrentSetupStep}>
+            {onboardingStep === 2 ? "Open API settings" : onboardingStep === 3 ? "Open account setup" : "Import playlists"}
+          </button>
+        </section>
+      ) : null}
+      {spotifySetupAlert ? (
+        <section className="spotifySetupAlert" role="alert" aria-live="assertive">
+          <div>
+            <strong>Spotify account needs one more setup step</strong>
+            <p>{spotifySetupAlert}</p>
+            <small>After adding the account under Users and Access, save the Spotify app and try Connect Spotify again.</small>
+          </div>
+          <button className="iconOnlyButton" onClick={() => setSpotifySetupAlert("")} aria-label="Dismiss Spotify setup message">
+            <X aria-hidden="true" />
+          </button>
+        </section>
+      ) : null}
       {busy ? (
         <div className="operationToast" role="status" aria-live="polite">
           <span className="miniSpinner" aria-hidden="true" />
           <strong>{busyLabel || "Working with Spotify"}</strong>
         </div>
       ) : null}
+      {passwordRecoveryOpen ? (
+        <div className="onboardingOverlay" role="dialog" aria-modal="true" aria-label="Set a new password">
+          <form className="passwordRecoveryPanel" onSubmit={saveRecoveryPassword}>
+            <span>Account security</span>
+            <h2>Set a new password</h2>
+            <p>Choose a new password with at least 10 characters for your PlaylistPilot account.</p>
+            <input type="password" autoComplete="new-password" minLength={10} value={recoveryPassword} onChange={(event) => setRecoveryPassword(event.target.value)} placeholder="New password" required autoFocus />
+            {error ? <div className="authError" role="alert">{error}</div> : null}
+            <button type="submit" disabled={authSubmitting}>{authSubmitting ? "Saving..." : "Save new password"}</button>
+          </form>
+        </div>
+      ) : null}
 
       {!session ? (
         <section className="loginScreen">
-          <h2>Sign in to Playlist Pilot</h2>
-          <p>Use the Google account linked to your existing Playlist Pilot workspace.</p>
-          <button onClick={signInWithGoogle} disabled={!supabase}>Continue with Google</button>
-          {error ? <strong>{error}</strong> : null}
+          <div className="loginCard">
+            <div className="loginBrand">
+              <img src="/playlistpilot-logo-v1.jpg" alt="" />
+              <span>PlaylistPilot</span>
+            </div>
+            <div className="loginCopy">
+              <span>Login & Signup</span>
+              <h2>Manage Spotify playlists with less manual work.</h2>
+              <p>Sign in or create an account, then connect Spotify and start managing your playlists.</p>
+            </div>
+            <div className="authModeTabs" role="tablist" aria-label="Email authentication mode">
+              <button type="button" className={authMode === "login" ? "active" : ""} onClick={() => { setAuthMode("login"); setError(""); setAuthNotice(""); }}>Log in</button>
+              <button type="button" className={authMode === "signup" ? "active" : ""} onClick={() => { setAuthMode("signup"); setError(""); setAuthNotice(""); }}>Create account</button>
+            </div>
+            <form className="emailAuthForm" onSubmit={submitEmailAuth}>
+              <label>
+                <span>Email</span>
+                <input type="email" autoComplete="email" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="you@example.com" required />
+              </label>
+              {authMode !== "reset" ? (
+                <label>
+                  <span>Password</span>
+                  <input type="password" autoComplete={authMode === "signup" ? "new-password" : "current-password"} minLength={10} value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} placeholder="At least 10 characters" required />
+                </label>
+              ) : null}
+              {process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY ? (
+                <div className="turnstileWrap">
+                  <Turnstile
+                    key={authCaptchaKey}
+                    siteKey={process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY}
+                    options={{ theme: "dark", size: "flexible" }}
+                    onSuccess={setAuthCaptchaToken}
+                    onExpire={() => setAuthCaptchaToken("")}
+                    onError={() => setAuthCaptchaToken("")}
+                  />
+                </div>
+              ) : (
+                <small className="authUnavailable">Protected email signup is being configured. Use Google in the meantime.</small>
+              )}
+              {authNotice ? <div className="authNotice" role="status">{authNotice}</div> : null}
+              {error ? <div className="authError" role="alert">{error}</div> : null}
+              <div className="emailAuthActions">
+                <button type="submit" disabled={!supabase || authSubmitting || !process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY}>
+                  {authSubmitting ? "Please wait..." : authMode === "signup" ? "Create account" : authMode === "reset" ? "Send reset link" : "Log in"}
+                </button>
+                {authMode === "login" ? <button type="button" className="textButton" onClick={() => { setAuthMode("reset"); setError(""); setAuthNotice(""); }}>Forgot password?</button> : null}
+                {authMode === "reset" ? <button type="button" className="textButton" onClick={() => { setAuthMode("login"); setError(""); setAuthNotice(""); }}>Back to login</button> : null}
+              </div>
+            </form>
+            <div className="authDivider"><span>or</span></div>
+            <button className="googleLoginButton" onClick={signInWithGoogle} disabled={!supabase}>
+              <span>G</span>Continue with Google
+            </button>
+            <div className="loginMetaGrid">
+              <article><strong>Multi-account</strong><small>Connect and switch Spotify accounts.</small></article>
+              <article><strong>Automation</strong><small>Locks, rotators, expiry and backups.</small></article>
+              <article><strong>Analytics</strong><small>Follower trends and ad performance.</small></article>
+            </div>
+          </div>
         </section>
       ) : userContext && !userContext.linked ? (
         <section className="loginScreen">
@@ -1557,6 +2291,10 @@ export default function PlaylistManager() {
             <span>Start</span>
             <h2>Choose a plan before opening your workspace</h2>
             <p>PlaylistPilot starts with a 30-day Stripe trial. Your plan controls how many Spotify accounts you can connect and keeps playlist tools behind an active workspace.</p>
+            <div className="premiumRequirement">
+              <strong>Spotify Premium required</strong>
+              <p>PlaylistPilot can only connect and manage Spotify Premium accounts because Spotify restricts the required Web API access to Premium users.</p>
+            </div>
             {error ? <strong>{error}</strong> : null}
             <button className="secondaryOutline" onClick={signOut}>Log out</button>
           </div>
@@ -1622,6 +2360,10 @@ export default function PlaylistManager() {
                 <div className="onboardingCopy">
                   <h3>Choose the account capacity you need</h3>
                   <p>PlaylistPilot starts with a 30-day Stripe trial. Billing comes first so Spotify accounts are only connected to active workspaces.</p>
+                  <div className="premiumRequirement">
+                    <strong>Spotify Premium required</strong>
+                    <p>The Spotify accounts you connect must have Premium access for PlaylistPilot's playlist management API features.</p>
+                  </div>
                 </div>
                 <div className="onboardingPlanGrid">
                   <article>
@@ -1731,18 +2473,25 @@ export default function PlaylistManager() {
               </div>
             </section>
 
-            <section className="settingsSection">
+            <section ref={spotifyAccountsSectionRef} className={`settingsSection ${onboardingStep === 3 ? "settingsSection--setupActive" : ""}`}>
               <div className="settingsSectionHeader">
                 <div>
                   <h3>Spotify Accounts</h3>
                   <p>Connect the Spotify accounts you want to manage in Playlist Pilot.</p>
                 </div>
-                <button
-                  disabled={busy || (!spotifyCredentials?.configured && !spotifyCredentials?.fallback_available)}
-                  onClick={startSpotifyConnect}
-                >
-                  Connect Spotify
-                </button>
+                <div className="settingsHeaderActions">
+                  <button className="secondaryOutline" disabled={busy} onClick={() => loadConnections()}>Refresh accounts</button>
+                  <button
+                    disabled={busy || (!spotifyCredentials?.configured && !spotifyCredentials?.fallback_available)}
+                    onClick={startSpotifyConnect}
+                  >
+                    Connect Spotify
+                  </button>
+                </div>
+              </div>
+              <div className="setupNotice settingsSpotifyNotice">
+                <strong>Before you connect</strong>
+                <p>Add the Spotify account's name and email under <b>Users and Access</b> in your Spotify Developer app, then press Save. Spotify returns a 403 if this step is missing.</p>
               </div>
               <div className="connectionList">
                 {connections.map((c) => (
@@ -1798,7 +2547,7 @@ export default function PlaylistManager() {
               ) : null}
             </section>
 
-            <section className="settingsSection">
+            <section ref={spotifyApiSectionRef} className={`settingsSection ${onboardingStep === 2 ? "settingsSection--setupActive" : ""}`}>
               <div className="settingsSectionHeader">
                 <div>
                   <h3>Spotify API App</h3>
@@ -1873,8 +2622,8 @@ export default function PlaylistManager() {
         <section className="setupHold" aria-live="polite">
           <span>Setup required</span>
           <h2>Connect your first Spotify account</h2>
-          <p>The Playlist Manager opens after a Spotify account is authorized. Finish the setup guide above or open Settings to edit your Spotify API app details.</p>
-          <button disabled={busy} onClick={() => setOnboardingOpen(true)}>Continue setup</button>
+          <p>The Playlist Manager opens after Spotify API credentials are saved and an account is authorized. Your setup progress stays visible above until the workspace is ready.</p>
+          <button disabled={busy} onClick={openCurrentSetupStep}>Continue setup</button>
         </section>
       ) : view === "dashboard" ? (
       <section className="dashboard">
@@ -1891,6 +2640,7 @@ export default function PlaylistManager() {
             <select value={dashboardRange} onChange={(e) => setDashboardRange(e.target.value)} aria-label="Dashboard range">
               <option value="week">Week</option>
               <option value="month">Month</option>
+              <option value="quarter">3 months</option>
               <option value="year">Year</option>
               <option value="custom">Custom</option>
             </select>
@@ -1908,6 +2658,12 @@ export default function PlaylistManager() {
             <button disabled={busy} onClick={loadDashboard}>Refresh</button>
           </div>
         </div>
+        <div className="dashboardSubnav" aria-label="Dashboard sections">
+          <button className={dashboardTab === "stats" ? "active" : ""} onClick={() => setDashboardTab("stats")}>Stats</button>
+          <button className={dashboardTab === "ad" ? "active" : ""} onClick={() => setDashboardTab("ad")}>Ad Performance</button>
+        </div>
+        {dashboardTab === "stats" ? (
+        <>
         <div className="metricGrid metricGrid--primary">
           <article>
             <span className="metricLabel">Total Followers</span>
@@ -1928,18 +2684,6 @@ export default function PlaylistManager() {
             <span className="metricLabel">Actions Soon</span>
             <strong className="metricValue">{formatNumber((dashboardSummary?.upcoming_removals?.length || 0) + (dashboardSummary?.totals?.flex_due_count || 0))}</strong>
             <small className="metricMeta">{formatNumber(dashboardSummary?.upcoming_removals?.length)} removals · {formatNumber(dashboardSummary?.totals?.flex_due_count)} rotations</small>
-          </article>
-        </div>
-        <div className="automationHealth">
-          <article>
-            <span>Automation Health</span>
-            <strong>{formatNumber(dashboardSummary?.totals?.automation_enabled_count)} expiry rules</strong>
-            <small>{formatNumber(dashboardSummary?.totals?.flex_enabled_count)} rotator slots · {formatNumber(dashboardSummary?.totals?.cooldown_count)} in safe edit</small>
-          </article>
-          <article>
-            <span>Data Freshness</span>
-            <strong>{formatNumber(dashboardSummary?.totals?.stale_count)} stale playlists</strong>
-            <small>{formatNumber(dashboardSummary?.totals?.growth_data_points)} growth snapshots in range</small>
           </article>
         </div>
         <div className="dashboardFocusGrid">
@@ -2008,7 +2752,8 @@ export default function PlaylistManager() {
                 <section>
                   <article><span>Growth</span><strong>{selectedDashboardPlaylist.has_growth_data ? formatDelta(selectedDashboardPlaylist.delta) : "warming"}</strong></article>
                   <article><span>Relative</span><strong>{formatPercent(selectedDashboardPlaylist.percent_delta)}</strong></article>
-                  <article><span>Snapshots</span><strong>{formatNumber(selectedDashboardPlaylist.snapshot_days || 0)}</strong></article>
+                  <article><span>Locked</span><strong>{formatNumber(selectedDashboardPlaylist.locked_count || 0)}</strong></article>
+                  <article><span>Rotator</span><strong>{formatNumber(selectedDashboardPlaylist.rotator_count || 0)}</strong></article>
                 </section>
                 <button onClick={() => {
                   setPlaylistId(dashboardPlaylistId);
@@ -2036,25 +2781,82 @@ export default function PlaylistManager() {
             ) : null}
           </section>
         </div>
-        <div className="dashboardSplitGrid">
-          <section className="dashboardPanel topPlaylistsPanel">
+        <div className="performanceHeroRow">
+          <button
+            className="performanceHeroCard"
+            disabled={!performanceHighlights.bestMonth?.playlist_id}
+            onClick={() => performanceHighlights.bestMonth?.playlist_id && setDashboardPlaylistId(performanceHighlights.bestMonth.playlist_id)}
+          >
+            <span>Best Performer This Month</span>
+            <strong>{performanceHighlights.bestMonth?.name || "Warming up"}</strong>
+            <small>{performanceHighlights.bestMonth ? `${formatDelta(performanceHighlights.bestMonth.delta)} · ${formatPercent(performanceHighlights.bestMonth.percent_delta)}` : "Needs more snapshots"}</small>
+          </button>
+          <button
+            className="performanceHeroCard performanceHeroCard--quiet"
+            disabled={!performanceHighlights.bestToday?.playlist_id}
+            onClick={() => performanceHighlights.bestToday?.playlist_id && setDashboardPlaylistId(performanceHighlights.bestToday.playlist_id)}
+          >
+            <span>Best Performer Today</span>
+            <strong>{performanceHighlights.bestToday?.name || "No trend yet"}</strong>
+            <small>{performanceHighlights.bestToday ? `${formatDelta(performanceHighlights.bestToday.today_delta)} · ${formatPercent(performanceHighlights.bestToday.today_percent_delta)}` : "Needs yesterday and today"}</small>
+          </button>
+          <button
+            className="performanceHeroCard performanceHeroCard--warning"
+            disabled={!performanceHighlights.needsAttention?.playlist_id}
+            onClick={() => performanceHighlights.needsAttention?.playlist_id && setDashboardPlaylistId(performanceHighlights.needsAttention.playlist_id)}
+          >
+            <span>Needs Attention</span>
+            <strong>{performanceHighlights.needsAttention?.name || "No decline detected"}</strong>
+            <small>{performanceHighlights.needsAttention ? `${formatDelta(performanceHighlights.needsAttention.today_delta)} today · was growing before` : "No growing playlist is shrinking today"}</small>
+          </button>
+          <button
+            className="performanceHeroCard performanceHeroCard--neutral"
+            disabled={!performanceHighlights.worstMonth?.playlist_id}
+            onClick={() => performanceHighlights.worstMonth?.playlist_id && setDashboardPlaylistId(performanceHighlights.worstMonth.playlist_id)}
+          >
+            <span>Worst Performer</span>
+            <strong>{performanceHighlights.worstMonth?.name || "No trend yet"}</strong>
+            <small>{performanceHighlights.worstMonth ? `${formatDelta(performanceHighlights.worstMonth.delta)} · ${formatPercent(performanceHighlights.worstMonth.percent_delta)}` : "Needs more snapshots"}</small>
+          </button>
+        </div>
+        <section className="dashboardPanel topPlaylistsPanel portfolioPanel">
             <div>
               <h2>Playlist Portfolio</h2>
-              <p>Largest playlists in the current account scope</p>
+              <p>All active playlists in the current account scope, sorted by followers</p>
             </div>
             <div className="playlistTable">
-              {(dashboardSummary?.top_playlists || []).map((item) => (
+              <div className="playlistTableHeader" aria-hidden="true">
+                <span>Playlist</span>
+                <span>Followers</span>
+                <span>Growth</span>
+                <span>Tracks</span>
+                <span>Locked</span>
+                <span>Rotator</span>
+                <span>Expiry</span>
+              </div>
+              {visiblePortfolioItems.map((item) => (
                 <div key={item.playlist_id}>
                   <Artwork src={item.image} alt="" size="sm" />
                   <strong>{item.name || "Untitled playlist"}</strong>
-                  <span>{formatNumber(item.followers)} followers</span>
-                  <span>{formatNumber(item.tracks_total)} tracks</span>
-                  <b>{item.auto_remove_enabled ? `${item.auto_remove_weeks || "?"}w expiry` : "manual"}</b>
+                  <span>{formatNumber(item.followers)}</span>
+                  <span>{item.has_growth_data ? formatDelta(item.delta) : "warming"}</span>
+                  <span>{formatNumber(item.tracks_total)}</span>
+                  <span>{formatNumber(item.locked_count || 0)}</span>
+                  <span>{formatNumber(item.rotator_count || 0)}</span>
+                  <b>{item.auto_remove_enabled ? `${item.auto_remove_weeks || "?"}w` : "manual"}</b>
                 </div>
               ))}
               {!dashboardSummary?.top_playlists?.length ? <p>No playlists yet.</p> : null}
             </div>
+            {portfolioItems.length > portfolioPageSize ? (
+              <div className="moversPager portfolioPager">
+                <button disabled={safePortfolioPage === 0} onClick={() => setPortfolioPage((page) => Math.max(0, page - 1))}>Prev</button>
+                <span>{safePortfolioPage + 1} / {portfolioPageCount}</span>
+                <button disabled={safePortfolioPage >= portfolioPageCount - 1} onClick={() => setPortfolioPage((page) => Math.min(portfolioPageCount - 1, page + 1))}>Next</button>
+              </div>
+            ) : null}
           </section>
+        <div className="dashboardSplitGrid">
           <section className="dashboardPanel removalsPanel">
             <div>
               <h2>Upcoming Auto-Removals</h2>
@@ -2077,7 +2879,277 @@ export default function PlaylistManager() {
               {!dashboardSummary?.upcoming_removals?.length ? <p>No upcoming removals.</p> : null}
             </div>
           </section>
+          <section className="dashboardPanel rotationsPanel">
+            <div>
+              <h2>Upcoming Track Rotations</h2>
+              <p>Rotator slots scheduled in the next 14 days</p>
+            </div>
+            <div className="removalList rotationList">
+              {(dashboardSummary?.upcoming_rotations || []).map((item, index) => (
+                <div key={`${item.slot_id || index}-${item.current_track_id || index}`}>
+                  <Artwork src={item.cover_url || item.playlist_image} alt="" size="sm" />
+                  <span>
+                    <strong>{item.track_name || "Rotation slot"}</strong>
+                    <em>{item.artist_names || item.source_playlist_name || "Reference playlist"}</em>
+                    <small>
+                      {item.playlist_name || "Playlist"} · {formatShortDate(String(item.next_rotation_at || "").slice(0, 10))}
+                      {Number.isFinite(Number(item.position)) ? ` · pos ${Number(item.position) + 1}` : ""}
+                      {item.interval ? ` · ${item.interval}` : ""}
+                    </small>
+                  </span>
+                </div>
+              ))}
+              {!dashboardSummary?.upcoming_rotations?.length ? <p>No upcoming rotations.</p> : null}
+            </div>
+          </section>
         </div>
+        </>
+        ) : (
+        <section className="adPerformanceView">
+          <div className="metricGrid metricGrid--primary">
+            <article>
+              <span className="metricLabel">Daily Ad Spend</span>
+              <strong className="metricValue">EUR {formatNumber(adPerformance?.totals?.current_daily_spend || 0)}</strong>
+              <small className="metricMeta">{formatNumber(adPerformance?.totals?.paid_playlists || 0)} active paid playlists</small>
+            </article>
+            <article>
+              <span className="metricLabel">Monthly Run Rate</span>
+              <strong className="metricValue">EUR {formatNumber(adPerformance?.totals?.monthly_run_rate || 0)}</strong>
+              <small className="metricMeta">based on current daily spend</small>
+            </article>
+            <article>
+              <span className="metricLabel">Spend In Range</span>
+              <strong className="metricValue">EUR {formatNumber(adPerformance?.totals?.period_spend || 0)}</strong>
+              <small className="metricMeta">{formatDelta(adPerformance?.totals?.total_growth || 0)} followers tracked</small>
+            </article>
+            <article>
+              <span className="metricLabel">Blended CPF</span>
+              <strong className="metricValue">{Number.isFinite(Number(adPerformance?.totals?.blended_cost_per_follower)) ? `EUR ${formatNumber(adPerformance.totals.blended_cost_per_follower)}` : "n/a"}</strong>
+              <small className="metricMeta">cost per follower in range</small>
+            </article>
+          </div>
+          <div className="performanceHeroRow adInsightHeroRow">
+            <article className="performanceHeroCard">
+              <span>Most Efficient</span>
+              <strong>{adPerformance?.best_efficiency?.name || "No paid growth yet"}</strong>
+              <small>{adPerformance?.best_efficiency ? `EUR ${formatNumber(adPerformance.best_efficiency.cost_per_follower)} per follower` : "Add spend markers and wait for growth snapshots"}</small>
+            </article>
+            <article className="performanceHeroCard performanceHeroCard--quiet">
+              <span>Highest Spend</span>
+              <strong>{(adPerformance?.playlists || []).slice().sort((a, b) => Number(b.period_spend || 0) - Number(a.period_spend || 0))[0]?.name || "No spend yet"}</strong>
+              <small>EUR {formatNumber((adPerformance?.playlists || []).slice().sort((a, b) => Number(b.period_spend || 0) - Number(a.period_spend || 0))[0]?.period_spend || 0)} in range</small>
+            </article>
+            <article className="performanceHeroCard performanceHeroCard--warning">
+              <span>Needs Review</span>
+              <strong>{(adPerformance?.playlists || []).filter((item) => Number(item.period_spend || 0) > 0).slice().sort((a, b) => Number(a.delta || 0) - Number(b.delta || 0))[0]?.name || "No risk detected"}</strong>
+              <small>{(() => { const item = (adPerformance?.playlists || []).filter((entry) => Number(entry.period_spend || 0) > 0).slice().sort((a, b) => Number(a.delta || 0) - Number(b.delta || 0))[0]; return item ? `${formatDelta(item.delta)} growth · EUR ${formatNumber(item.period_spend)} spend` : "No paid playlist is underperforming"; })()}</small>
+            </article>
+            <article className="performanceHeroCard performanceHeroCard--neutral">
+              <span>Campaign Markers</span>
+              <strong>{formatNumber(adPerformance?.totals?.event_count || 0)}</strong>
+              <small>budget changes and notes in this range</small>
+            </article>
+          </div>
+          <div className="adControlGrid adControlGrid--single">
+            <section className="dashboardPanel adEventPanel">
+              <div>
+                <h2>Pin spend or note</h2>
+                <p>Set a daily spend from a specific date, or add a campaign note such as new creatives, budget change, or audience test.</p>
+              </div>
+              <div className="adEventForm">
+                <select value={adForm.playlist_id} onChange={(e) => setAdForm((current) => ({ ...current, playlist_id: e.target.value }))}>
+                  <option value="">Choose playlist</option>
+                  {(adPerformance?.playlists || dashboardSummary?.top_playlists || []).map((item) => (
+                    <option key={item.playlist_id} value={item.playlist_id}>{item.name}</option>
+                  ))}
+                </select>
+                <input type="date" value={adForm.event_date} onChange={(e) => setAdForm((current) => ({ ...current, event_date: e.target.value }))} />
+                <input type="number" min="0" step="0.01" value={adForm.daily_spend} onChange={(e) => setAdForm((current) => ({ ...current, daily_spend: e.target.value }))} placeholder="Daily spend EUR" />
+                <input value={adForm.label} onChange={(e) => setAdForm((current) => ({ ...current, label: e.target.value }))} placeholder="Marker label" />
+                <textarea value={adForm.note} onChange={(e) => setAdForm((current) => ({ ...current, note: e.target.value }))} placeholder="Optional note" />
+                <button disabled={busy || !adForm.playlist_id || !adForm.event_date} onClick={saveAdEvent}>Save marker</button>
+              </div>
+            </section>
+          </div>
+          <div className="adPlaylistSectionHeader">
+            <div>
+              <h2>Playlist ad performance</h2>
+              <p>Follower trend with pinned spend changes and campaign notes.</p>
+            </div>
+            <div className="modeToggle">
+              <button className={adPlaylistView === "chart" ? "active" : ""} onClick={() => setAdPlaylistView("chart")}>Charts</button>
+              <button className={adPlaylistView === "info" ? "active" : ""} onClick={() => setAdPlaylistView("info")}>Info</button>
+            </div>
+            {adPlaylistView === "chart" ? (
+              <div className="modeToggle adMobileChartToggle" aria-label="Mobile chart mode">
+                <button className={adMobileChartMode === "delta" ? "active" : ""} onClick={() => setAdMobileChartMode("delta")}>Delta</button>
+                <button className={adMobileChartMode === "growth" ? "active" : ""} onClick={() => setAdMobileChartMode("growth")}>Growth</button>
+              </div>
+            ) : null}
+          </div>
+          <div className="adPlaylistGrid">
+            {(adPerformance?.playlists || []).map((item) => (
+              <article className="adPlaylistCard" key={item.playlist_id}>
+                <div className="adPlaylistHeader">
+                  <Artwork src={item.image} alt="" size="sm" />
+                  <span>
+                    <strong>{item.name || "Untitled playlist"}</strong>
+                    <small>{formatNumber(item.followers_now)} followers · {formatDelta(item.delta)} range growth</small>
+                  </span>
+                </div>
+                {adPlaylistView === "chart" ? (
+                  <>
+                    <div className={`adDualChartGrid adDualChartGrid--mobile-${adMobileChartMode}`}>
+                      <section>
+                        <span>Follower Delta</span>
+                        <AdPlaylistChart playlist={item} />
+                      </section>
+                      <section>
+                        <span>Follower Trend</span>
+                        <AdPlaylistFollowerChart playlist={item} />
+                      </section>
+                    </div>
+                    <div className="adPlaylistStats">
+                      <span>Daily EUR {formatNumber(item.current_daily_spend || 0)}</span>
+                      <span>Range EUR {formatNumber(item.period_spend || 0)}</span>
+                      <span>{Number.isFinite(Number(item.cost_per_follower)) ? `CPF EUR ${formatNumber(item.cost_per_follower)}` : "CPF n/a"}</span>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="adPlaylistStats adPlaylistStats--details">
+                      <span>Daily EUR {formatNumber(item.current_daily_spend || 0)}</span>
+                      <span>Range EUR {formatNumber(item.period_spend || 0)}</span>
+                      <span>{Number.isFinite(Number(item.cost_per_follower)) ? `CPF EUR ${formatNumber(item.cost_per_follower)}` : "CPF n/a"}</span>
+                      <span>Run rate EUR {formatNumber(item.monthly_run_rate || 0)}</span>
+                      <span>{formatNumber(item.events?.length || 0)} markers</span>
+                      <span>{item.has_notes ? "Notes active" : "No notes"}</span>
+                    </div>
+                    <div className="adEventList">
+                      {(item.events || []).slice(-5).reverse().map((event) => (
+                        <div key={event.id}>
+                          <span>{formatShortDate(event.event_date)} · EUR {formatNumber(event.daily_spend || 0)}</span>
+                          <strong>{event.label || event.note || "Spend marker"}</strong>
+                          <button disabled={busy} onClick={() => deleteAdEvent(event.id)}>Remove</button>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </article>
+            ))}
+            {!adPerformance?.playlists?.length ? (
+              <section className="dashboardPanel adEmptyState">
+                <h2>No ad performance data yet</h2>
+                <p>Add your first spend marker above. PlaylistPilot will overlay it onto the existing follower snapshots as new data arrives.</p>
+              </section>
+            ) : null}
+          </div>
+        </section>
+        )}
+      </section>
+      ) : view === "ads" && isAdmin ? (
+      <section className="adminPanel metaAdsPanel">
+        <div className="statusLine">
+          {busy ? <span><i className="miniSpinner" aria-hidden="true" />{busyLabel || "Working"}</span> : message ? <span>{message}</span> : <span />}
+          {error ? <strong>{error}</strong> : null}
+        </div>
+        <div className="dashboardHero">
+          <div>
+            <div className="metaTitleLine">
+              <h2>Meta Ads Manager</h2>
+              <span className="adminBadge">Admin preview</span>
+              <span className="metaReadOnlyBadge">Read-only</span>
+            </div>
+            <p>Connect and audit your Meta business assets before campaign publishing is enabled.</p>
+          </div>
+          <div className="dashboardActions">
+            <button disabled={busy} onClick={loadMetaWorkspace}>Refresh</button>
+            <button disabled={busy || !metaWorkspace?.configured} onClick={auditMetaConnection}>Audit connection</button>
+          </div>
+        </div>
+
+        <div className="metricGrid metricGrid--primary">
+          <article>
+            <span className="metricLabel">Connection</span>
+            <strong className="metricValue metaMetricText">{metaWorkspace?.configured ? metaWorkspace.status : "Not set"}</strong>
+            <small className="metricMeta">{metaWorkspace?.last_audit_at ? `Audited ${formatShortDate(String(metaWorkspace.last_audit_at).slice(0, 10))}` : "Awaiting first audit"}</small>
+          </article>
+          <article>
+            <span className="metricLabel">Ad accounts</span>
+            <strong className="metricValue">{formatNumber(metaWorkspace?.audit_summary?.counts?.ad_accounts || 0)}</strong>
+            <small className="metricMeta">accessible to this token</small>
+          </article>
+          <article>
+            <span className="metricLabel">Instagram</span>
+            <strong className="metricValue">{formatNumber(metaWorkspace?.audit_summary?.counts?.instagram_accounts || 0)}</strong>
+            <small className="metricMeta">professional accounts</small>
+          </article>
+          <article>
+            <span className="metricLabel">Publishing</span>
+            <strong className="metricValue metaMetricText">Locked</strong>
+            <small className="metricMeta">no campaign writes in phase 1</small>
+          </article>
+        </div>
+
+        <div className="metaSetupGrid">
+          <section className="dashboardPanel metaConnectionPanel">
+            <div className="panelHeader">
+              <div>
+                <h2>Meta connection</h2>
+                <p>Credentials are encrypted server-side and are never returned to this browser.</p>
+              </div>
+              <span className={`jobStatus jobStatus--${metaWorkspace?.status === "ready" ? "done" : metaWorkspace?.status === "error" ? "failed" : "pending"}`}>{metaWorkspace?.status || "unverified"}</span>
+            </div>
+            <div className="metaFormGrid">
+              <label><span>App ID</span><input value={metaForm.app_id} onChange={(e) => setMetaForm({ ...metaForm, app_id: e.target.value })} inputMode="numeric" /></label>
+              <label><span>Business ID</span><input value={metaForm.business_id} onChange={(e) => setMetaForm({ ...metaForm, business_id: e.target.value })} inputMode="numeric" /></label>
+              <label><span>Graph API version</span><input value={metaForm.graph_version} onChange={(e) => setMetaForm({ ...metaForm, graph_version: e.target.value })} placeholder="v25.0" /></label>
+              <label><span>{metaWorkspace?.configured ? "Replace access token" : "System user access token"}</span><input type="password" autoComplete="new-password" value={metaForm.access_token} onChange={(e) => setMetaForm({ ...metaForm, access_token: e.target.value })} placeholder={metaWorkspace?.configured ? "Leave empty to keep current token" : "Paste token"} /></label>
+              <label className="metaFormWide"><span>App secret <small>optional, enables appsecret_proof</small></span><input type="password" autoComplete="new-password" value={metaForm.app_secret} onChange={(e) => setMetaForm({ ...metaForm, app_secret: e.target.value })} placeholder={metaWorkspace?.has_app_secret ? "Stored securely; leave empty to keep" : "Optional"} /></label>
+            </div>
+            <div className="metaFormActions">
+              <button disabled={busy || !metaForm.app_id || !metaForm.business_id || (!metaWorkspace?.configured && !metaForm.access_token)} onClick={saveMetaConnection}>Save securely</button>
+              <small>Use a dedicated system-user token with only <b>ads_read</b> and <b>ads_management</b>.</small>
+            </div>
+          </section>
+
+          <section className="dashboardPanel metaAuditPanel">
+            <div className="panelHeader"><div><h2>Audit result</h2><p>Identity, permissions, and warnings from Meta.</p></div></div>
+            <div className="metaIdentity">
+              <span>Token identity</span>
+              <strong>{metaWorkspace?.audit_summary?.identity?.name || "Not audited"}</strong>
+              <small>{metaWorkspace?.audit_summary?.identity?.id || "Run the connection audit after saving."}</small>
+            </div>
+            <div className="metaPermissionList">
+              {(metaWorkspace?.audit_summary?.permissions?.granted || []).map((permission) => <span key={permission}>{permission}</span>)}
+              {!metaWorkspace?.audit_summary?.permissions?.granted?.length ? <p>No granted permissions loaded.</p> : null}
+            </div>
+            {(metaWorkspace?.audit_summary?.warnings || []).length ? <div className="metaWarnings">{metaWorkspace.audit_summary.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div> : null}
+            {metaWorkspace?.last_error && !metaWorkspace?.audit_summary?.warnings?.length ? <div className="metaWarnings"><p>{metaWorkspace.last_error}</p></div> : null}
+          </section>
+        </div>
+
+        <section className="dashboardPanel metaAssetsPanel">
+          <div className="panelHeader">
+            <div><h2>Business assets</h2><p>Read-only inventory. Asset selection and paused campaign drafts come next.</p></div>
+          </div>
+          <div className="metaAssetColumns">
+            {[{ type: "ad_account", title: "Ad accounts" }, { type: "page", title: "Facebook pages" }, { type: "instagram_account", title: "Instagram accounts" }].map((group) => {
+              const items = (metaWorkspace?.assets || []).filter((asset) => asset.asset_type === group.type);
+              return <div className="metaAssetGroup" key={group.type}>
+                <div className="metaAssetGroupHeader"><strong>{group.title}</strong><span>{items.length}</span></div>
+                {items.map((asset) => <article key={asset.id}>
+                  <div><strong>{asset.name}</strong><small>{asset.meta_id}</small></div>
+                  {group.type === "ad_account" ? <span>{asset.metadata?.currency || ""} {asset.metadata?.timezone_name || ""}</span> : null}
+                </article>)}
+                {!items.length ? <p>No assets found.</p> : null}
+              </div>;
+            })}
+          </div>
+        </section>
+
+        <div className="metaPublishLock"><Lock aria-hidden="true" /><div><strong>Campaign publishing is locked</strong><p>The next phase will create paused drafts only after the connection, ad account, Page, and Instagram identity are explicitly selected.</p></div></div>
       </section>
       ) : view === "admin" && isAdmin ? (
       <section className="adminPanel">
@@ -2296,7 +3368,11 @@ export default function PlaylistManager() {
 
         <section className="content">
           <div className="statusLine">
-            {busy ? <span><i className="miniSpinner" aria-hidden="true" />{busyLabel || "Working with Spotify"}</span> : message ? <span>{message}</span> : <span />}
+            {busy ? (
+              <span><i className="miniSpinner" aria-hidden="true" />{busyLabel || "Working with Spotify"}</span>
+            ) : pendingPlaylistEdits > 0 ? (
+              <span><i className="miniSpinner" aria-hidden="true" />Saving {pendingPlaylistEdits} playlist {pendingPlaylistEdits === 1 ? "change" : "changes"}</span>
+            ) : message ? <span>{message}</span> : <span />}
             {error ? <strong>{error}</strong> : null}
           </div>
 
@@ -2322,7 +3398,7 @@ export default function PlaylistManager() {
               <nav className="toolsNav" aria-label="Playlist tools">
                 {[
                   ["add", "Add song"],
-                  ["expiry", "Expiry"],
+                  ["expiry", "Cleanup"],
                   ["flex", "Rotator"],
                   ["backups", "Backups"],
                 ].map(([key, label]) => (
@@ -2334,105 +3410,296 @@ export default function PlaylistManager() {
               <div className="toolCard">
                 {activeTool === "add" ? (
                   <>
-                    <h2>Add song</h2>
-                    <p>Search Spotify or paste a track URL. Pick a candidate, then add it at an optional position with optional expiry.</p>
-                    <div className="toolGrid addToolGrid">
-                      <div className="trackSearchBox">
-                        <input
-                          value={trackLink}
-                          onChange={(e) => {
-                            setTrackLink(e.target.value);
-                            setSelectedTrackCandidate(null);
-                          }}
-                          placeholder="Search artist - song or paste Spotify track link"
-                        />
-                        {selectedTrackCandidate ? (
-                          <div className="selectedTrackCard">
-                            <Artwork src={selectedTrackCandidate.cover_url} alt="" size="sm" />
-                            <span>
-                              <strong>{selectedTrackCandidate.name}</strong>
-                              <small>{selectedTrackCandidate.artists}{selectedTrackCandidate.album ? ` · ${selectedTrackCandidate.album}` : ""}</small>
-                            </span>
-                            <button
-                              className="iconOnlyButton selectedTrackClear"
-                              aria-label="Clear selected song"
-                              onClick={() => {
-                                setTrackLink("");
-                                setSelectedTrackCandidate(null);
-                              }}
-                            >
-                              <X aria-hidden="true" />
-                            </button>
-                          </div>
-                        ) : null}
-                        {(trackSearchLoading || trackCandidates.length || trackSearchNotice) ? (
-                          <div className="trackCandidates">
-                            {trackSearchLoading ? <span>Searching...</span> : null}
-                            {!trackSearchLoading && trackSearchNotice ? <span>{trackSearchNotice}</span> : null}
-                            {trackCandidates.map((candidate) => (
-                              <button key={candidate.id} onClick={() => selectTrackCandidate(candidate)}>
-                                <Artwork src={candidate.cover_url} alt="" size="sm" />
-                                <span>
-                                  <strong>{candidate.name}</strong>
-                                  <small>{candidate.artists}{candidate.album ? ` · ${candidate.album}` : ""}</small>
-                                </span>
-                              </button>
-                            ))}
-                          </div>
-                        ) : null}
+                    <div className="cleanupIntro addSongIntro">
+                      <div>
+                        <h2>Add song</h2>
+                        <p>Add a released Spotify track now, or schedule an unreleased song for release day.</p>
                       </div>
-                      <input value={trackPosition} onChange={(e) => setTrackPosition(e.target.value)} placeholder="Position" inputMode="numeric" />
-                      <input value={trackExpiry} onChange={(e) => setTrackExpiry(e.target.value)} placeholder="Expiry weeks" inputMode="numeric" />
-                      <button disabled={busy || !playlistId || !trackLink.trim()} onClick={addTrack}>Add song</button>
+                      <div className="cleanupStatus">
+                        <strong>{futureAdds.filter((item) => item.status === "pending").length}</strong>
+                        <span>scheduled</span>
+                      </div>
+                    </div>
+                    <div className="addSongCards">
+                      <section className="cleanupRuleCard addNowCard isActive">
+                        <div className="cleanupRuleHeader">
+                          <span className="cleanupRuleIcon"><ListEnd aria-hidden="true" /></span>
+                          <div>
+                            <h3>Add now</h3>
+                            <p>Search Spotify or paste a track link. Position defaults to 1 when empty.</p>
+                          </div>
+                        </div>
+                        <div className="cleanupRuleControls">
+                          <div className="addNowGrid">
+                            <div className="trackSearchBox">
+                              <input
+                                value={trackLink}
+                                onChange={(e) => {
+                                  setTrackLink(e.target.value);
+                                  setSelectedTrackCandidate(null);
+                                }}
+                                placeholder="Search artist - song or paste Spotify track link"
+                              />
+                              {selectedTrackCandidate ? (
+                                <div className="selectedTrackCard">
+                                  <Artwork src={selectedTrackCandidate.cover_url} alt="" size="sm" />
+                                  <span>
+                                    <strong>{selectedTrackCandidate.name}</strong>
+                                    <small>{selectedTrackCandidate.artists}{selectedTrackCandidate.album ? ` · ${selectedTrackCandidate.album}` : ""}</small>
+                                  </span>
+                                  <button
+                                    className="iconOnlyButton selectedTrackClear"
+                                    aria-label="Clear selected song"
+                                    onClick={() => {
+                                      setTrackLink("");
+                                      setSelectedTrackCandidate(null);
+                                    }}
+                                  >
+                                    <X aria-hidden="true" />
+                                  </button>
+                                </div>
+                              ) : null}
+                              {(trackSearchLoading || trackCandidates.length || trackSearchNotice) ? (
+                                <div className="trackCandidates">
+                                  {trackSearchLoading ? <span>Searching...</span> : null}
+                                  {!trackSearchLoading && trackSearchNotice ? <span>{trackSearchNotice}</span> : null}
+                                  {trackCandidates.map((candidate) => (
+                                    <button key={candidate.id} onClick={() => selectTrackCandidate(candidate)}>
+                                      <Artwork src={candidate.cover_url} alt="" size="sm" />
+                                      <span>
+                                        <strong>{candidate.name}</strong>
+                                        <small>{candidate.artists}{candidate.album ? ` · ${candidate.album}` : ""}</small>
+                                      </span>
+                                    </button>
+                                  ))}
+                                </div>
+                              ) : null}
+                            </div>
+                            <input value={trackPosition} onChange={(e) => setTrackPosition(e.target.value)} placeholder="Position" inputMode="numeric" />
+                            <input value={trackExpiry} onChange={(e) => setTrackExpiry(e.target.value)} placeholder="Expiry weeks" inputMode="numeric" />
+                            <button disabled={busy || !playlistId || !trackLink.trim()} onClick={addTrack}>Add now</button>
+                          </div>
+                        </div>
+                      </section>
+
+                      <section className={`cleanupRuleCard futureAddCard ${futureAddEnabled ? "isActive" : ""}`}>
+                        <div className="cleanupRuleHeader">
+                          <span className="cleanupRuleIcon"><TimerReset aria-hidden="true" /></span>
+                          <div>
+                            <h3>Future add</h3>
+                            <p>On release day PlaylistPilot searches Spotify, verifies the best match, and adds it automatically.</p>
+                          </div>
+                          <label className="cleanupSwitch">
+                            <input
+                              type="checkbox"
+                              checked={futureAddEnabled}
+                              onChange={(e) => setFutureAddEnabled(e.target.checked)}
+                            />
+                            <span aria-hidden="true" />
+                            <em>{futureAddEnabled ? "On" : "Off"}</em>
+                          </label>
+                        </div>
+                        {futureAddEnabled ? (
+                          <div className="cleanupRuleControls">
+                            <div className="futureAddGrid">
+                              <label className="compactField">
+                                <span>Release date</span>
+                                <input type="date" value={futureAddForm.release_date} onChange={(e) => setFutureAddForm((current) => ({ ...current, release_date: e.target.value }))} />
+                              </label>
+                              <label className="compactField">
+                                <span>Artist</span>
+                                <input value={futureAddForm.artist_name} onChange={(e) => setFutureAddForm((current) => ({ ...current, artist_name: e.target.value }))} placeholder="Artist name" />
+                              </label>
+                              <label className="compactField">
+                                <span>Song title</span>
+                                <input value={futureAddForm.track_title} onChange={(e) => setFutureAddForm((current) => ({ ...current, track_title: e.target.value }))} placeholder="Song title" />
+                              </label>
+                              <label className="compactField">
+                                <span>Position</span>
+                                <input value={futureAddForm.position} onChange={(e) => setFutureAddForm((current) => ({ ...current, position: e.target.value }))} placeholder="Optional" inputMode="numeric" />
+                              </label>
+                            </div>
+                            <p className="cleanupHint">If the match is unclear, PlaylistPilot marks it as not found instead of adding the wrong song.</p>
+                            <div className="toolActions">
+                              <button disabled={busy || !playlistId || !futureAddForm.release_date || !futureAddForm.artist_name.trim() || !futureAddForm.track_title.trim()} onClick={createFutureAdd}>Schedule add</button>
+                              <button className="secondaryOutline" disabled={busy || !playlistId} onClick={loadFutureAdds}>Refresh queue</button>
+                            </div>
+                          </div>
+                        ) : null}
+                      </section>
+                    </div>
+                    <div className="futureAddList addToolFutureList">
+                      {futureAdds.map((item) => (
+                        <article className={`futureAddItem futureAddItem--${item.status}`} key={item.id}>
+                          <div>
+                            <strong>{item.track_title}</strong>
+                            <span>{item.artist_name}</span>
+                            <small>{formatShortDate(item.release_date)}{item.target_position ? ` · pos ${item.target_position}` : ""}</small>
+                          </div>
+                          <em>{item.status}</em>
+                          {item.status === "added" ? <small>{item.spotify_track_name || item.spotify_track_uri}</small> : item.last_error ? <small>{item.last_error}</small> : <small />}
+                          {item.status === "pending" ? <button className="smallOutlineButton danger" disabled={busy} onClick={() => deleteFutureAdd(item)}>Remove</button> : null}
+                        </article>
+                      ))}
+                      {!futureAdds.length ? <p className="emptyToolState">No future adds scheduled for this playlist yet.</p> : null}
                     </div>
                   </>
                 ) : null}
                 {activeTool === "expiry" ? (
                   <>
-                    <h2>Expiry</h2>
-                    <p>Automatically remove unlocked songs after the selected number of weeks. Manual per-song expiry still overrides this.</p>
-                    <div className="toolGrid expiryToolGrid">
-                      <label className="compactField">
-                        <span>Default expiry weeks</span>
-                        <input type="number" min="1" max="104" value={autoWeeks} onChange={(e) => setAutoWeeks(e.target.value)} />
-                      </label>
-                      <button disabled={busy || !playlistId} onClick={saveAutoRemoval}>Save expiry</button>
-                      <button disabled={busy || !playlistId} onClick={cleanupNow}>Run expiry check now</button>
+                    <div className="cleanupIntro">
+                      <div>
+                        <h2>Cleanup</h2>
+                        <p>Choose how PlaylistPilot keeps this playlist fresh. Locked tracks are always protected.</p>
+                      </div>
+                      <div className="cleanupStatus">
+                        <strong>{Number(autoExpiryEnabled) + Number(trackLimitEnabled)}</strong>
+                        <span>active rules</span>
+                      </div>
+                    </div>
+                    <div className="cleanupRules">
+                      <section className={`cleanupRuleCard ${autoExpiryEnabled ? "isActive" : ""}`}>
+                        <div className="cleanupRuleHeader">
+                          <span className="cleanupRuleIcon"><TimerReset aria-hidden="true" /></span>
+                          <div>
+                            <h3>Weekly expiry</h3>
+                            <p>Remove unlocked tracks after they reach the selected age.</p>
+                          </div>
+                          <label className="cleanupSwitch">
+                            <input
+                              type="checkbox"
+                              checked={autoExpiryEnabled}
+                              onChange={(e) => setAutoExpiryEnabled(e.target.checked)}
+                            />
+                            <span aria-hidden="true" />
+                            <em>{autoExpiryEnabled ? "On" : "Off"}</em>
+                          </label>
+                        </div>
+                        <div className="cleanupRuleControls">
+                          <label className="compactField">
+                            <span>Remove tracks after</span>
+                            <div className="inlineNumberField">
+                              <input type="number" min="1" max="104" value={autoWeeks} onChange={(e) => setAutoWeeks(e.target.value)} disabled={!autoExpiryEnabled} />
+                              <small>weeks</small>
+                            </div>
+                          </label>
+                          <p className="cleanupHint">A manual expiry set directly on a song takes priority over this playlist default.</p>
+                        </div>
+                      </section>
+
+                      <section className={`cleanupRuleCard ${trackLimitEnabled ? "isActive" : ""}`}>
+                        <div className="cleanupRuleHeader">
+                          <span className="cleanupRuleIcon"><ListEnd aria-hidden="true" /></span>
+                          <div>
+                            <h3>Playlist size limit</h3>
+                            <p>Automatically trim unlocked tracks when the playlist becomes too large.</p>
+                          </div>
+                          <label className="cleanupSwitch">
+                            <input
+                              type="checkbox"
+                              checked={trackLimitEnabled}
+                              onChange={(e) => setTrackLimitEnabled(e.target.checked)}
+                            />
+                            <span aria-hidden="true" />
+                            <em>{trackLimitEnabled ? "On" : "Off"}</em>
+                          </label>
+                        </div>
+                        <div className="cleanupRuleControls">
+                          <div className="trackLimitGrid">
+                            <label className="compactField">
+                              <span>Maximum tracks</span>
+                              <input
+                                type="number"
+                                min="1"
+                                max="10000"
+                                value={trackLimitCount}
+                                onChange={(e) => setTrackLimitCount(e.target.value)}
+                                placeholder="100"
+                                disabled={!trackLimitEnabled}
+                              />
+                            </label>
+                            <label className="compactField">
+                              <span>When over the limit</span>
+                              <select value={trackLimitStrategy} onChange={(e) => setTrackLimitStrategy(e.target.value)}>
+                                <option value="back">Remove tracks from the bottom</option>
+                                <option value="oldest">Remove oldest additions first</option>
+                              </select>
+                            </label>
+                          </div>
+                          <p className="cleanupHint">If locked tracks prevent reaching the limit, PlaylistPilot leaves them untouched.</p>
+                        </div>
+                      </section>
+                    </div>
+                    <div className="toolActions">
+                      <button disabled={busy || !playlistId} onClick={saveAutoRemoval}>Save changes</button>
+                      <button className="secondaryOutline" disabled={busy || !playlistId || (!autoExpiryEnabled && !trackLimitEnabled)} onClick={cleanupNow}>Run cleanup now</button>
                     </div>
                   </>
                 ) : null}
                 {activeTool === "flex" ? (
                   <>
-                    <div className="flexPanelHeader">
+                    <div className="cleanupIntro rotatorIntro">
                       <div>
                         <h2>Track Rotator</h2>
-                        <p>Set rotation slots that automatically swap songs from a reference playlist on your schedule.</p>
+                        <p>Automatically refresh selected track positions using songs from a reference playlist.</p>
+                      </div>
+                      <div className="cleanupStatus">
+                        <strong>{flexSlots.length}</strong>
+                        <span>rotation slots</span>
                       </div>
                     </div>
-                    <div className="flexSettings">
-                      <input value={flexReference} onChange={(e) => { setFlexReference(e.target.value); setFlexReferenceIssue(null); }} placeholder="Reference playlist link" />
-                      <select value={flexInterval} onChange={(e) => setFlexInterval(e.target.value)}>
-                        <option value="daily">Daily</option>
-                        <option value="weekly">Weekly</option>
-                        <option value="monthly">Monthly</option>
-                      </select>
-                      <label className="toggleField">
-                        <input type="checkbox" checked={flexEnabled} onChange={(e) => setFlexEnabled(e.target.checked)} />
-                        Enabled
-                      </label>
-                      <button className="tooltipButton" data-tooltip="Save the reference playlist, rotation interval, and enabled state." disabled={busy || !playlistId} onClick={saveFlexSettings}>
-                        Save rotator
-                      </button>
-                    </div>
-                    <div className="rotatorRules">
-                      <label className="toggleField rotatorDuplicateToggle">
-                        <input type="checkbox" checked={flexAvoidDuplicates} onChange={(e) => setFlexAvoidDuplicates(e.target.checked)} />
-                        Skip songs already in target playlist
-                      </label>
-                      <input value={flexRepeatWeeks} onChange={(e) => setFlexRepeatWeeks(e.target.value)} placeholder="No repeat weeks" inputMode="numeric" />
-                      <input value={flexMaxReleaseAgeWeeks} onChange={(e) => setFlexMaxReleaseAgeWeeks(e.target.value)} placeholder="Max release age weeks" inputMode="numeric" />
-                      <input value={flexMinPopularity} onChange={(e) => setFlexMinPopularity(e.target.value)} placeholder="Min popularity" inputMode="numeric" />
-                      <input value={flexMaxPopularity} onChange={(e) => setFlexMaxPopularity(e.target.value)} placeholder="Max popularity" inputMode="numeric" />
+                    <div className="rotatorCards">
+                      <section className={`cleanupRuleCard rotatorSettingsCard ${flexEnabled ? "isActive" : ""}`}>
+                        <div className="cleanupRuleHeader">
+                          <span className="cleanupRuleIcon"><Shuffle aria-hidden="true" /></span>
+                          <div>
+                            <h3>Rotation source</h3>
+                            <p>Choose the playlist and schedule used to refresh your rotation slots.</p>
+                          </div>
+                          <label className="cleanupSwitch">
+                            <input type="checkbox" checked={flexEnabled} onChange={(e) => setFlexEnabled(e.target.checked)} />
+                            <span aria-hidden="true" />
+                            <em>{flexEnabled ? "On" : "Off"}</em>
+                          </label>
+                        </div>
+                        <div className="cleanupRuleControls">
+                          <div className="flexSettings">
+                            <label className="compactField rotatorSourceField">
+                              <span>Reference playlist</span>
+                              <input value={flexReference} onChange={(e) => { setFlexReference(e.target.value); setFlexReferenceIssue(null); }} placeholder="Paste a Spotify playlist link" />
+                            </label>
+                            <label className="compactField">
+                              <span>Rotation schedule</span>
+                              <select value={flexInterval} onChange={(e) => setFlexInterval(e.target.value)}>
+                                <option value="daily">Daily</option>
+                                <option value="weekly">Weekly</option>
+                                <option value="monthly">Monthly</option>
+                              </select>
+                            </label>
+                          </div>
+                        </div>
+                      </section>
+                      <section className="cleanupRuleCard rotatorSettingsCard">
+                        <div className="cleanupRuleHeader">
+                          <span className="cleanupRuleIcon"><Settings aria-hidden="true" /></span>
+                          <div>
+                            <h3>Selection rules</h3>
+                            <p>Control which tracks can be selected and how often they may return.</p>
+                          </div>
+                        </div>
+                        <div className="cleanupRuleControls">
+                          <label className="toggleField rotatorDuplicateToggle">
+                            <input type="checkbox" checked={flexAvoidDuplicates} onChange={(e) => setFlexAvoidDuplicates(e.target.checked)} />
+                            Skip songs already in target playlist
+                          </label>
+                          <div className="rotatorRules">
+                            <input value={flexRepeatWeeks} onChange={(e) => setFlexRepeatWeeks(e.target.value)} placeholder="No repeat weeks" inputMode="numeric" />
+                            <input value={flexMaxReleaseAgeWeeks} onChange={(e) => setFlexMaxReleaseAgeWeeks(e.target.value)} placeholder="Max release age weeks" inputMode="numeric" />
+                            <input value={flexMinPopularity} onChange={(e) => setFlexMinPopularity(e.target.value)} placeholder="Min popularity" inputMode="numeric" />
+                            <input value={flexMaxPopularity} onChange={(e) => setFlexMaxPopularity(e.target.value)} placeholder="Max popularity" inputMode="numeric" />
+                          </div>
+                        </div>
+                      </section>
                     </div>
                     {flexReferenceMeta ? (
                       <div className="referencePlaylist">
@@ -2463,6 +3730,11 @@ export default function PlaylistManager() {
                         </ol>
                       </div>
                     ) : null}
+                    <div className="toolActions">
+                      <button className="tooltipButton" data-tooltip="Save the reference playlist, schedule, status, and selection rules." disabled={busy || !playlistId} onClick={saveFlexSettings}>
+                        Save changes
+                      </button>
+                    </div>
                     <div className="flexSlotList">
                       {flexSlots.map((slot) => (
                         <div className="flexSlot" key={slot.id}>
@@ -2490,7 +3762,7 @@ export default function PlaylistManager() {
                     <div className="flexPanelHeader">
                       <div>
                         <h2>Backups</h2>
-                        <p>Create a playlist snapshot before bigger edits. Automatic backups already happen during sync; manual backups are useful before risky reorder sessions.</p>
+                        <p>PlaylistPilot keeps up to 5 useful restore points per playlist: the latest manual backup plus snapshots at least one day, one week, one month and six months old. Historical points appear as the backup history grows.</p>
                       </div>
                       <button className="tooltipButton" data-tooltip="Fetch the current Spotify order and store it as a restorable snapshot." disabled={busy || !playlistId} onClick={createBackupNow}>
                         Create backup
@@ -2498,24 +3770,33 @@ export default function PlaylistManager() {
                     </div>
                     <div className="backupActions">
                       <button className="smallOutlineButton" disabled={busy || !playlistId} onClick={cleanupDuplicateBackups}>Clean duplicates</button>
-                      <button className="smallOutlineButton" disabled={busy || !playlistId} onClick={applyBackupRetention}>Apply retention</button>
+                      <button className="smallOutlineButton" disabled={busy || !playlistId} onClick={applyBackupRetention}>Compact backups</button>
                     </div>
                     <div className="backupList">
-                      {backups.map((backup) => (
+                      {backupSlots.map((slot) => slot.backup ? (
                         <button
-                          className={selectedBackupId === backup.id ? "backupItem selected" : "backupItem"}
-                          key={backup.id}
-                          onClick={() => openBackupDetails(backup)}
+                          className={selectedBackupId === slot.backup.id ? "backupItem selected" : "backupItem"}
+                          key={slot.key}
+                          onClick={() => openBackupDetails(slot.backup)}
                           type="button"
                         >
-                          <Artwork src={backup.image || playlist?.image} alt="" size="sm" />
+                          <Artwork src={slot.backup.image || playlist?.image} alt="" size="sm" />
                           <span>
-                            <strong>{formatShortDate(String(backup.taken_at || "").slice(0, 10)) || "Backup"}</strong>
-                            <small>{backup.reason ? `${backup.reason} · ` : ""}{formatNumber(backup.tracks_total)} tracks · {backup.snapshot_id ? `snapshot ${String(backup.snapshot_id).slice(0, 8)}` : "no snapshot"}</small>
+                            <b>{slot.label}</b>
+                            <strong>{formatShortDate(String(slot.backup.taken_at || "").slice(0, 10)) || "Backup"}</strong>
+                            <small>{formatNumber(slot.backup.tracks_total)} tracks · {slot.backup.snapshot_id ? `snapshot ${String(slot.backup.snapshot_id).slice(0, 8)}` : "no snapshot"}</small>
                           </span>
                         </button>
+                      ) : (
+                        <div className="backupItem backupItem--empty" key={slot.key}>
+                          <span className="backupSlotMark" aria-hidden="true">{slot.label.slice(0, 1)}</span>
+                          <span>
+                            <b>{slot.label}</b>
+                            <strong>Building history</strong>
+                            <small>{slot.empty}</small>
+                          </span>
+                        </div>
                       ))}
-                      {!backups.length ? <p>No backups stored for this playlist yet.</p> : null}
                     </div>
                     {backupDetail ? (
                       <div className="backupDetail">
@@ -2559,7 +3840,7 @@ export default function PlaylistManager() {
                           </div>
                         ) : null}
                         <div className="backupTracks">
-                          {(backupDetail.tracks || []).slice(0, 12).map((track) => (
+                          {(backupDetail.tracks || []).slice(0, 5).map((track) => (
                             <div key={`${track.position}-${track.track_id}`}>
                               <b>{Number(track.position) + 1}</b>
                               <span>
@@ -2601,7 +3882,7 @@ export default function PlaylistManager() {
                   ))}
                 </div>
               ) : null}
-              {filteredTracks.map((track) => {
+              {!playlistLoading && filteredTracks.map((track) => {
                 const isFlexTrack = activeFlexTrackIds.has(track.track_id);
                 return (
 	                  <article
@@ -2792,6 +4073,124 @@ export default function PlaylistManager() {
           background: rgba(18, 21, 26, 0.94);
           backdrop-filter: blur(10px);
         }
+        .setupProgress {
+          position: relative;
+          z-index: 24;
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto;
+          gap: 10px 20px;
+          padding: 14px clamp(20px, 3vw, 40px) 16px;
+          border-bottom: 1px solid rgba(24, 224, 111, 0.22);
+          background: #151a20;
+          box-shadow: 0 12px 34px rgba(0, 0, 0, 0.16);
+        }
+        .setupProgressHeader {
+          grid-column: 1 / -1;
+          display: flex;
+          align-items: end;
+          justify-content: space-between;
+          gap: 20px;
+        }
+        .setupProgressHeader div {
+          display: grid;
+          gap: 2px;
+        }
+        .setupProgressHeader span,
+        .setupProgressHeader small {
+          color: #18e06f;
+          font-size: 11px;
+          font-weight: 850;
+          text-transform: uppercase;
+        }
+        .setupProgressHeader strong {
+          font-size: 16px;
+        }
+        .setupProgressTrack {
+          grid-column: 1 / -1;
+          height: 3px;
+          overflow: hidden;
+          border-radius: 3px;
+          background: #29313b;
+        }
+        .setupProgressTrack span {
+          display: block;
+          height: 100%;
+          border-radius: inherit;
+          background: #18e06f;
+          transition: width 240ms ease;
+        }
+        .setupProgressSteps {
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 8px;
+          min-width: 0;
+          margin: 0;
+          padding: 0;
+          list-style: none;
+        }
+        .setupProgressSteps li {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          min-width: 0;
+          color: #747e8b;
+          font-size: 12px;
+          font-weight: 750;
+        }
+        .setupProgressSteps li.active {
+          color: #f4f6fb;
+        }
+        .setupProgressSteps li.done {
+          color: #9eb2a6;
+        }
+        .setupProgressSteps b {
+          display: grid;
+          place-items: center;
+          width: 24px;
+          height: 24px;
+          flex: 0 0 auto;
+          border: 1px solid #35404c;
+          border-radius: 50%;
+          color: inherit;
+          font-size: 11px;
+        }
+        .setupProgressSteps li.active b,
+        .setupProgressSteps li.done b {
+          border-color: #18e06f;
+          color: #18e06f;
+        }
+        .setupProgressSteps span {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .setupProgress > button {
+          align-self: center;
+          min-width: 170px;
+        }
+        .spotifySetupAlert {
+          display: flex;
+          align-items: flex-start;
+          justify-content: space-between;
+          gap: 18px;
+          width: min(1180px, calc(100% - 32px));
+          margin: 14px auto 0;
+          padding: 15px 16px;
+          border: 1px solid #d9a441;
+          border-radius: 8px;
+          background: #211d15;
+          color: #f4f6fb;
+        }
+        .spotifySetupAlert div {
+          display: grid;
+          gap: 4px;
+        }
+        .spotifySetupAlert p,
+        .spotifySetupAlert small {
+          margin: 0;
+          color: #d8c9aa;
+          line-height: 1.45;
+        }
         .operationToast {
           position: fixed;
           top: 118px;
@@ -2883,20 +4282,223 @@ export default function PlaylistManager() {
         }
         .loginScreen {
           display: grid;
-          gap: 18px;
+          gap: 16px;
           align-content: center;
-          justify-items: start;
-          min-height: 58vh;
-          max-width: 620px;
-          padding: 40px;
+          justify-items: center;
+          min-height: calc(100vh - 180px);
+          padding: clamp(28px, 5vw, 72px);
+        }
+        .loginCard {
+          width: min(760px, 100%);
+          display: grid;
+          gap: 22px;
+          padding: clamp(26px, 4vw, 44px);
+          border: 1px solid #2a303b;
+          border-radius: 10px;
+          background:
+            linear-gradient(135deg, rgba(24, 224, 111, 0.12), rgba(24, 28, 35, 0) 42%),
+            #181c23;
+          box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28);
+        }
+        .loginBrand {
+          display: inline-flex;
+          align-items: center;
+          gap: 12px;
+          color: #f4f6fb;
+          font-size: 15px;
+          font-weight: 900;
+          letter-spacing: 0;
+        }
+        .loginBrand img {
+          width: 42px;
+          height: 42px;
+          border-radius: 8px;
+          object-fit: cover;
+        }
+        .loginCopy {
+          display: grid;
+          gap: 10px;
+        }
+        .loginCopy > span {
+          color: #18e06f;
+          font-size: 12px;
+          font-weight: 900;
+          text-transform: uppercase;
         }
         .loginScreen h2 {
-          font-size: 34px;
+          max-width: 650px;
+          font-size: clamp(34px, 5vw, 58px);
+          line-height: 0.98;
         }
         .loginScreen p {
+          max-width: 620px;
           color: #a6adba;
           font-size: 18px;
           line-height: 1.5;
+        }
+        .authModeTabs {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 4px;
+          padding: 4px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #101318;
+        }
+        .authModeTabs button {
+          border-color: transparent;
+          background: transparent;
+          color: #929ba8;
+        }
+        .authModeTabs button.active {
+          border-color: rgba(24, 224, 111, 0.45);
+          background: rgba(24, 224, 111, 0.1);
+          color: #18e06f;
+        }
+        .emailAuthForm {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 12px;
+        }
+        .emailAuthForm label {
+          display: grid;
+          gap: 7px;
+          min-width: 0;
+        }
+        .emailAuthForm label > span {
+          color: #c8ced8;
+          font-size: 12px;
+          font-weight: 800;
+        }
+        .emailAuthForm input {
+          width: 100%;
+          min-width: 0;
+          min-height: 46px;
+        }
+        .turnstileWrap,
+        .authNotice,
+        .authError,
+        .authUnavailable,
+        .emailAuthActions {
+          grid-column: 1 / -1;
+        }
+        .turnstileWrap {
+          min-height: 65px;
+          overflow: hidden;
+        }
+        .authNotice,
+        .authError,
+        .authUnavailable {
+          padding: 10px 12px;
+          border-radius: 6px;
+          line-height: 1.4;
+        }
+        .authNotice {
+          border: 1px solid #2c6041;
+          background: #14231b;
+          color: #bfe8ce;
+        }
+        .authError,
+        .authUnavailable {
+          border: 1px solid #65363b;
+          background: #25171a;
+          color: #ffb8bd;
+        }
+        .emailAuthActions {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+        }
+        .textButton {
+          padding: 8px 0;
+          border: 0;
+          background: transparent;
+          color: #a6adba;
+        }
+        .textButton:hover {
+          color: #18e06f;
+        }
+        .authDivider {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          color: #6f7886;
+          font-size: 12px;
+          text-transform: uppercase;
+        }
+        .authDivider::before,
+        .authDivider::after {
+          content: "";
+          height: 1px;
+          flex: 1;
+          background: #2a303b;
+        }
+        .passwordRecoveryPanel {
+          width: min(460px, calc(100% - 32px));
+          display: grid;
+          gap: 14px;
+          padding: 26px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #181c23;
+          box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+        }
+        .passwordRecoveryPanel > span {
+          color: #18e06f;
+          font-size: 12px;
+          font-weight: 900;
+          text-transform: uppercase;
+        }
+        .passwordRecoveryPanel p {
+          margin: 0;
+          color: #a6adba;
+          line-height: 1.5;
+        }
+        .googleLoginButton {
+          justify-self: start;
+          display: inline-flex;
+          align-items: center;
+          gap: 10px;
+          min-height: 48px;
+          padding: 0 18px;
+          border-color: rgba(24, 224, 111, 0.5);
+          background: #18e06f;
+          color: #07110b;
+          font-weight: 900;
+        }
+        .googleLoginButton span {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 24px;
+          height: 24px;
+          border-radius: 999px;
+          background: #f4fff8;
+          color: #11161d;
+          font-weight: 900;
+        }
+        .loginMetaGrid {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 10px;
+          padding-top: 4px;
+        }
+        .loginMetaGrid article {
+          display: grid;
+          gap: 5px;
+          padding: 12px;
+          border: 1px solid #252c37;
+          border-radius: 8px;
+          background: #101318;
+        }
+        .loginMetaGrid strong {
+          color: #f4f6fb;
+          font-size: 13px;
+        }
+        .loginMetaGrid small {
+          color: #a6adba;
+          line-height: 1.4;
         }
         .loginScreen strong {
           color: #ff4d4d;
@@ -2935,6 +4537,25 @@ export default function PlaylistManager() {
         }
         .subscriptionGateCopy strong {
           color: #ff6b6b;
+        }
+        .premiumRequirement {
+          display: grid;
+          gap: 5px;
+          padding: 13px 14px;
+          border: 1px solid #2c6041;
+          border-radius: 8px;
+          background: #14231b;
+        }
+        .premiumRequirement strong {
+          color: #18e06f;
+        }
+        .premiumRequirement p {
+          margin: 0;
+          color: #c1cdc5;
+          font-size: 13px;
+        }
+        .settingsSpotifyNotice {
+          margin-top: 2px;
         }
         .subscriptionGateCopy button {
           width: fit-content;
@@ -3274,6 +4895,10 @@ export default function PlaylistManager() {
           border-radius: 8px;
           background: #12161d;
         }
+        .settingsSection--setupActive {
+          border-color: rgba(24, 224, 111, 0.58);
+          box-shadow: inset 0 0 0 1px rgba(24, 224, 111, 0.08), 0 0 30px rgba(24, 224, 111, 0.06);
+        }
         .settingsSection h3 {
           font-size: 18px;
         }
@@ -3329,6 +4954,12 @@ export default function PlaylistManager() {
           grid-template-columns: minmax(0, 1fr) auto;
           align-items: start;
           gap: 14px;
+        }
+        .settingsHeaderActions {
+          display: flex;
+          flex-wrap: wrap;
+          justify-content: flex-end;
+          gap: 8px;
         }
         .connectionList {
           display: grid;
@@ -3629,6 +5260,29 @@ export default function PlaylistManager() {
           min-width: 132px;
           height: 42px;
         }
+        .dashboardSubnav {
+          display: inline-flex;
+          justify-self: start;
+          gap: 4px;
+          padding: 4px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #11161d;
+        }
+        .dashboardSubnav button {
+          min-height: 36px;
+          padding: 0 14px;
+          border: 0;
+          border-radius: 6px;
+          background: transparent;
+          color: #a6adba;
+          font-size: 13px;
+          font-weight: 900;
+        }
+        .dashboardSubnav button.active {
+          background: rgba(24, 224, 111, 0.12);
+          color: #18e06f;
+        }
         .dashboardHero h2 {
           font-size: clamp(30px, 4vw, 48px);
           line-height: 1;
@@ -3715,6 +5369,292 @@ export default function PlaylistManager() {
           display: grid;
           grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
           gap: 14px;
+        }
+        .performanceHeroRow {
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 14px;
+        }
+        .performanceHeroCard {
+          display: grid;
+          align-content: center;
+          justify-items: start;
+          gap: 7px;
+          min-height: 132px;
+          padding: 18px;
+          border: 1px solid rgba(24, 224, 111, 0.32);
+          border-radius: 8px;
+          background: linear-gradient(135deg, rgba(24, 224, 111, 0.12), #181c23 54%);
+          color: #f4f6fb;
+          text-align: left;
+          min-width: 0;
+        }
+        .performanceHeroCard:hover:not(:disabled),
+        .performanceHeroCard:focus-visible:not(:disabled) {
+          border-color: rgba(24, 224, 111, 0.72);
+          background: linear-gradient(135deg, rgba(24, 224, 111, 0.16), #1b2028 54%);
+        }
+        .performanceHeroCard span {
+          color: #18e06f;
+          font-size: 11px;
+          font-weight: 900;
+          text-transform: uppercase;
+        }
+        .performanceHeroCard strong,
+        .performanceHeroCard small {
+          max-width: 100%;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .performanceHeroCard strong {
+          font-size: 18px;
+          line-height: 1.18;
+        }
+        .performanceHeroCard small {
+          color: #a6adba;
+          font-size: 13px;
+        }
+        .performanceHeroCard--quiet {
+          border-color: rgba(89, 180, 255, 0.32);
+          background: linear-gradient(135deg, rgba(89, 180, 255, 0.11), #181c23 54%);
+        }
+        .performanceHeroCard--quiet span {
+          color: #7cc7ff;
+        }
+        .performanceHeroCard--warning {
+          border-color: rgba(255, 208, 102, 0.34);
+          background: linear-gradient(135deg, rgba(255, 208, 102, 0.1), #181c23 54%);
+        }
+        .performanceHeroCard--warning span {
+          color: #ffd066;
+        }
+        .performanceHeroCard--neutral {
+          border-color: rgba(166, 173, 186, 0.24);
+          background: #181c23;
+        }
+        .performanceHeroCard--neutral span {
+          color: #a6adba;
+        }
+        .adPerformanceView {
+          display: grid;
+          gap: 18px;
+        }
+        .adControlGrid {
+          display: grid;
+          grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.65fr);
+          gap: 14px;
+          align-items: start;
+        }
+        .adControlGrid--single {
+          grid-template-columns: minmax(0, 1fr);
+        }
+        .adEventPanel,
+        .adInsightsPanel {
+          display: grid;
+          gap: 14px;
+        }
+        .adEventForm {
+          display: grid;
+          grid-template-columns: minmax(260px, 1.5fr) 170px 170px minmax(220px, 1fr) 150px;
+          gap: 10px;
+          align-items: start;
+        }
+        .adEventForm select,
+        .adEventForm input,
+        .adEventForm textarea {
+          min-height: 42px;
+          width: 100%;
+          border: 1px solid #2a303b;
+          background: #101318;
+          color: #f4f6fb;
+        }
+        .adEventForm textarea {
+          grid-column: 1 / 5;
+          min-height: 88px;
+          resize: vertical;
+        }
+        .adEventForm textarea::placeholder,
+        .adEventForm input::placeholder {
+          color: #7f8794;
+        }
+        .adEventForm button {
+          min-height: 42px;
+          align-self: end;
+        }
+        .adInsightList {
+          display: grid;
+          gap: 10px;
+        }
+        .adInsightList article {
+          display: grid;
+          gap: 5px;
+          padding: 12px;
+          border: 1px solid #252c37;
+          border-radius: 8px;
+          background: #101318;
+        }
+        .adInsightList span {
+          color: #18e06f;
+          font-size: 11px;
+          font-weight: 900;
+          text-transform: uppercase;
+        }
+        .adInsightList strong {
+          color: #f4f6fb;
+        }
+        .adInsightList small {
+          color: #a6adba;
+        }
+        .adPlaylistGrid {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr);
+          gap: 14px;
+        }
+        .adPlaylistCard {
+          display: grid;
+          gap: 12px;
+          padding: 16px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #181c23;
+          min-width: 0;
+          overflow: hidden;
+        }
+        .adPlaylistHeader {
+          display: flex;
+          gap: 12px;
+          align-items: center;
+          min-width: 0;
+        }
+        .adPlaylistHeader span {
+          display: grid;
+          gap: 3px;
+          min-width: 0;
+        }
+        .adPlaylistHeader strong,
+        .adPlaylistHeader small {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .adPlaylistHeader small {
+          color: #a6adba;
+        }
+        .adPlaylistSectionHeader {
+          display: flex;
+          justify-content: space-between;
+          align-items: end;
+          gap: 10px;
+          flex-wrap: wrap;
+          padding: 4px 2px 0;
+        }
+        .adPlaylistSectionHeader h2 {
+          font-size: 22px;
+        }
+        .adPlaylistSectionHeader p {
+          color: #a6adba;
+          margin-top: 4px;
+        }
+        .adChart {
+          width: 100%;
+          height: 320px;
+          min-height: 320px;
+          min-width: 0;
+          overflow: hidden;
+          border-radius: 8px;
+          background: rgba(18, 22, 29, 0.42);
+        }
+        .adDualChartGrid {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+          gap: 12px;
+        }
+        .adDualChartGrid section {
+          display: grid;
+          gap: 8px;
+          min-width: 0;
+          overflow: hidden;
+        }
+        .adDualChartGrid section > span {
+          color: #a6adba;
+          font-size: 11px;
+          font-weight: 900;
+          text-transform: uppercase;
+        }
+        .adMiniGrowthChart :global(.growthChart) {
+          height: 320px;
+          min-height: 320px;
+          margin-top: 0;
+        }
+        :global(.adChartSvg) {
+          display: block;
+          width: 100%;
+          height: 100%;
+        }
+        .adChart--empty {
+          display: grid;
+          place-items: center;
+          color: #a6adba;
+          font-size: 13px;
+          font-weight: 800;
+        }
+        .adPlaylistStats {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 8px;
+        }
+        .adPlaylistStats--details {
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+        }
+        .adPlaylistStats span {
+          padding: 8px 10px;
+          border: 1px solid #252c37;
+          border-radius: 8px;
+          background: #101318;
+          color: #a6adba;
+          font-size: 12px;
+          font-weight: 800;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .adEventList {
+          display: grid;
+          gap: 6px;
+        }
+        .adEventList div {
+          display: grid;
+          grid-template-columns: minmax(120px, 0.55fr) minmax(0, 1fr) auto;
+          gap: 8px;
+          align-items: center;
+          padding-top: 8px;
+          border-top: 1px solid #202630;
+        }
+        .adEventList span,
+        .adEventList strong {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .adEventList span {
+          color: #7cc7ff;
+          font-size: 12px;
+          font-weight: 800;
+        }
+        .adEventList strong {
+          color: #f4f6fb;
+          font-size: 13px;
+        }
+        .adEventList button {
+          min-height: 30px;
+          padding: 0 10px;
+          border-color: rgba(255, 77, 77, 0.45);
+          color: #ff6b6b;
+          background: transparent;
+        }
+        .adEmptyState {
+          grid-column: 1 / -1;
         }
         .adminGrid {
           display: grid;
@@ -3816,6 +5756,189 @@ export default function PlaylistManager() {
           color: #a6adba;
           font-size: 12px;
         }
+        .metaTitleLine {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          flex-wrap: wrap;
+        }
+        .metaTitleLine h2 {
+          margin: 0;
+        }
+        .metaReadOnlyBadge {
+          padding: 6px 9px;
+          border: 1px solid #39414e;
+          border-radius: 999px;
+          color: #a6adba;
+          font-size: 11px;
+          font-weight: 900;
+          text-transform: uppercase;
+        }
+        .metaMetricText {
+          font-size: 25px;
+          text-transform: capitalize;
+        }
+        .metaSetupGrid {
+          display: grid;
+          grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.65fr);
+          gap: 14px;
+          align-items: stretch;
+        }
+        .metaConnectionPanel,
+        .metaAuditPanel {
+          min-width: 0;
+        }
+        .metaFormGrid {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 12px;
+          margin-top: 16px;
+        }
+        .metaFormGrid label {
+          display: grid;
+          gap: 7px;
+          min-width: 0;
+        }
+        .metaFormGrid label > span {
+          color: #a6adba;
+          font-size: 12px;
+          font-weight: 800;
+        }
+        .metaFormGrid label > span small {
+          color: #707987;
+          font-weight: 600;
+        }
+        .metaFormGrid input {
+          width: 100%;
+          min-width: 0;
+        }
+        .metaFormWide {
+          grid-column: 1 / -1;
+        }
+        .metaFormActions {
+          display: flex;
+          align-items: center;
+          gap: 14px;
+          margin-top: 14px;
+        }
+        .metaFormActions small {
+          color: #7f8998;
+          line-height: 1.4;
+        }
+        .metaIdentity {
+          display: grid;
+          gap: 4px;
+          padding: 14px 0;
+          border-bottom: 1px solid #292f38;
+        }
+        .metaIdentity span,
+        .metaIdentity small {
+          color: #7f8998;
+          font-size: 12px;
+        }
+        .metaPermissionList {
+          display: flex;
+          gap: 7px;
+          flex-wrap: wrap;
+          padding: 14px 0;
+        }
+        .metaPermissionList span {
+          padding: 6px 8px;
+          border: 1px solid rgba(24, 224, 111, 0.35);
+          border-radius: 6px;
+          color: #18e06f;
+          background: rgba(24, 224, 111, 0.06);
+          font-size: 11px;
+          font-weight: 800;
+        }
+        .metaPermissionList p,
+        .metaAssetGroup > p {
+          margin: 0;
+          color: #7f8998;
+          font-size: 13px;
+        }
+        .metaWarnings {
+          display: grid;
+          gap: 6px;
+          padding: 11px 12px;
+          border: 1px solid rgba(255, 208, 102, 0.35);
+          border-radius: 7px;
+          background: rgba(255, 208, 102, 0.06);
+        }
+        .metaWarnings p {
+          margin: 0;
+          color: #ffd066;
+          font-size: 12px;
+        }
+        .metaAssetColumns {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 14px;
+          margin-top: 16px;
+        }
+        .metaAssetGroup {
+          display: grid;
+          align-content: start;
+          gap: 8px;
+          min-width: 0;
+        }
+        .metaAssetGroupHeader {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          padding-bottom: 9px;
+          border-bottom: 1px solid #2a303b;
+        }
+        .metaAssetGroupHeader span {
+          color: #18e06f;
+          font-weight: 900;
+        }
+        .metaAssetGroup article {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 10px;
+          min-width: 0;
+          padding: 11px 12px;
+          border: 1px solid #2a303b;
+          border-radius: 7px;
+          background: #151920;
+        }
+        .metaAssetGroup article div {
+          display: grid;
+          gap: 3px;
+          min-width: 0;
+        }
+        .metaAssetGroup article strong,
+        .metaAssetGroup article small,
+        .metaAssetGroup article > span {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .metaAssetGroup article small,
+        .metaAssetGroup article > span {
+          color: #7f8998;
+          font-size: 11px;
+        }
+        .metaPublishLock {
+          display: flex;
+          align-items: center;
+          gap: 13px;
+          padding: 15px 17px;
+          border: 1px solid #303744;
+          border-radius: 8px;
+          background: #14181f;
+        }
+        .metaPublishLock svg {
+          width: 20px;
+          color: #18e06f;
+        }
+        .metaPublishLock p {
+          margin: 3px 0 0;
+          color: #8d96a4;
+          font-size: 13px;
+        }
         .jobStatus {
           display: inline-flex;
           align-items: center;
@@ -3837,6 +5960,10 @@ export default function PlaylistManager() {
         .jobStatus--done {
           border-color: rgba(24, 224, 111, 0.48);
           color: #18e06f;
+        }
+        .jobStatus--failed {
+          border-color: rgba(255, 77, 77, 0.48);
+          color: #ff6b6b;
         }
         .jobStatus--failed {
           border-color: rgba(255, 77, 77, 0.48);
@@ -3879,6 +6006,9 @@ export default function PlaylistManager() {
           background: rgba(24, 224, 111, 0.12);
           color: #18e06f;
         }
+        .adMobileChartToggle {
+          display: none;
+        }
         .chartFilters select:last-child {
           min-width: 220px;
           max-width: 320px;
@@ -3910,19 +6040,20 @@ export default function PlaylistManager() {
         :global(.growthChart) {
           position: relative;
           width: 100%;
-          height: clamp(260px, 30vw, 340px);
-          min-height: 260px;
+          height: 300px;
+          min-height: 300px;
           margin-top: 14px;
           padding: 0;
-          overflow: visible;
+          overflow: hidden;
           border-radius: 8px;
           background: rgba(18, 22, 29, 0.42);
+          contain: layout paint;
         }
         :global(.growthChart) svg {
           display: block;
           width: 100%;
           height: 100%;
-          overflow: visible;
+          overflow: hidden;
         }
         :global(.chartGridLine) {
           stroke: rgba(166, 173, 186, 0.18);
@@ -3961,9 +6092,10 @@ export default function PlaylistManager() {
         }
         :global(.chartTooltip) {
           position: absolute;
-          top: 14px;
+          top: 12px;
           z-index: 8;
           min-width: 176px;
+          max-width: min(240px, calc(100% - 24px));
           padding: 10px 12px;
           border: 1px solid rgba(24, 224, 111, 0.28);
           border-radius: 8px;
@@ -4114,7 +6246,7 @@ export default function PlaylistManager() {
         }
         .playlistDetailDrawer section {
           display: grid;
-          grid-template-columns: repeat(3, minmax(0, 1fr));
+          grid-template-columns: repeat(4, minmax(0, 1fr));
           gap: 8px;
         }
         .playlistDetailDrawer article {
@@ -4275,14 +6407,53 @@ export default function PlaylistManager() {
           font-size: 13px;
           font-weight: 800;
         }
+        :global(.growthChart--recharts) {
+          padding: 6px 4px 2px 0;
+        }
+        :global(.rechartsTooltip) {
+          min-width: 184px;
+          padding: 11px 12px;
+          border: 1px solid rgba(24, 224, 111, 0.3);
+          border-radius: 8px;
+          background: rgba(15, 18, 23, 0.97);
+          color: #f4f6fb;
+          box-shadow: 0 16px 40px rgba(0, 0, 0, 0.36);
+          display: grid;
+          gap: 5px;
+        }
+        :global(.rechartsTooltip strong),
+        :global(.rechartsTooltip span),
+        :global(.rechartsTooltip em) {
+          display: block;
+          line-height: 1.3;
+          white-space: nowrap;
+        }
+        :global(.rechartsTooltip strong) {
+          font-size: 13px;
+        }
+        :global(.rechartsTooltip span) {
+          color: #a6adba;
+          font-size: 12px;
+        }
+        :global(.rechartsTooltip em) {
+          color: #18e06f;
+          font-size: 13px;
+          font-style: normal;
+          font-weight: 800;
+        }
+        :global(.rechartsTooltip b) {
+          color: #18e06f;
+          margin-right: 5px;
+        }
         .playlistTable {
           display: grid;
           gap: 2px;
           margin-top: 18px;
         }
+        .playlistTableHeader,
         .playlistTable div {
           display: grid;
-          grid-template-columns: 52px minmax(140px, 1fr) 116px 88px 92px;
+          grid-template-columns: 52px minmax(240px, 2fr) minmax(104px, 0.75fr) minmax(92px, 0.65fr) minmax(76px, 0.5fr) minmax(76px, 0.5fr) minmax(76px, 0.5fr) minmax(92px, 0.65fr);
           align-items: center;
           gap: 12px;
           min-height: 64px;
@@ -4290,9 +6461,22 @@ export default function PlaylistManager() {
           border-top: 1px solid #202630;
           min-width: 0;
         }
+        .playlistTableHeader {
+          min-height: 32px;
+          border-top: 0;
+          padding: 0 0 6px;
+          color: #7f8794;
+          font-size: 11px;
+          font-weight: 900;
+          text-transform: uppercase;
+        }
+        .playlistTableHeader span:first-child {
+          grid-column: 1 / 3;
+        }
         .playlistTable strong,
         .playlistTable span,
-        .playlistTable b {
+        .playlistTable b,
+        .playlistTable small {
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
@@ -4300,7 +6484,10 @@ export default function PlaylistManager() {
         .playlistTable b {
           color: #18e06f;
           font-size: 13px;
-          text-align: right;
+        }
+        .playlistTable small {
+          color: #7f8794;
+          font-size: 12px;
         }
         .removalList {
           display: grid;
@@ -4399,6 +6586,8 @@ export default function PlaylistManager() {
           gap: 12px;
           min-height: 0;
           padding-right: 6px;
+          overflow-y: auto;
+          overscroll-behavior: contain;
         }
         .playlistCard {
           display: grid;
@@ -4562,6 +6751,28 @@ export default function PlaylistManager() {
           grid-template-columns: minmax(420px, 2.4fr) 96px 120px auto;
           align-items: start;
         }
+        .addSongCards {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr);
+          gap: 14px;
+          align-items: start;
+        }
+        .addNowCard,
+        .futureAddCard {
+          min-width: 0;
+        }
+        .addNowGrid {
+          display: grid;
+          grid-template-columns: minmax(300px, 1fr) 120px 140px auto;
+          gap: 10px;
+          align-items: start;
+        }
+        .addNowGrid > input {
+          width: 100%;
+        }
+        .addToolFutureList {
+          margin-top: 0;
+        }
         .trackSearchBox {
           position: relative;
           min-width: 0;
@@ -4668,9 +6879,188 @@ export default function PlaylistManager() {
         .addToolGrid > input {
           width: 100%;
         }
-        .expiryToolGrid {
-          grid-template-columns: minmax(190px, 240px) auto auto;
+        .cleanupRules {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 14px;
+        }
+        .cleanupIntro {
+          display: flex;
           align-items: end;
+          justify-content: space-between;
+          gap: 18px;
+          margin-bottom: 16px;
+        }
+        .cleanupIntro > div:first-child {
+          display: grid;
+          gap: 5px;
+        }
+        .cleanupIntro > div:first-child > span {
+          color: #18e06f;
+          font-size: 11px;
+          font-weight: 900;
+          text-transform: uppercase;
+        }
+        .cleanupIntro h2,
+        .cleanupIntro p {
+          margin: 0;
+        }
+        .cleanupStatus {
+          display: grid;
+          justify-items: end;
+          gap: 1px;
+          flex: 0 0 auto;
+        }
+        .cleanupStatus strong {
+          color: #18e06f;
+          font-size: 24px;
+          line-height: 1;
+        }
+        .cleanupStatus span {
+          color: #7f8794;
+          font-size: 11px;
+          font-weight: 800;
+          text-transform: uppercase;
+        }
+        .cleanupRuleCard {
+          display: grid;
+          align-content: start;
+          gap: 18px;
+          padding: 18px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #12161d;
+          transition: border-color 160ms ease, background 160ms ease;
+        }
+        .cleanupRuleCard.isActive {
+          border-color: rgba(24, 224, 111, 0.38);
+          background: linear-gradient(145deg, rgba(24, 224, 111, 0.075), #12161d 45%);
+        }
+        .cleanupRuleHeader {
+          display: grid;
+          grid-template-columns: 38px minmax(0, 1fr) auto;
+          align-items: start;
+          gap: 12px;
+        }
+        .cleanupRuleHeader > div {
+          display: grid;
+          gap: 5px;
+          min-width: 0;
+        }
+        .cleanupRuleIcon {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 38px;
+          height: 38px;
+          border: 1px solid #303743;
+          border-radius: 8px;
+          color: #7f8794;
+          background: #181d25;
+        }
+        .cleanupRuleIcon svg {
+          width: 18px;
+          height: 18px;
+        }
+        .cleanupRuleCard.isActive .cleanupRuleIcon {
+          border-color: rgba(24, 224, 111, 0.42);
+          color: #18e06f;
+          background: rgba(24, 224, 111, 0.08);
+        }
+        .cleanupRuleCard h3 {
+          margin: 0;
+          font-size: 16px;
+          color: #f4f6fb;
+        }
+        .cleanupRuleCard p {
+          margin: 0;
+          font-size: 13px;
+          color: #a6adba;
+          line-height: 1.45;
+        }
+        .cleanupRuleControls {
+          display: grid;
+          align-content: start;
+          gap: 12px;
+          padding-top: 14px;
+          border-top: 1px solid #252c37;
+        }
+        .cleanupHint {
+          min-height: 38px;
+          color: #7f8794 !important;
+          font-size: 12px !important;
+        }
+        .inlineNumberField {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto;
+          align-items: center;
+          gap: 8px;
+        }
+        .inlineNumberField small {
+          color: #a6adba;
+          font-weight: 700;
+        }
+        .cleanupSwitch {
+          display: grid;
+          grid-template-columns: 34px auto;
+          align-items: center;
+          gap: 7px;
+          color: #f4f6fb;
+          font-weight: 800;
+          font-size: 11px;
+          cursor: pointer;
+        }
+        .cleanupSwitch input {
+          position: absolute;
+          opacity: 0;
+          pointer-events: none;
+        }
+        .cleanupSwitch > span {
+          position: relative;
+          width: 34px;
+          height: 20px;
+          border: 1px solid #3a424f;
+          border-radius: 999px;
+          background: #252c37;
+          transition: 160ms ease;
+        }
+        .cleanupSwitch > span::after {
+          content: "";
+          position: absolute;
+          top: 3px;
+          left: 3px;
+          width: 12px;
+          height: 12px;
+          border-radius: 50%;
+          background: #a6adba;
+          transition: 160ms ease;
+        }
+        .cleanupSwitch input:checked + span {
+          border-color: rgba(24, 224, 111, 0.72);
+          background: rgba(24, 224, 111, 0.2);
+        }
+        .cleanupSwitch input:checked + span::after {
+          transform: translateX(14px);
+          background: #18e06f;
+        }
+        .cleanupSwitch em {
+          color: #7f8794;
+          font-style: normal;
+          text-transform: uppercase;
+        }
+        .cleanupSwitch input:checked ~ em {
+          color: #18e06f;
+        }
+        .trackLimitGrid {
+          display: grid;
+          grid-template-columns: minmax(120px, 0.7fr) minmax(180px, 1fr);
+          gap: 12px;
+        }
+        .toolActions {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
+          margin-top: 14px;
         }
         .compactField {
           display: grid;
@@ -4684,7 +7074,8 @@ export default function PlaylistManager() {
           font-size: 13px;
           white-space: nowrap;
         }
-        .compactField input {
+        .compactField input,
+        .compactField select {
           width: 100%;
         }
         .flexPanelHeader,
@@ -4702,19 +7093,28 @@ export default function PlaylistManager() {
           margin-top: 5px;
           color: #a6adba;
         }
+        .rotatorCards {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 14px;
+        }
+        .rotatorSettingsCard {
+          min-width: 0;
+        }
         .flexSettings {
           display: grid;
-          grid-template-columns: minmax(220px, 1fr) 132px auto auto;
+          grid-template-columns: minmax(0, 1.5fr) minmax(140px, 0.6fr);
+          gap: 10px;
+          align-items: end;
+        }
+        .rotatorSourceField {
+          min-width: 0;
         }
         .rotatorRules {
           display: grid;
-          grid-template-columns: repeat(4, minmax(128px, 1fr));
+          grid-template-columns: repeat(2, minmax(120px, 1fr));
           gap: 10px;
           align-items: center;
-          padding: 12px;
-          border: 1px solid #252c37;
-          border-radius: 8px;
-          background: #12161d;
         }
         .toggleField {
           display: flex;
@@ -4732,7 +7132,89 @@ export default function PlaylistManager() {
           flex: 0 0 auto;
         }
         .rotatorDuplicateToggle {
-          grid-column: 1 / -1;
+          padding: 10px 12px;
+          border: 1px solid #252c37;
+          border-radius: 8px;
+          background: #101318;
+        }
+        .futureAddCard {
+          margin-top: 0;
+        }
+        .futureAddGrid {
+          display: grid;
+          grid-template-columns: minmax(150px, 0.75fr) minmax(180px, 1fr) minmax(180px, 1fr) minmax(110px, 0.5fr);
+          gap: 10px;
+          align-items: end;
+        }
+        .futureAddList {
+          display: grid;
+          gap: 8px;
+          margin-top: 14px;
+        }
+        .futureAddItem {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto minmax(0, 0.8fr) auto;
+          align-items: center;
+          gap: 12px;
+          min-height: 70px;
+          padding: 12px;
+          border: 1px solid #252c37;
+          border-radius: 8px;
+          background: #12161d;
+        }
+        .futureAddItem > div {
+          display: grid;
+          gap: 3px;
+          min-width: 0;
+        }
+        .futureAddItem strong,
+        .futureAddItem span,
+        .futureAddItem small {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .futureAddItem span,
+        .futureAddItem small {
+          color: #a6adba;
+          font-size: 12px;
+        }
+        .futureAddItem em {
+          justify-self: start;
+          min-width: 78px;
+          padding: 6px 9px;
+          border: 1px solid rgba(166, 173, 186, 0.28);
+          border-radius: 999px;
+          color: #a6adba;
+          font-size: 11px;
+          font-style: normal;
+          font-weight: 900;
+          text-align: center;
+          text-transform: uppercase;
+        }
+        .futureAddItem--pending em {
+          border-color: rgba(255, 208, 102, 0.44);
+          color: #ffd066;
+          background: rgba(255, 208, 102, 0.08);
+        }
+        .futureAddItem--added em {
+          border-color: rgba(24, 224, 111, 0.44);
+          color: #18e06f;
+          background: rgba(24, 224, 111, 0.08);
+        }
+        .futureAddItem--failed em,
+        .futureAddItem--not_found em {
+          border-color: rgba(255, 77, 77, 0.44);
+          color: #ff6b6b;
+          background: rgba(255, 77, 77, 0.08);
+        }
+        .emptyToolState {
+          margin: 0;
+          padding: 12px;
+          border: 1px dashed #303743;
+          border-radius: 8px;
+          color: #a6adba;
+          background: #101318;
         }
         .referencePlaylist {
           display: grid;
@@ -4863,6 +7345,34 @@ export default function PlaylistManager() {
           display: grid;
           gap: 3px;
           min-width: 0;
+        }
+        .backupItem span > b {
+          color: #24d366;
+          font-size: 10px;
+          font-weight: 900;
+          text-transform: uppercase;
+        }
+        .backupItem--empty {
+          border-style: dashed;
+          color: #7f8997;
+          background: #101318;
+        }
+        .backupItem--empty:hover {
+          border-color: #303844;
+          background: #101318;
+        }
+        .backupItem--empty strong {
+          color: #a6adba;
+        }
+        .backupSlotMark {
+          display: grid !important;
+          place-items: center;
+          width: 42px;
+          height: 42px;
+          border: 1px solid #303844;
+          border-radius: 6px;
+          color: #687280;
+          font-weight: 900;
         }
         .backupItem strong,
         .backupItem small {
@@ -5356,7 +7866,31 @@ export default function PlaylistManager() {
           .dashboardSplitGrid,
           .adminGrid,
           .adminGrid--wide,
+          .metaSetupGrid,
+          .metaAssetColumns,
+          .metaFormGrid,
+          .performanceHeroRow,
+          .adControlGrid,
+          .adPlaylistGrid,
           .removalList {
+            grid-template-columns: 1fr;
+          }
+          .metaFormWide {
+            grid-column: auto;
+          }
+          .metaFormActions {
+            align-items: stretch;
+            flex-direction: column;
+          }
+          .adEventForm {
+            grid-template-columns: 1fr;
+          }
+          .adEventForm textarea {
+            grid-column: auto;
+          }
+          .adPlaylistStats,
+          .adDualChartGrid,
+          .adEventList div {
             grid-template-columns: 1fr;
           }
           .adminTable div {
@@ -5365,10 +7899,14 @@ export default function PlaylistManager() {
           .adminTable small {
             grid-column: 2;
           }
+          .playlistTableHeader {
+            display: none;
+          }
           .playlistTable div {
             grid-template-columns: 52px minmax(0, 1fr) 100px;
           }
           .playlistTable span:nth-of-type(2),
+          .playlistTable span:nth-of-type(3),
           .playlistTable b {
             display: none;
           }
@@ -5377,12 +7915,21 @@ export default function PlaylistManager() {
             height: auto;
             overflow: visible;
             padding: 24px;
+            gap: 28px;
+          }
+          .sidebar {
+            position: relative;
+            z-index: 1;
+            max-width: 100%;
+            overflow: hidden;
           }
           .content {
             overflow: visible;
           }
           .playlistList {
             max-height: 42vh;
+            overflow-y: auto;
+            padding-right: 4px;
           }
           .playlistHeader {
             grid-template-columns: auto minmax(0, 1fr);
@@ -5396,17 +7943,338 @@ export default function PlaylistManager() {
           }
         }
         @media (max-width: 720px) {
+          .dashboard,
+          .adminPanel {
+            gap: 14px;
+            padding: 14px 14px 24px;
+          }
+          .dashboardHero {
+            display: grid;
+            gap: 14px;
+            align-items: stretch;
+          }
+          .dashboardHero h2 {
+            font-size: 32px;
+          }
+          .dashboardHero p {
+            font-size: 13px;
+            line-height: 1.35;
+          }
+          .dashboardActions {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 8px;
+          }
+          .dashboardActions select,
+          .dashboardActions input,
+          .dashboardActions button {
+            width: 100%;
+            min-width: 0;
+            height: 42px;
+          }
+          .dashboardActions button,
+          .dashboardActions input[type="date"] {
+            grid-column: span 2;
+          }
+          .dashboardSubnav {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            width: 100%;
+          }
+          .dashboardSubnav button {
+            width: 100%;
+          }
+          .metricGrid,
+          .metricGrid--primary {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+          }
+          .metricGrid article {
+            min-height: 112px;
+            padding: 13px;
+            grid-template-rows: auto minmax(32px, auto) auto;
+          }
+          .metricLabel {
+            font-size: 10px;
+          }
+          .metricValue {
+            font-size: 22px;
+            overflow-wrap: anywhere;
+          }
+          .metricMeta {
+            font-size: 11px;
+          }
+          .dashboardPanel {
+            padding: 14px;
+          }
+          .dashboardFocusGrid,
+          .dashboardSplitGrid,
+          .performanceHeroRow,
+          .adInsightHeroRow {
+            grid-template-columns: 1fr;
+            gap: 10px;
+          }
+          .growthPanel,
+          .rankPanel,
+          .topPlaylistsPanel,
+          .removalsPanel {
+            min-height: 0;
+          }
+          .rankPanel {
+            grid-template-rows: auto auto auto;
+          }
+          .panelHeader {
+            display: grid;
+            gap: 12px;
+          }
+          .chartFilters {
+            display: grid;
+            grid-template-columns: 1fr;
+            justify-content: stretch;
+          }
+          .chartFilters .modeToggle {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            width: 100%;
+          }
+          .chartFilters select {
+            width: 100%;
+            max-width: none;
+            min-width: 0;
+          }
+          .chartStats,
+          .warmupStats,
+          .playlistDetailDrawer section {
+            grid-template-columns: 1fr;
+          }
+          :global(.growthChart),
+          .adChart,
+          .adMiniGrowthChart :global(.growthChart) {
+            height: 240px;
+            min-height: 240px;
+          }
+          :global(.rechartsTooltip),
+          :global(.chartTooltip) {
+            max-width: calc(100vw - 52px);
+            min-width: 0;
+            white-space: normal;
+          }
+          :global(.growthBars) {
+            min-height: 0;
+            gap: 8px;
+          }
+          :global(.growthBar) {
+            grid-template-columns: 42px minmax(0, 1fr);
+            min-height: 68px;
+            gap: 9px;
+          }
+          :global(.growthRank) {
+            display: none;
+          }
+          :global(.growthBar) .artwork--sm,
+          :global(.growthBar) .coverFallback.artwork--sm {
+            grid-row: span 2;
+            width: 42px;
+            height: 42px;
+          }
+          :global(.growthDelta) {
+            grid-column: 2;
+            justify-self: start;
+            min-width: 0;
+            padding: 5px 8px;
+            font-size: 12px;
+          }
+          .performanceHeroCard {
+            min-height: 104px;
+            padding: 14px;
+          }
+          .performanceHeroCard strong,
+          .performanceHeroCard small {
+            white-space: normal;
+            overflow-wrap: anywhere;
+          }
+          .playlistTable {
+            gap: 10px;
+          }
+          .playlistTable div {
+            grid-template-columns: 42px minmax(0, 1fr);
+            gap: 8px 10px;
+            min-height: 0;
+            padding: 10px;
+            border: 1px solid #252c37;
+            border-radius: 8px;
+            background: #12161d;
+          }
+          .playlistTable div > strong {
+            grid-column: 2;
+            white-space: normal;
+            overflow-wrap: anywhere;
+          }
+          .playlistTable div > .artwork,
+          .playlistTable div > .coverFallback {
+            grid-row: 1 / 3;
+          }
+          .playlistTable span,
+          .playlistTable b {
+            display: grid !important;
+            grid-column: 1 / -1;
+            grid-template-columns: minmax(82px, 0.55fr) minmax(0, 1fr);
+            align-items: center;
+            min-height: 34px;
+            padding: 8px 10px;
+            border: 1px solid #252c37;
+            border-radius: 8px;
+            background: #101318;
+            font-size: 12px;
+            text-align: right;
+          }
+          .playlistTable span::before,
+          .playlistTable b::before {
+            color: #7f8794;
+            font-size: 10px;
+            font-weight: 900;
+            text-align: left;
+            text-transform: uppercase;
+          }
+          .playlistTable span:nth-of-type(1)::before {
+            content: "Followers";
+          }
+          .playlistTable span:nth-of-type(2)::before {
+            content: "Growth";
+          }
+          .playlistTable span:nth-of-type(3)::before {
+            content: "Tracks";
+          }
+          .playlistTable span:nth-of-type(4)::before {
+            content: "Locked";
+          }
+          .playlistTable span:nth-of-type(5)::before {
+            content: "Rotator";
+          }
+          .playlistTable b::before {
+            content: "Expiry";
+          }
+          .removalList div {
+            grid-template-columns: 42px minmax(0, 1fr);
+            padding: 10px 0;
+          }
+          .removalList strong,
+          .removalList em,
+          .removalList small {
+            white-space: normal;
+            overflow-wrap: anywhere;
+          }
+          .adPerformanceView {
+            gap: 14px;
+          }
+          .adEventForm {
+            grid-template-columns: 1fr;
+            gap: 8px;
+          }
+          .adEventForm textarea,
+          .adEventForm button {
+            grid-column: auto;
+          }
+          .adPlaylistSectionHeader {
+            display: grid;
+            gap: 10px;
+            align-items: stretch;
+          }
+          .adPlaylistSectionHeader .modeToggle {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            width: 100%;
+          }
+          .adMobileChartToggle {
+            display: grid !important;
+          }
+          .adPlaylistCard {
+            padding: 12px;
+            gap: 10px;
+          }
+          .adPlaylistHeader {
+            display: grid;
+            grid-template-columns: 44px minmax(0, 1fr);
+            gap: 10px;
+          }
+          .adPlaylistHeader strong,
+          .adPlaylistHeader small {
+            white-space: normal;
+            overflow-wrap: anywhere;
+          }
+          .adDualChartGrid {
+            grid-template-columns: 1fr;
+          }
+          .adDualChartGrid section {
+            min-height: 282px;
+            overflow: visible;
+          }
+          .adChart {
+            height: 240px;
+            min-height: 240px;
+            overflow: visible;
+          }
+          .adChart :global(.recharts-responsive-container) {
+            min-width: 240px;
+            min-height: 240px;
+          }
+          .adDualChartGrid--mobile-delta section:nth-child(2),
+          .adDualChartGrid--mobile-growth section:nth-child(1) {
+            display: none;
+          }
+          .adPlaylistStats,
+          .adPlaylistStats--details {
+            grid-template-columns: 1fr;
+            gap: 6px;
+          }
+          .adPlaylistStats span {
+            white-space: normal;
+            overflow-wrap: anywhere;
+          }
+          .adEventList div {
+            grid-template-columns: 1fr;
+          }
+          .adEventList button {
+            justify-self: start;
+          }
           .topbar {
             position: relative;
             grid-template-columns: minmax(0, 1fr);
             padding: 22px;
           }
+          .setupProgress {
+            grid-template-columns: 1fr;
+            gap: 10px;
+            padding: 14px 16px 16px;
+          }
+          .setupProgressHeader {
+            align-items: start;
+          }
+          .setupProgressSteps {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 9px 12px;
+          }
+          .setupProgress > button {
+            width: 100%;
+          }
+          .settingsSectionHeader,
+          .settingsHeaderActions {
+            grid-template-columns: 1fr;
+            width: 100%;
+          }
+          .settingsHeaderActions {
+            display: grid;
+          }
           .onboardingSteps,
           .onboardingStage,
           .onboardingReady,
+          .loginMetaGrid,
           .onboardingPlanGrid,
           .subscriptionGate,
           .subscriptionGatePlans {
+            grid-template-columns: 1fr;
+          }
+          .emailAuthForm {
             grid-template-columns: 1fr;
           }
           .onboardingHeader {
@@ -5449,18 +8317,19 @@ export default function PlaylistManager() {
             max-width: none;
           }
           :global(.growthBar) {
-            grid-template-columns: 24px 44px minmax(0, 1fr);
+            grid-template-columns: 42px minmax(0, 1fr);
           }
           :global(.growthSignal) {
-            grid-column: 3;
+            grid-column: 2;
             grid-template-columns: 1fr;
             gap: 6px;
           }
           .playlistTable div {
             grid-template-columns: 42px minmax(0, 1fr);
           }
-          .playlistTable span {
-            grid-column: 2;
+          .playlistTable span,
+          .playlistTable b {
+            grid-column: 1 / -1;
           }
           .siteFooter {
             display: grid;
@@ -5471,10 +8340,11 @@ export default function PlaylistManager() {
           }
           .workspace {
             padding: 22px;
-            gap: 40px;
+            gap: 28px;
           }
           .sidebar {
             gap: 18px;
+            padding-bottom: 4px;
           }
           .accountField {
             grid-template-columns: 1fr;
@@ -5492,6 +8362,30 @@ export default function PlaylistManager() {
             align-items: center;
             margin-top: 4px;
           }
+          .playlistList {
+            max-height: min(300px, 34vh);
+            border: 1px solid #202630;
+            border-radius: 8px;
+            padding: 8px;
+            background: rgba(16, 19, 24, 0.62);
+          }
+          .playlistCard {
+            min-height: 72px;
+            grid-template-columns: 52px minmax(0, 1fr);
+            gap: 10px;
+            padding: 9px;
+          }
+          .playlistCard :global(.artwork--lg),
+          .playlistCard :global(.coverFallback.artwork--lg) {
+            width: 52px;
+            height: 52px;
+          }
+          .playlistCard strong {
+            font-size: 14px;
+          }
+          .playlistCard small {
+            font-size: 11px;
+          }
           .playlistHeader {
             grid-template-columns: 72px minmax(0, 1fr);
             align-items: center;
@@ -5502,12 +8396,33 @@ export default function PlaylistManager() {
           }
           .toolsBody,
           .addToolGrid,
-          .expiryToolGrid {
+          .addSongCards,
+          .addNowGrid,
+          .cleanupRules,
+          .trackLimitGrid,
+          .rotatorCards,
+          .flexSettings,
+          .futureAddGrid {
+            grid-template-columns: 1fr;
+          }
+          .cleanupIntro {
+            align-items: start;
+          }
+          .cleanupRuleHeader {
+            grid-template-columns: 38px minmax(0, 1fr);
+          }
+          .cleanupRuleHeader .cleanupSwitch {
+            grid-column: 1 / -1;
+            justify-self: start;
+          }
+          .toolActions {
+            display: grid;
             grid-template-columns: 1fr;
           }
           .flexSettings,
           .rotatorRules,
           .healthGrid,
+          .futureAddItem,
           .backupItem,
           .backupDetailHeader,
           .backupDiffGrid,

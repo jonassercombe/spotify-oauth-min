@@ -662,6 +662,67 @@ function encToken(plain) {
   return Buffer.concat([iv, tag, ct]).toString("base64");
 }
 
+function normalizeMetaGraphVersion(value) {
+  const version = String(value || "v25.0").trim();
+  return /^v\d+\.\d+$/.test(version) ? version : "v25.0";
+}
+
+function sanitizeMetaConnection(connection, assets = []) {
+  if (!connection) return { configured: false, assets: [] };
+  return {
+    configured: true,
+    id: connection.id,
+    app_id: connection.app_id,
+    business_id: connection.business_id,
+    graph_version: connection.graph_version,
+    status: connection.status,
+    token_expires_at: connection.token_expires_at,
+    last_audit_at: connection.last_audit_at,
+    last_error: connection.last_error,
+    audit_summary: connection.audit_summary || {},
+    has_app_secret: !!connection.app_secret_enc,
+    assets,
+  };
+}
+
+async function loadMetaConnection(bubbleUserId) {
+  const response = await sb(
+    `/rest/v1/meta_ads_connections?select=*&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}&limit=1`
+  );
+  const rows = response.ok ? await response.json().catch(() => []) : [];
+  return rows[0] || null;
+}
+
+async function metaGraphRequest(connection, path, params = {}) {
+  const token = decryptToken(connection.access_token_enc);
+  const query = new URLSearchParams();
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") query.set(key, String(value));
+  });
+  query.set("access_token", token);
+  if (connection.app_secret_enc) {
+    const proof = crypto.createHmac("sha256", decryptToken(connection.app_secret_enc)).update(token).digest("hex");
+    query.set("appsecret_proof", proof);
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(
+      `https://graph.facebook.com/${normalizeMetaGraphVersion(connection.graph_version)}/${String(path).replace(/^\/+/, "")}?${query}`,
+      { signal: controller.signal, headers: { Accept: "application/json" } }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok || payload?.error) {
+      const code = payload?.error?.code || response.status;
+      const message = payload?.error?.message || `Meta request failed (${response.status})`;
+      throw new Error(`meta_graph_${code}: ${message}`);
+    }
+    return payload || {};
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function fallbackSpotifyCredentials({ requireRedirect = false } = {}) {
   const client_id = process.env.SPOTIFY_CLIENT_ID || "";
   const client_secret = process.env.SPOTIFY_CLIENT_SECRET || "";
@@ -742,13 +803,37 @@ async function refreshAccessToken(refresh_token, credentials = null) {
 
 
 async function getAccessTokenFromConnection(connection_id) {
-  const r = await sb(`/rest/v1/spotify_connections?select=refresh_token_enc&limit=1&id=eq.${encodeURIComponent(connection_id)}`);
+  const r = await sb(
+    `/rest/v1/spotify_connections?select=refresh_token_enc,access_token_enc,access_expires_at&limit=1` +
+    `&id=eq.${encodeURIComponent(connection_id)}`
+  );
   const arr = await r.json();
-  const enc = arr?.[0]?.refresh_token_enc;
+  const connection = arr?.[0];
+  const expiresAt = connection?.access_expires_at ? Date.parse(connection.access_expires_at) : 0;
+  if (connection?.access_token_enc && Number.isFinite(expiresAt) && expiresAt - Date.now() > 5 * 60 * 1000) {
+    try {
+      return decryptToken(connection.access_token_enc);
+    } catch {
+      // Fall through to a refresh when an older token used another encryption key.
+    }
+  }
+
+  const enc = connection?.refresh_token_enc;
   if (!enc) throw new Error("no refresh token on connection");
   const refresh_token = decryptToken(enc);
   const creds = await getSpotifyAppCredentialsForConnection(connection_id);
   const t = await refreshAccessToken(refresh_token, creds);
+  const patch = {
+    access_token_enc: encToken(t.access_token),
+    access_expires_at: new Date(Date.now() + (Number(t.expires_in) || 3600) * 1000).toISOString(),
+    updated_at: new Date().toISOString(),
+    ...(t.refresh_token ? { refresh_token_enc: encToken(t.refresh_token) } : {}),
+  };
+  await sb(`/rest/v1/spotify_connections?id=eq.${encodeURIComponent(connection_id)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify(patch),
+  });
   return t.access_token;
 }
 
@@ -874,7 +959,8 @@ async function createPlaylistBackup(playlist, { reason = "manual", onlyIfChanged
   }
   if (!insert.ok) throw new Error(`backup_insert_failed:${await insert.text()}`);
   const rows = await insert.json();
-  return { skipped: false, backup: rows?.[0] || null, snapshot_id };
+  const retention = await compactPlaylistBackups(playlist.id, { max: 5 }).catch((e) => ({ error: String(e?.message || e) }));
+  return { skipped: false, backup: rows?.[0] || null, snapshot_id, retention };
 }
 
 async function replaceSpotifyPlaylistTracks(spotify_playlist_id, access_token, uris) {
@@ -954,12 +1040,12 @@ function diffBackupAgainstCurrent(backupTracks = [], currentTracks = []) {
     const currentMatch = key ? currentByUri.get(key) : null;
     if (!currentMatch) {
       added++;
-      if (preview.length < 12) preview.push({ type: "restore_add", track_name: target.track_name, to_position: i });
+      if (preview.length < 5) preview.push({ type: "restore_add", track_name: target.track_name, to_position: i });
       continue;
     }
     if (currentMatch.index !== i) {
       moved++;
-      if (preview.length < 12) preview.push({ type: "move", track_name: target.track_name, from_position: currentMatch.index, to_position: i });
+      if (preview.length < 5) preview.push({ type: "move", track_name: target.track_name, from_position: currentMatch.index, to_position: i });
     }
     const source = currentMatch.track || {};
     if (!!source.is_locked !== !!target.is_locked || Number(source.locked_position ?? -1) !== Number(target.locked_position ?? -1)) lock_changes++;
@@ -971,10 +1057,84 @@ function diffBackupAgainstCurrent(backupTracks = [], currentTracks = []) {
     const key = backupTrackKey(source);
     if (key && !backupByUri.has(key)) {
       removed++;
-      if (preview.length < 12) preview.push({ type: "remove_current", track_name: source.track_name, from_position: i });
+      if (preview.length < 5) preview.push({ type: "remove_current", track_name: source.track_name, from_position: i });
     }
   }
   return { moved, added, removed, lock_changes, expiry_changes, rotator_changes, preview };
+}
+
+async function deleteBackupIds(deleteIds = []) {
+  const ids = (Array.isArray(deleteIds) ? deleteIds : []).filter(Boolean);
+  let deleted = 0;
+  for (const batch of chunk(ids, 80)) {
+    const idList = batch.map((id) => encodeURIComponent(String(id))).join(",");
+    const del = await sb(`/rest/v1/playlist_backups?id=in.(${idList})`, { method: "DELETE" });
+    if (!del.ok) throw new Error(`backup_delete_failed:${await del.text()}`);
+    deleted += batch.length;
+  }
+  return deleted;
+}
+
+function pickNewestBackupAtOrBefore(rows, cutoffMs, excludedIds) {
+  let best = null;
+  let bestTimestamp = Number.NEGATIVE_INFINITY;
+  for (const row of rows || []) {
+    if (!row?.id || excludedIds.has(row.id)) continue;
+    const ts = Date.parse(row.taken_at || "");
+    if (!Number.isFinite(ts) || ts > cutoffMs) continue;
+    if (ts > bestTimestamp) {
+      best = row;
+      bestTimestamp = ts;
+    }
+  }
+  return best;
+}
+
+async function compactPlaylistBackups(playlist_id, { max = 5 } = {}) {
+  const r = await sb(
+    `/rest/v1/playlist_backups?select=id,taken_at,snapshot_id,reason` +
+    `&playlist_id=eq.${encodeURIComponent(String(playlist_id))}` +
+    `&order=taken_at.desc&limit=2000`
+  );
+  if (!r.ok) throw new Error(`backup_select_failed:${await r.text()}`);
+  const rows = await r.json().catch(() => []);
+  if (!Array.isArray(rows) || !rows.length) return { deleted: 0, kept: 0 };
+
+  const kept = new Map();
+  const addKeep = (row) => { if (row?.id && kept.size < max) kept.set(row.id, row); };
+  const now = Date.now();
+  const manualRows = rows.filter((row) => String(row.reason || "") === "manual");
+  addKeep(manualRows[0]);
+
+  const uniqueBySnapshot = [];
+  const seenSnapshots = new Set();
+  for (const row of rows) {
+    const snapshotKey = row.snapshot_id || `backup:${row.id}`;
+    if (seenSnapshots.has(snapshotKey)) continue;
+    seenSnapshots.add(snapshotKey);
+    uniqueBySnapshot.push(row);
+  }
+  if (!kept.size) addKeep(uniqueBySnapshot[0]);
+
+  const excludedIds = new Set(kept.keys());
+  const targets = [
+    now - 24 * 3600 * 1000,
+    now - 7 * 24 * 3600 * 1000,
+    now - 30 * 24 * 3600 * 1000,
+    now - 180 * 24 * 3600 * 1000,
+  ];
+  for (const target of targets) {
+    const picked = pickNewestBackupAtOrBefore(uniqueBySnapshot, target, excludedIds);
+    if (picked) {
+      addKeep(picked);
+      excludedIds.add(picked.id);
+    }
+  }
+
+  const keepIds = new Set(kept.keys());
+  const deleteIds = rows.filter((row) => row?.id && !keepIds.has(row.id)).map((row) => row.id);
+  const deleted = await deleteBackupIds(deleteIds);
+  return { deleted, kept: keepIds.size };
 }
 
 async function fetchCurrentPlaylistItemsForBackupDiff(playlist_id) {
@@ -1153,6 +1313,64 @@ function releaseDateToTime(value) {
   return Date.parse(`${normalized}T00:00:00Z`);
 }
 
+function normalizeSearchText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function scoreFutureAddCandidate(track, wantedArtist, wantedTitle) {
+  const title = normalizeSearchText(track?.name);
+  const wanted = normalizeSearchText(wantedTitle);
+  const artists = (track?.artists || []).map((artist) => normalizeSearchText(artist?.name)).filter(Boolean);
+  const wantedArtistNorm = normalizeSearchText(wantedArtist);
+  let score = 0;
+  if (title === wanted) score += 70;
+  else if (title.includes(wanted) || wanted.includes(title)) score += 42;
+  const artistMatch = artists.some((artist) => artist === wantedArtistNorm || artist.includes(wantedArtistNorm) || wantedArtistNorm.includes(artist));
+  if (artistMatch) score += 45;
+  const releaseMs = releaseDateToTime(track?.album?.release_date);
+  if (Number.isFinite(releaseMs)) score += 5;
+  return score;
+}
+
+async function addTrackUriToPlaylist({ playlist, access_token, trackUriValue, position }) {
+  let wantPosition = null;
+  if (position !== undefined && position !== null && String(position).trim() !== "") {
+    const p = Number(position);
+    if (Number.isFinite(p) && p > 0) wantPosition = Math.floor(p - 1);
+  }
+  const payload = wantPosition !== null ? { uris: [trackUriValue], position: wantPosition } : { uris: [trackUriValue] };
+  let r = await fetch(`https://api.spotify.com/v1/playlists/${encodeURIComponent(playlist.playlist_id)}/tracks`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  let parsed = await parseJsonSafe(r);
+  if (r.status === 400 && String(parsed.text || "").toLowerCase().includes("index out of bounds")) {
+    r = await fetch(`https://api.spotify.com/v1/playlists/${encodeURIComponent(playlist.playlist_id)}/tracks`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ uris: [trackUriValue] })
+    });
+    parsed = await parseJsonSafe(r);
+  }
+  if (r.status === 429) {
+    const ra = Number(r.headers.get("retry-after") || "1");
+    await sleep((Math.max(1, ra) + 0.5) * 1000);
+    r = await fetch(`https://api.spotify.com/v1/playlists/${encodeURIComponent(playlist.playlist_id)}/tracks`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    parsed = await parseJsonSafe(r);
+  }
+  return { r, json: parsed.json, text: parsed.text };
+}
+
 function chunkArray(arr, size) {
   const out = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
@@ -1249,6 +1467,25 @@ async function findPlaylistTrackPosition(spotify_playlist_id, track_id, access_t
   return matches.sort((a, b) => Math.abs(a - preferred) - Math.abs(b - preferred))[0];
 }
 
+async function findPlaylistTrackPositionFast(spotify_playlist_id, track_id, access_token, preferred_position = 0) {
+  const preferred = Math.max(0, Number(preferred_position) || 0);
+  const offset = Math.max(0, preferred - 5);
+  const { r, json, text } = await fetchJSON(
+    `https://api.spotify.com/v1/playlists/${encodeURIComponent(spotify_playlist_id)}/tracks` +
+      `?fields=items(track(id)),total&limit=11&offset=${offset}`,
+    { headers: { Authorization: `Bearer ${access_token}` } },
+    20000
+  );
+  if (!r.ok) throw new Error(`spotify_position_probe_failed:${r.status}:${text || JSON.stringify(json)}`);
+  const localMatches = (Array.isArray(json?.items) ? json.items : [])
+    .map((item, index) => item?.track?.id === track_id ? offset + index : -1)
+    .filter((position) => position >= 0);
+  if (localMatches.length) {
+    return localMatches.sort((a, b) => Math.abs(a - preferred) - Math.abs(b - preferred))[0];
+  }
+  return findPlaylistTrackPosition(spotify_playlist_id, track_id, access_token, preferred);
+}
+
 async function rotateFlexSlot(slot, settings) {
   const access_token = await getAccessTokenFromConnection(slot.connection_id);
   const playlistRows = await sb(`/rest/v1/playlists?select=id,playlist_id&limit=1&id=eq.${encodeURIComponent(slot.playlist_id)}`).then(r => r.json());
@@ -1280,7 +1517,13 @@ async function rotateFlexSlot(slot, settings) {
   });
   if (!usable.length) throw new Error("reference_playlist_has_no_usable_tracks");
   const picked = usable[Math.floor(Math.random() * usable.length)];
-  const desired = Math.max(0, Number(slot.position) || 0);
+  const currentItemRows = await sb(
+    `/rest/v1/playlist_items?select=position&limit=1` +
+    `&playlist_id=eq.${encodeURIComponent(slot.playlist_id)}` +
+    `&track_id=eq.${encodeURIComponent(slot.current_track_id)}`
+  ).then(r => r.json()).catch(() => []);
+  const liveSlotPosition = Number.isFinite(Number(currentItemRows?.[0]?.position)) ? Number(currentItemRows[0].position) : Number(slot.position);
+  const desired = Math.max(0, Number(liveSlotPosition) || 0);
 
   const oldPosition = await findPlaylistTrackPosition(playlist.playlist_id, slot.current_track_id, access_token, desired);
   const insertPosition = oldPosition >= 0 && oldPosition < desired ? desired + 1 : desired;
@@ -1326,6 +1569,7 @@ async function rotateFlexSlot(slot, settings) {
     method: "PATCH",
     headers: { Prefer: "return=representation" },
     body: JSON.stringify({
+      position: desired,
       current_track_id: picked.id,
       current_track_name: picked.name || null,
       source_playlist_id: refPlaylistId,
@@ -1373,6 +1617,54 @@ async function rotateFlexSlot(slot, settings) {
   }).catch(() => {});
 
   return { picked_track_id: picked.id, picked_track_name: picked.name || null, position: desired, cooldown_until: cooldownUntil, history_saved: historySaved };
+}
+
+async function resyncFlexSlotPositionsForPlaylist(playlist_id) {
+  const slotsR = await sb(
+    `/rest/v1/playlist_flex_slots?select=id,current_track_id,position` +
+    `&playlist_id=eq.${encodeURIComponent(String(playlist_id))}`
+  );
+  const slots = slotsR.ok ? await slotsR.json().catch(() => []) : [];
+  const trackIds = (Array.isArray(slots) ? slots : []).map((slot) => slot.current_track_id).filter(Boolean);
+  if (!trackIds.length) return { updated: 0 };
+
+  const quotedIds = trackIds.map((id) => `"${encodeURIComponent(String(id))}"`).join(",");
+  const itemsR = await sb(
+    `/rest/v1/playlist_items?select=track_id,position` +
+    `&playlist_id=eq.${encodeURIComponent(String(playlist_id))}` +
+    `&track_id=in.(${quotedIds})`
+  );
+  const items = itemsR.ok ? await itemsR.json().catch(() => []) : [];
+  const positionByTrack = new Map((Array.isArray(items) ? items : [])
+    .filter((row) => row?.track_id && Number.isFinite(Number(row.position)))
+    .map((row) => [row.track_id, Number(row.position)]));
+
+  const updates = (Array.isArray(slots) ? slots : [])
+    .map((slot, index) => ({
+      id: slot.id,
+      current: Number(slot.position),
+      next: positionByTrack.get(slot.current_track_id),
+      temp: 100000 + index,
+    }))
+    .filter((update) => update.id && Number.isFinite(update.next) && update.current !== update.next);
+  if (!updates.length) return { updated: 0 };
+
+  const nowIso = new Date().toISOString();
+  for (const update of updates) {
+    await sb(`/rest/v1/playlist_flex_slots?id=eq.${encodeURIComponent(update.id)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ position: update.temp, updated_at: nowIso })
+    });
+  }
+  for (const update of updates) {
+    await sb(`/rest/v1/playlist_flex_slots?id=eq.${encodeURIComponent(update.id)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ position: update.next, updated_at: nowIso })
+    });
+  }
+  return { updated: updates.length };
 }
 
 async function syncPlaylistItemsNow(playlistId) {
@@ -1724,6 +2016,155 @@ const routes = {
       results,
       elapsed_ms: Date.now() - startedAt,
     });
+  },
+
+  /* ---------- meta/connection (GET) ---------- */
+  "meta/connection": async (req, res) => {
+    if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return json(res, 200, sanitizeMetaConnection(null));
+    const assetsResponse = await sb(
+      `/rest/v1/meta_ads_assets?select=id,asset_type,meta_id,name,is_selected,metadata,updated_at&connection_id=eq.${encodeURIComponent(connection.id)}&order=asset_type.asc,name.asc`
+    );
+    const assets = assetsResponse.ok ? await assetsResponse.json().catch(() => []) : [];
+    return json(res, 200, sanitizeMetaConnection(connection, assets));
+  },
+
+  /* ---------- meta/connection/save (POST) ---------- */
+  "meta/connection/save": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const body = await readBody(req);
+    const appId = String(body.app_id || "").trim();
+    const businessId = String(body.business_id || "").trim();
+    const accessToken = String(body.access_token || "").trim();
+    const appSecret = String(body.app_secret || "").trim();
+    if (!/^\d{6,30}$/.test(appId)) return bad(res, 400, "invalid_meta_app_id");
+    if (!/^\d{6,30}$/.test(businessId)) return bad(res, 400, "invalid_meta_business_id");
+    const existing = await loadMetaConnection(ctx.bubble_user_id);
+    if (!existing && accessToken.length < 40) return bad(res, 400, "meta_access_token_required");
+    if (accessToken && accessToken.length < 40) return bad(res, 400, "invalid_meta_access_token");
+
+    const payload = {
+      bubble_user_id: ctx.bubble_user_id,
+      app_id: appId,
+      business_id: businessId,
+      graph_version: normalizeMetaGraphVersion(body.graph_version),
+      status: "unverified",
+      last_error: null,
+      updated_at: new Date().toISOString(),
+      ...(accessToken ? { access_token_enc: encToken(accessToken) } : {}),
+      ...(appSecret ? { app_secret_enc: encToken(appSecret) } : {}),
+    };
+    const response = await sb(`/rest/v1/meta_ads_connections?on_conflict=bubble_user_id`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+      body: JSON.stringify([payload]),
+    });
+    const text = await response.text();
+    if (!response.ok) return bad(res, 500, `meta_connection_save_failed: ${text}`);
+    const saved = JSON.parse(text || "[]")[0];
+    return json(res, 200, sanitizeMetaConnection(saved, []));
+  },
+
+  /* ---------- meta/connection/audit (POST) ---------- */
+  "meta/connection/audit": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+
+    try {
+      const fields = "id,name,account_status,currency,timezone_name,disable_reason";
+      const [identity, permissions, ownedAccounts, clientAccounts, pages, personalAccounts] = await Promise.all([
+        metaGraphRequest(connection, "me", { fields: "id,name" }),
+        metaGraphRequest(connection, "me/permissions"),
+        metaGraphRequest(connection, `${connection.business_id}/owned_ad_accounts`, { fields, limit: 100 }).catch(() => ({ data: [] })),
+        metaGraphRequest(connection, `${connection.business_id}/client_ad_accounts`, { fields, limit: 100 }).catch(() => ({ data: [] })),
+        metaGraphRequest(connection, `${connection.business_id}/owned_pages`, {
+          fields: "id,name,instagram_business_account{id,username,name,profile_picture_url}",
+          limit: 100,
+        }).catch(() => ({ data: [] })),
+        metaGraphRequest(connection, "me/adaccounts", { fields, limit: 100 }).catch(() => ({ data: [] })),
+      ]);
+
+      const assetMap = new Map();
+      const addAsset = (asset) => asset?.meta_id && assetMap.set(`${asset.asset_type}:${asset.meta_id}`, asset);
+      [...(ownedAccounts.data || []), ...(clientAccounts.data || []), ...(personalAccounts.data || [])].forEach((account) => addAsset({
+        connection_id: connection.id,
+        asset_type: "ad_account",
+        meta_id: String(account.id || "").replace(/^act_/, ""),
+        name: account.name || account.id,
+        metadata: {
+          account_status: account.account_status,
+          currency: account.currency,
+          timezone_name: account.timezone_name,
+          disable_reason: account.disable_reason,
+        },
+        updated_at: new Date().toISOString(),
+      }));
+      (pages.data || []).forEach((page) => {
+        addAsset({ connection_id: connection.id, asset_type: "page", meta_id: page.id, name: page.name || page.id, metadata: {}, updated_at: new Date().toISOString() });
+        const instagram = page.instagram_business_account;
+        if (instagram?.id) addAsset({
+          connection_id: connection.id,
+          asset_type: "instagram_account",
+          meta_id: instagram.id,
+          name: instagram.username ? `@${instagram.username}` : (instagram.name || instagram.id),
+          metadata: { page_id: page.id, username: instagram.username, profile_picture_url: instagram.profile_picture_url },
+          updated_at: new Date().toISOString(),
+        });
+      });
+      const assets = Array.from(assetMap.values());
+      if (assets.length) {
+        const upsert = await sb(`/rest/v1/meta_ads_assets?on_conflict=connection_id,asset_type,meta_id`, {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify(assets),
+        });
+        if (!upsert.ok) throw new Error(`meta_asset_save_failed: ${await upsert.text()}`);
+      }
+      const granted = (permissions.data || []).filter((item) => item.status === "granted").map((item) => item.permission);
+      const denied = (permissions.data || []).filter((item) => item.status !== "granted").map((item) => item.permission);
+      const accountCount = assets.filter((item) => item.asset_type === "ad_account").length;
+      const pageCount = assets.filter((item) => item.asset_type === "page").length;
+      const instagramCount = assets.filter((item) => item.asset_type === "instagram_account").length;
+      const warnings = [];
+      if (!accountCount) warnings.push("No accessible ad account found.");
+      if (!instagramCount) warnings.push("No connected Instagram professional account found.");
+      if (!granted.includes("ads_read")) warnings.push("ads_read permission is missing.");
+      if (!granted.includes("ads_management")) warnings.push("ads_management permission is missing.");
+      const summary = { identity, permissions: { granted, denied }, counts: { ad_accounts: accountCount, pages: pageCount, instagram_accounts: instagramCount }, warnings };
+      const status = accountCount && granted.includes("ads_read") ? "ready" : "error";
+      const auditedAt = new Date().toISOString();
+      await Promise.all([
+        sb(`/rest/v1/meta_ads_connections?id=eq.${encodeURIComponent(connection.id)}`, {
+          method: "PATCH",
+          headers: { Prefer: "return=minimal" },
+          body: JSON.stringify({ status, last_audit_at: auditedAt, last_error: warnings.join(" ") || null, audit_summary: summary, updated_at: auditedAt }),
+        }),
+        sb(`/rest/v1/meta_ads_audit_events`, {
+          method: "POST",
+          headers: { Prefer: "return=minimal" },
+          body: JSON.stringify([{ connection_id: connection.id, status: warnings.length ? "warning" : "success", summary }]),
+        }),
+      ]);
+      const storedAssetsResponse = await sb(`/rest/v1/meta_ads_assets?select=id,asset_type,meta_id,name,is_selected,metadata,updated_at&connection_id=eq.${encodeURIComponent(connection.id)}&order=asset_type.asc,name.asc`);
+      const storedAssets = storedAssetsResponse.ok ? await storedAssetsResponse.json().catch(() => []) : [];
+      return json(res, 200, sanitizeMetaConnection({ ...connection, status, last_audit_at: auditedAt, last_error: warnings.join(" ") || null, audit_summary: summary }, storedAssets));
+    } catch (error) {
+      const message = String(error?.message || "meta_audit_failed").slice(0, 1000);
+      const auditedAt = new Date().toISOString();
+      await Promise.all([
+        sb(`/rest/v1/meta_ads_connections?id=eq.${encodeURIComponent(connection.id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "error", last_audit_at: auditedAt, last_error: message, updated_at: auditedAt }) }).catch(() => null),
+        sb(`/rest/v1/meta_ads_audit_events`, { method: "POST", headers: { Prefer: "return=minimal" }, body: JSON.stringify([{ connection_id: connection.id, status: "error", summary: { error: message } }]) }).catch(() => null),
+      ]);
+      return bad(res, 502, message);
+    }
   },
 
   /* ---------- admin/status (GET) ---------- */
@@ -3397,6 +3838,243 @@ const routes = {
    
      return json(res, 200, { ok: true, granularity: gran, labels, by_playlist, data_points: rows.length, history_days: uniqueDays.size, ready: labels.length >= 2 && uniqueDays.size >= 2, warmup: labels.length < 2 || uniqueDays.size < 2 });
    },
+
+   /* ---------- dashboard/ad-performance (GET) ---------- */
+   "dashboard/ad-performance": async (req, res) => {
+     if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+     const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK } = process.env;
+     if (!SUPABASE_URL || !SRK) return bad(res, 500, "missing_env");
+
+     const bubble_user_id = await bubbleUserIdFromRequest(req, req.query.bubble_user_id);
+     if (!bubble_user_id) return bad(res, 401, "not_authenticated");
+
+     const days = Math.max(7, Math.min(365, Number(req.query.days || "90")));
+     const gran = String(req.query.granularity || "weekly").toLowerCase();
+     const connection_id = String(req.query.connection_id || "").trim();
+     const fromParam = String(req.query.from || "").slice(0, 10);
+     const toParam = String(req.query.to || "").slice(0, 10);
+     const toDate = /^\d{4}-\d{2}-\d{2}$/.test(toParam) ? new Date(`${toParam}T00:00:00Z`) : new Date();
+     const fromDate = /^\d{4}-\d{2}-\d{2}$/.test(fromParam) ? new Date(`${fromParam}T00:00:00Z`) : new Date(toDate.getTime() - days * 24 * 3600 * 1000);
+     const fromStr = fromDate.toISOString().slice(0, 10);
+     const toStr = toDate.toISOString().slice(0, 10);
+
+     const bucketKey = (isoDay) => {
+       if (gran === "monthly") return String(isoDay).slice(0, 7) + "-01";
+       if (gran === "daily") return String(isoDay).slice(0, 10);
+       const d = new Date(`${isoDay}T00:00:00Z`);
+       const day = d.getUTCDay();
+       const diffToMon = day === 0 ? -6 : 1 - day;
+       const monday = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + diffToMon));
+       return monday.toISOString().slice(0, 10);
+     };
+     const bucketWeight = (label, nextLabel) => {
+       if (nextLabel) {
+         const diff = Math.round((new Date(`${nextLabel}T00:00:00Z`) - new Date(`${label}T00:00:00Z`)) / (24 * 3600 * 1000));
+         if (Number.isFinite(diff) && diff > 0) return diff;
+       }
+       if (gran === "monthly") {
+         const d = new Date(`${label}T00:00:00Z`);
+         return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+       }
+       return gran === "daily" ? 1 : 7;
+     };
+
+     let playlistPath =
+       `/rest/v1/playlists?select=id,playlist_id,name,image,followers,tracks_total,connection_id` +
+       `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+       `&is_owner=is.true&is_public=is.true`;
+     if (connection_id) playlistPath += `&connection_id=eq.${encodeURIComponent(connection_id)}`;
+     const pResp = await fetch(SUPABASE_URL + playlistPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
+     if (!pResp.ok) return bad(res, 500, `playlists_select_failed: ${await pResp.text()}`);
+     const playlists = JSON.parse(await pResp.text() || "[]");
+     const playlistIds = playlists.map((p) => p.id).filter(Boolean);
+     if (!playlistIds.length) return json(res, 200, { ok: true, labels: [], playlists: [], events: [], totals: {} });
+
+     const snapPath =
+       `/rest/v1/playlist_followers_daily?select=playlist_id,spotify_playlist_id,day,followers` +
+       `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+       `&day=gte.${encodeURIComponent(fromStr)}` +
+       `&day=lte.${encodeURIComponent(toStr)}` +
+       `&playlist_id=in.(${playlistIds.map((id) => `"${id}"`).join(",")})` +
+       `&order=day.asc`;
+     const eventsPath =
+       `/rest/v1/playlist_ad_events?select=id,playlist_id,event_date,daily_spend,currency,label,note,created_at,updated_at` +
+       `&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}` +
+       `&playlist_id=in.(${playlistIds.map((id) => `"${id}"`).join(",")})` +
+       `&event_date=lte.${encodeURIComponent(toStr)}` +
+       `&order=event_date.asc,created_at.asc`;
+     const [sResp, eResp] = await Promise.all([
+       fetch(SUPABASE_URL + snapPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" }),
+       fetch(SUPABASE_URL + eventsPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" }),
+     ]);
+     if (!sResp.ok) return bad(res, 500, `snapshots_select_failed: ${await sResp.text()}`);
+     if (!eResp.ok) return bad(res, 500, `ad_events_select_failed: ${await eResp.text()}`);
+     const snaps = JSON.parse(await sResp.text() || "[]");
+     const events = JSON.parse(await eResp.text() || "[]");
+
+     const labels = [...new Set(snaps.map((row) => bucketKey(row.day)).filter(Boolean))].sort();
+     const playlistById = new Map(playlists.map((p) => [p.id, p]));
+     const rowsByPlaylist = new Map();
+     for (const row of snaps) {
+       const id = row.playlist_id;
+       if (!id) continue;
+       if (!rowsByPlaylist.has(id)) rowsByPlaylist.set(id, []);
+       rowsByPlaylist.get(id).push(row);
+     }
+     const eventsByPlaylist = new Map();
+     for (const event of events) {
+       if (!eventsByPlaylist.has(event.playlist_id)) eventsByPlaylist.set(event.playlist_id, []);
+       eventsByPlaylist.get(event.playlist_id).push({
+         ...event,
+         daily_spend: Number(event.daily_spend || 0),
+         bucket_label: bucketKey(event.event_date),
+       });
+     }
+
+     const latestSpendFor = (playlistId, label) => {
+       const evs = eventsByPlaylist.get(playlistId) || [];
+       let current = 0;
+       for (const ev of evs) {
+         if (String(ev.event_date).slice(0, 10) <= label) current = Number(ev.daily_spend || 0);
+         else break;
+       }
+       return current;
+     };
+
+     const playlistCards = playlists.map((playlist) => {
+       const rows = rowsByPlaylist.get(playlist.id) || [];
+       const byBucket = new Map();
+       for (const row of rows) byBucket.set(bucketKey(row.day), Number(row.followers || 0));
+       const followers = [];
+       const hasData = [];
+       let last = null;
+       for (const label of labels) {
+         if (byBucket.has(label)) last = Number(byBucket.get(label) || 0);
+         followers.push(last ?? 0);
+         hasData.push(last !== null);
+       }
+       const growth = followers.map((value, index) => {
+         if (!hasData[index]) return 0;
+         const previousIndex = hasData.slice(0, index).lastIndexOf(true);
+         if (previousIndex < 0) return 0;
+         return value - followers[previousIndex];
+       });
+       const firstDataIndex = hasData.findIndex(Boolean);
+       const lastDataIndex = hasData.length - 1 - [...hasData].reverse().findIndex(Boolean);
+       const delta = firstDataIndex >= 0 && lastDataIndex > firstDataIndex ? followers[lastDataIndex] - followers[firstDataIndex] : 0;
+       const currentDailySpend = latestSpendFor(playlist.id, toStr);
+       const spendSeries = labels.map((label, index) => latestSpendFor(playlist.id, label) * bucketWeight(label, labels[index + 1]));
+       const periodSpend = spendSeries.reduce((sum, value) => sum + value, 0);
+       const costPerFollower = delta > 0 && periodSpend > 0 ? periodSpend / delta : null;
+       const eventRows = eventsByPlaylist.get(playlist.id) || [];
+       const hasNotes = eventRows.some((event) => event.note || event.label);
+       return {
+         playlist_id: playlist.id,
+         spotify_playlist_id: playlist.playlist_id || null,
+         name: playlist.name,
+         image: playlist.image,
+         followers_now: playlist.followers || 0,
+         tracks_total: playlist.tracks_total || 0,
+         labels,
+         followers,
+         growth,
+         ad_spend: spendSeries,
+         delta,
+         current_daily_spend: currentDailySpend,
+         period_spend: periodSpend,
+         monthly_run_rate: currentDailySpend * 30.4,
+         cost_per_follower: costPerFollower,
+         events: eventRows,
+         has_notes: hasNotes,
+       };
+     })
+       .sort((a, b) => Number(b.followers_now || 0) - Number(a.followers_now || 0) || String(a.name || "").localeCompare(String(b.name || "")))
+       .slice(0, 20);
+
+     const currentDailySpend = playlistCards.reduce((sum, item) => sum + Number(item.current_daily_spend || 0), 0);
+     const periodSpend = playlistCards.reduce((sum, item) => sum + Number(item.period_spend || 0), 0);
+     const totalGrowth = playlistCards.reduce((sum, item) => sum + Number(item.delta || 0), 0);
+     const paidPlaylists = playlistCards.filter((item) => item.period_spend > 0 || item.current_daily_spend > 0).length;
+     const bestEfficiency = playlistCards
+       .filter((item) => Number.isFinite(Number(item.cost_per_follower)) && item.cost_per_follower > 0)
+       .sort((a, b) => Number(a.cost_per_follower) - Number(b.cost_per_follower))[0] || null;
+
+     return json(res, 200, {
+       ok: true,
+       labels,
+       granularity: gran,
+       range: { from: fromStr, to: toStr, days },
+       playlists: playlistCards,
+       events: events.map((event) => ({ ...event, daily_spend: Number(event.daily_spend || 0), playlist_name: playlistById.get(event.playlist_id)?.name || "Playlist", bucket_label: bucketKey(event.event_date) })),
+       totals: {
+         current_daily_spend: currentDailySpend,
+         monthly_run_rate: currentDailySpend * 30.4,
+         period_spend: periodSpend,
+         paid_playlists: paidPlaylists,
+         total_growth: totalGrowth,
+         blended_cost_per_follower: totalGrowth > 0 && periodSpend > 0 ? periodSpend / totalGrowth : null,
+         event_count: events.length,
+       },
+       best_efficiency: bestEfficiency,
+     });
+   },
+
+   /* ---------- dashboard/ad-events (POST/DELETE) ---------- */
+   "dashboard/ad-events": async (req, res) => {
+     const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: SRK } = process.env;
+     if (!SUPABASE_URL || !SRK) return bad(res, 500, "missing_env");
+     const bubble_user_id = await bubbleUserIdFromRequest(req);
+     if (!bubble_user_id) return bad(res, 401, "not_authenticated");
+
+     if (req.method === "DELETE") {
+       const id = String(req.query.id || "");
+       if (!id) return bad(res, 400, "missing_event_id");
+       const delR = await fetch(
+         SUPABASE_URL + `/rest/v1/playlist_ad_events?id=eq.${encodeURIComponent(id)}&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}`,
+         { method: "DELETE", headers: { apikey: SRK, Authorization: `Bearer ${SRK}`, Prefer: "return=minimal" } }
+       );
+       if (!delR.ok) return bad(res, 500, `ad_event_delete_failed: ${await delR.text()}`);
+       return json(res, 200, { ok: true });
+     }
+
+     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+     const body = await readBody(req);
+     const playlist_id = String(body.playlist_id || "");
+     const event_date = String(body.event_date || "").slice(0, 10);
+     const daily_spend = Number(body.daily_spend || 0);
+     if (!playlist_id || !/^\d{4}-\d{2}-\d{2}$/.test(event_date)) return bad(res, 400, "missing_playlist_or_date");
+     if (!Number.isFinite(daily_spend) || daily_spend < 0) return bad(res, 400, "invalid_daily_spend");
+
+     const ownerR = await fetch(
+       SUPABASE_URL + `/rest/v1/playlists?select=id&limit=1&id=eq.${encodeURIComponent(playlist_id)}&bubble_user_id=eq.${encodeURIComponent(bubble_user_id)}`,
+       { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" }
+     );
+     const ownerRows = ownerR.ok ? JSON.parse(await ownerR.text() || "[]") : [];
+     if (!ownerRows[0]) return bad(res, 403, "playlist_not_owned");
+
+     const payload = {
+       bubble_user_id,
+       playlist_id,
+       event_date,
+       daily_spend,
+       currency: String(body.currency || "EUR").slice(0, 8),
+       label: String(body.label || "").slice(0, 120) || null,
+       note: String(body.note || "").slice(0, 1000) || null,
+     };
+     const saveR = await fetch(SUPABASE_URL + `/rest/v1/playlist_ad_events`, {
+       method: "POST",
+       headers: {
+         apikey: SRK,
+         Authorization: `Bearer ${SRK}`,
+         "Content-Type": "application/json",
+         Prefer: "return=representation",
+       },
+       body: JSON.stringify([payload]),
+     });
+     if (!saveR.ok) return bad(res, 500, `ad_event_save_failed: ${await saveR.text()}`);
+     const rows = await saveR.json().catch(() => []);
+     return json(res, 200, { ok: true, event: rows?.[0] || null });
+   },
    
       
 /* ---------- dashboard/summary (GET) ---------- */
@@ -3457,14 +4135,43 @@ const routes = {
     row.spotify_playlist_id ||
     row.playlist_id;
 
-  // map: stable spotify playlist id -> {firstFollowers, lastFollowers}
+  // map: stable spotify playlist id -> follower snapshots in the selected range
   const snapMap = new Map();
   for (const r of snaps) {
     const stableKey = stableSnapshotKey(r);
     let o = snapMap.get(stableKey);
-    if (!o) { o = { first: r.followers, last: r.followers, days: new Set() }; snapMap.set(stableKey, o); }
+    if (!o) { o = { first: r.followers, last: r.followers, days: new Set(), samples: [] }; snapMap.set(stableKey, o); }
     if (r.day) o.days.add(r.day);
+    if (r.day) o.samples.push({ day: r.day, followers: Number(r.followers || 0) });
     o.last = r.followers; // wegen day.asc ist die letzte Zeile am Ende
+  }
+
+  let lockCountByPlaylist = new Map();
+  let rotatorCountByPlaylist = new Map();
+  if (playlistIds.length) {
+    const [locksCountResp, slotsCountResp] = await Promise.all([
+      fetch(
+        SUPABASE_URL +
+          `/rest/v1/playlist_item_locks?select=playlist_id,track_id,is_locked` +
+          `&playlist_id=in.(${playlistIds.map((id) => `"${id}"`).join(",")})` +
+          `&is_locked=is.true`,
+        { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" }
+      ).catch(() => null),
+      fetch(
+        SUPABASE_URL +
+          `/rest/v1/playlist_flex_slots?select=playlist_id,id` +
+          `&playlist_id=in.(${playlistIds.map((id) => `"${id}"`).join(",")})`,
+        { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" }
+      ).catch(() => null),
+    ]);
+    const lockRows = locksCountResp?.ok ? JSON.parse(await locksCountResp.text() || "[]") : [];
+    const slotRows = slotsCountResp?.ok ? JSON.parse(await slotsCountResp.text() || "[]") : [];
+    for (const row of Array.isArray(lockRows) ? lockRows : []) {
+      if (row?.playlist_id) lockCountByPlaylist.set(row.playlist_id, (lockCountByPlaylist.get(row.playlist_id) || 0) + 1);
+    }
+    for (const row of Array.isArray(slotRows) ? slotRows : []) {
+      if (row?.playlist_id) rotatorCountByPlaylist.set(row.playlist_id, (rotatorCountByPlaylist.get(row.playlist_id) || 0) + 1);
+    }
   }
 
   let top_growing = null;
@@ -3476,6 +4183,12 @@ const routes = {
     const delta = hasEnoughData ? (s.last - s.first) : 0;
     const firstFollowers = hasEnoughData ? Number(s.first || 0) : null;
     const percent_delta = hasEnoughData && firstFollowers > 0 ? (delta / firstFollowers) * 100 : null;
+    const samples = Array.isArray(s?.samples) ? s.samples : [];
+    const previous = samples.length >= 2 ? samples[samples.length - 2] : null;
+    const latest = samples.length >= 1 ? samples[samples.length - 1] : null;
+    const today_delta = previous && latest ? Number(latest.followers || 0) - Number(previous.followers || 0) : 0;
+    const today_percent_delta = previous && Number(previous.followers || 0) > 0 ? (today_delta / Number(previous.followers || 0)) * 100 : null;
+    const had_positive_day = samples.some((sample, index) => index > 0 && Number(sample.followers || 0) > Number(samples[index - 1]?.followers || 0));
     net_growth += delta;
     if (!top_growing || delta > top_growing.delta) {
       top_growing = { playlist_id: p.id, name: p.name, image: p.image, delta, followers_now: p.followers || 0 };
@@ -3490,13 +4203,39 @@ const routes = {
       has_growth_data: hasEnoughData,
       followers_now: p.followers || 0,
       tracks_total: p.tracks_total || 0,
+      today_delta,
+      today_percent_delta,
+      had_positive_day,
+      locked_count: lockCountByPlaylist.get(p.id) || 0,
+      rotator_count: rotatorCountByPlaylist.get(p.id) || 0,
     });
   }
   growth_rank.sort((a, b) => b.delta - a.delta || b.followers_now - a.followers_now);
+  const growthByPlaylistId = new Map(growth_rank.map((item) => [item.playlist_id, item]));
+  const withAutomationCounts = (payload, playlistIdForCounts) => ({
+    ...payload,
+    locked_count: lockCountByPlaylist.get(playlistIdForCounts) || 0,
+    rotator_count: rotatorCountByPlaylist.get(playlistIdForCounts) || 0,
+  });
+  const bestMonth = growth_rank.find((item) => item.has_growth_data) || null;
+  const bestToday = [...growth_rank]
+    .filter((item) => item.has_growth_data)
+    .sort((a, b) => Number(b.today_delta || 0) - Number(a.today_delta || 0) || Number(b.followers_now || 0) - Number(a.followers_now || 0))[0] || null;
+  const needsAttention = [...growth_rank]
+    .filter((item) => item.has_growth_data && item.had_positive_day && Number(item.today_delta || 0) < 0)
+    .sort((a, b) => Number(a.today_delta || 0) - Number(b.today_delta || 0))[0] || null;
+  const worstMonth = [...growth_rank]
+    .filter((item) => item.has_growth_data)
+    .sort((a, b) => Number(a.delta || 0) - Number(b.delta || 0) || Number(a.followers_now || 0) - Number(b.followers_now || 0))[0] || null;
+  const performance_cards = {
+    best_month: bestMonth,
+    best_today: bestToday,
+    needs_attention: needsAttention,
+    worst_month: worstMonth,
+  };
   const top_playlists = [...playlists]
     .sort((a, b) => (b.followers || 0) - (a.followers || 0))
-    .slice(0, 8)
-    .map((p) => ({
+    .map((p) => withAutomationCounts({
       playlist_id: p.id,
       name: p.name,
       image: p.image,
@@ -3504,7 +4243,35 @@ const routes = {
       tracks_total: p.tracks_total || 0,
       auto_remove_enabled: !!p.auto_remove_enabled,
       auto_remove_weeks: p.auto_remove_weeks ?? null,
-    }));
+      snapshot_days: growthByPlaylistId.get(p.id)?.snapshot_days || 0,
+      has_growth_data: !!growthByPlaylistId.get(p.id)?.has_growth_data,
+      delta: growthByPlaylistId.get(p.id)?.delta || 0,
+      percent_delta: growthByPlaylistId.get(p.id)?.percent_delta ?? null,
+      today_delta: growthByPlaylistId.get(p.id)?.today_delta || 0,
+      today_percent_delta: growthByPlaylistId.get(p.id)?.today_percent_delta ?? null,
+    }, p.id));
+  const playlist_options = [...playlists]
+    .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")))
+    .map((p) => {
+      const growth = growthByPlaylistId.get(p.id) || {};
+      return withAutomationCounts({
+        id: p.id,
+        playlist_id: p.id,
+        spotify_playlist_id: p.playlist_id || null,
+        connection_id: p.connection_id || null,
+        name: p.name,
+        image: p.image,
+        followers: p.followers || 0,
+        followers_now: p.followers || 0,
+        tracks_total: p.tracks_total || 0,
+        snapshot_days: growth.snapshot_days || 0,
+        has_growth_data: !!growth.has_growth_data,
+        delta: growth.delta || 0,
+        percent_delta: growth.percent_delta ?? null,
+        today_delta: growth.today_delta || 0,
+        today_percent_delta: growth.today_percent_delta ?? null,
+      }, p.id);
+    });
 
 	  // 3) kommende Auto-Removals
 	  const todayStr = new Date().toISOString().slice(0,10);
@@ -3562,17 +4329,20 @@ const routes = {
 	        const quotedTrackIds = removalTrackIds.map((id) => `"${encodeURIComponent(String(id))}"`).join(",");
 	        const itemsResp = await fetch(
 	          SUPABASE_URL +
-	            `/rest/v1/playlist_items?select=playlist_id,track_id,cover_url` +
+	            `/rest/v1/playlist_items?select=playlist_id,track_id,cover_url,position` +
 	            `&playlist_id=in.(${playlistIds.map((id) => `"${id}"`).join(",")})` +
 	            `&track_id=in.(${quotedTrackIds})`,
 	          { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" }
 	        );
 	        const itemRows = itemsResp.ok ? JSON.parse(await itemsResp.text() || "[]") : [];
-	        const coverByKey = new Map(itemRows.map((row) => [`${row.playlist_id}:${row.track_id}`, row.cover_url]));
+	        const itemByKey = new Map(itemRows.map((row) => [`${row.playlist_id}:${row.track_id}`, row]));
 	        const playlistImageById = new Map(playlists.map((p) => [p.id, p.image]));
 	        upcoming_removals = upcoming_removals.map((row) => ({
 	          ...row,
-	          cover_url: row.cover_url || coverByKey.get(`${row.playlist_id}:${row.track_id}`) || null,
+	          cover_url: row.cover_url || itemByKey.get(`${row.playlist_id}:${row.track_id}`)?.cover_url || null,
+	          position: Number.isFinite(Number(itemByKey.get(`${row.playlist_id}:${row.track_id}`)?.position))
+	            ? Number(itemByKey.get(`${row.playlist_id}:${row.track_id}`).position)
+	            : row.position,
 	          playlist_image: playlistImageById.get(row.playlist_id) || null,
 	        }));
 	      }
@@ -3581,14 +4351,67 @@ const routes = {
 
   let flex_enabled_count = 0;
   let flex_due_count = 0;
+  let upcoming_rotations = [];
   if (playlistIds.length) {
     const flexPath =
-      `/rest/v1/playlist_flex_settings?select=playlist_id,enabled,next_rotation_at` +
+      `/rest/v1/playlist_flex_settings?select=playlist_id,enabled,next_rotation_at,interval,reference_playlist_id,reference_playlist_url` +
       `&playlist_id=in.(${playlistIds.map((id) => `"${id}"`).join(",")})`;
     const fResp = await fetch(SUPABASE_URL + flexPath, { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" });
     const flexRows = fResp.ok ? JSON.parse(await fResp.text() || "[]") : [];
     flex_enabled_count = flexRows.filter((r) => r.enabled).length;
-    flex_due_count = flexRows.filter((r) => r.enabled && r.next_rotation_at && new Date(r.next_rotation_at) <= new Date(Date.now() + 24*3600*1000)).length;
+    const rotationHorizon = new Date(Date.now() + 14 * 24 * 3600 * 1000);
+    const dueSettings = flexRows
+      .filter((r) => r.enabled && (!r.next_rotation_at || new Date(r.next_rotation_at) <= rotationHorizon));
+    const duePlaylistIds = dueSettings.map((r) => r.playlist_id).filter(Boolean);
+    if (duePlaylistIds.length) {
+      const slotResp = await fetch(
+        SUPABASE_URL +
+          `/rest/v1/playlist_flex_slots?select=id,playlist_id,position,current_track_id,last_rotated_at` +
+          `&playlist_id=in.(${duePlaylistIds.map((id) => `"${id}"`).join(",")})`,
+        { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" }
+      );
+      const dueSlots = slotResp.ok ? JSON.parse(await slotResp.text() || "[]") : [];
+      flex_due_count = dueSlots.length || duePlaylistIds.length;
+      const playlistById = new Map(playlists.map((p) => [p.id, p]));
+      const settingsByPlaylist = new Map(dueSettings.map((s) => [s.playlist_id, s]));
+      const trackIds = [...new Set(dueSlots.map((slot) => slot.current_track_id).filter(Boolean))];
+      let itemRows = [];
+      if (trackIds.length) {
+        const itemsResp = await fetch(
+          SUPABASE_URL +
+            `/rest/v1/playlist_items?select=playlist_id,track_id,track_name,artist_names,cover_url,position` +
+            `&playlist_id=in.(${duePlaylistIds.map((id) => `"${id}"`).join(",")})` +
+            `&track_id=in.(${trackIds.map((id) => `"${encodeURIComponent(String(id))}"`).join(",")})`,
+          { headers: { apikey: SRK, Authorization: `Bearer ${SRK}` }, cache: "no-store" }
+        );
+        itemRows = itemsResp.ok ? JSON.parse(await itemsResp.text() || "[]") : [];
+      }
+      const itemByKey = new Map(itemRows.map((item) => [`${item.playlist_id}:${item.track_id}`, item]));
+      upcoming_rotations = dueSlots
+        .map((slot) => {
+          const playlist = playlistById.get(slot.playlist_id) || {};
+          const settings = settingsByPlaylist.get(slot.playlist_id) || {};
+          const item = itemByKey.get(`${slot.playlist_id}:${slot.current_track_id}`) || {};
+          return {
+            playlist_id: slot.playlist_id,
+            playlist_name: playlist.name || "Playlist",
+            playlist_image: playlist.image || null,
+            slot_id: slot.id,
+            position: Number.isFinite(Number(slot.position)) ? Number(slot.position) : null,
+            current_track_id: slot.current_track_id || null,
+            track_name: item.track_name || slot.current_track_id || "Rotation slot",
+            artist_names: item.artist_names || "",
+            cover_url: item.cover_url || playlist.image || null,
+            next_rotation_at: settings.next_rotation_at || null,
+            interval: settings.interval || "weekly",
+            source_playlist_id: settings.reference_playlist_id || null,
+            source_playlist_name: settings.reference_playlist_id || "Reference playlist",
+            source_playlist_url: settings.reference_playlist_url || null,
+            last_rotated_at: slot.last_rotated_at || null,
+          };
+        })
+        .sort((a, b) => String(a.next_rotation_at || "").localeCompare(String(b.next_rotation_at || "")) || Number(a.position ?? 0) - Number(b.position ?? 0));
+    }
   }
 
   const automation_enabled_count = playlists.filter((p) => p.auto_remove_enabled && Number(p.auto_remove_weeks) > 0).length;
@@ -3615,9 +4438,12 @@ const routes = {
       growth_ready: snapshotDays.size >= 2,
     },
     top_growing: top_growing || null,
+    performance_cards,
+    playlist_options,
     top_playlists,
     growth_rank: growth_rank.slice(0, 8),
     upcoming_removals,
+    upcoming_rotations,
     next_day_removals: upcoming_removals.filter((r) => r.removes_on === new Date(Date.now() + 24*3600*1000).toISOString().slice(0,10))
   });
 },
@@ -3793,9 +4619,11 @@ const routes = {
       else seen.add(row.snapshot_id);
     }
     if (deleteIds.length) {
-      const idList = deleteIds.map((id) => encodeURIComponent(String(id))).join(",");
-      const del = await sb(`/rest/v1/playlist_backups?id=in.(${idList})`, { method: "DELETE" });
-      if (!del.ok) return bad(res, 500, `backup_delete_failed:${await del.text()}`);
+      try {
+        await deleteBackupIds(deleteIds);
+      } catch (e) {
+        return bad(res, 500, String(e?.message || e));
+      }
     }
     return json(res, 200, { ok: true, deleted: deleteIds.length, kept_snapshots: seen.size });
   },
@@ -3805,39 +4633,16 @@ const routes = {
     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
     const bubbleUserId = await bubbleUserIdFromRequest(req);
     if (!bubbleUserId) return bad(res, 401, "missing_user");
-    const { playlist_id, keep_daily_days = 30, keep_weekly_months = 6 } = await readBody(req);
+    const { playlist_id } = await readBody(req);
     if (!playlist_id) return bad(res, 400, "missing_playlist_id");
     const owned = await getOwnedPlaylist(playlist_id, bubbleUserId);
     if (!owned) return bad(res, 403, "playlist_not_owned");
-    const r = await sb(
-      `/rest/v1/playlist_backups?select=id,taken_at` +
-      `&playlist_id=eq.${encodeURIComponent(String(playlist_id))}` +
-      `&order=taken_at.desc&limit=2000`
-    );
-    if (!r.ok) return bad(res, 500, `backup_select_failed:${await r.text()}`);
-    const rows = await r.json();
-    const dailyCutoff = Date.now() - Math.max(1, Number(keep_daily_days) || 30) * 24 * 3600 * 1000;
-    const weeklyCutoff = Date.now() - Math.max(1, Number(keep_weekly_months) || 6) * 31 * 24 * 3600 * 1000;
-    const keptWeeks = new Set();
-    const deleteIds = [];
-    for (const row of rows || []) {
-      const ts = Date.parse(row.taken_at || "");
-      if (!Number.isFinite(ts) || ts >= dailyCutoff) continue;
-      if (ts < weeklyCutoff) {
-        deleteIds.push(row.id);
-        continue;
-      }
-      const d = new Date(ts);
-      const weekKey = `${d.getUTCFullYear()}-${Math.floor((Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - Date.UTC(d.getUTCFullYear(), 0, 1)) / (7 * 24 * 3600 * 1000))}`;
-      if (keptWeeks.has(weekKey)) deleteIds.push(row.id);
-      else keptWeeks.add(weekKey);
+    try {
+      const result = await compactPlaylistBackups(playlist_id, { max: 5 });
+      return json(res, 200, { ok: true, ...result });
+    } catch (e) {
+      return bad(res, 500, String(e?.message || e));
     }
-    if (deleteIds.length) {
-      const idList = deleteIds.map((id) => encodeURIComponent(String(id))).join(",");
-      const del = await sb(`/rest/v1/playlist_backups?id=in.(${idList})`, { method: "DELETE" });
-      if (!del.ok) return bad(res, 500, `backup_delete_failed:${await del.text()}`);
-    }
-    return json(res, 200, { ok: true, deleted: deleteIds.length, weekly_kept: keptWeeks.size });
   },
 
   /* ---------- backups/cron-weekly (GET/POST) ---------- */
@@ -3864,6 +4669,162 @@ const routes = {
       await sleep(120);
     }
     return json(res, 200, { ok: true, processed: playlists.length, created, unchanged, failed });
+  },
+
+
+  /* ---------- future-adds/list (GET) ---------- */
+  "future-adds/list": async (req, res) => {
+    if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req, req.query.bubble_user_id);
+    if (!bubbleUserId) return bad(res, 401, "missing_user");
+    const playlist_id = String(req.query.playlist_id || "");
+    if (!playlist_id) return bad(res, 400, "missing_playlist_id");
+    const owned = await getOwnedPlaylist(playlist_id, bubbleUserId);
+    if (!owned) return bad(res, 403, "playlist_not_owned");
+    const r = await sb(
+      `/rest/v1/playlist_future_adds?select=*` +
+      `&playlist_id=eq.${encodeURIComponent(playlist_id)}` +
+      `&order=release_date.asc,created_at.asc&limit=50`
+    );
+    if (!r.ok) return bad(res, 500, `future_adds_select_failed:${await r.text()}`);
+    return json(res, 200, await r.json());
+  },
+
+  /* ---------- future-adds/create (POST) ---------- */
+  "future-adds/create": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req);
+    if (!bubbleUserId) return bad(res, 401, "missing_user");
+    const body = await readBody(req);
+    const playlist_id = String(body.playlist_id || "");
+    const release_date = String(body.release_date || "").slice(0, 10);
+    const artist_name = String(body.artist_name || "").trim();
+    const track_title = String(body.track_title || "").trim();
+    const targetPosition = body.position === undefined || body.position === null || String(body.position).trim() === "" ? null : Number(body.position);
+    if (!playlist_id || !/^\d{4}-\d{2}-\d{2}$/.test(release_date)) return bad(res, 400, "missing_playlist_or_release_date");
+    if (!artist_name || !track_title) return bad(res, 400, "missing_artist_or_title");
+    if (targetPosition !== null && (!Number.isInteger(targetPosition) || targetPosition < 1)) return bad(res, 400, "invalid_position");
+    const playlist = await getOwnedPlaylist(playlist_id, bubbleUserId);
+    if (!playlist) return bad(res, 403, "playlist_not_owned");
+    const r = await sb(`/rest/v1/playlist_future_adds`, {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify([{
+        bubble_user_id: bubbleUserId,
+        playlist_id,
+        connection_id: playlist.connection_id || null,
+        release_date,
+        artist_name: artist_name.slice(0, 240),
+        track_title: track_title.slice(0, 240),
+        target_position: targetPosition,
+        status: "pending",
+        updated_at: new Date().toISOString(),
+      }])
+    });
+    if (!r.ok) return bad(res, 500, `future_add_create_failed:${await r.text()}`);
+    const rows = await r.json().catch(() => []);
+    return json(res, 200, { ok: true, item: rows?.[0] || null });
+  },
+
+  /* ---------- future-adds/delete (POST) ---------- */
+  "future-adds/delete": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const bubbleUserId = await bubbleUserIdFromRequest(req);
+    if (!bubbleUserId) return bad(res, 401, "missing_user");
+    const { id, playlist_id } = await readBody(req);
+    if (!id || !playlist_id) return bad(res, 400, "missing_id_or_playlist_id");
+    const owned = await getOwnedPlaylist(playlist_id, bubbleUserId);
+    if (!owned) return bad(res, 403, "playlist_not_owned");
+    const r = await sb(
+      `/rest/v1/playlist_future_adds?id=eq.${encodeURIComponent(String(id))}` +
+      `&playlist_id=eq.${encodeURIComponent(String(playlist_id))}` +
+      `&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`,
+      { method: "DELETE", headers: { Prefer: "return=minimal" } }
+    );
+    if (!r.ok) return bad(res, 500, `future_add_delete_failed:${await r.text()}`);
+    return json(res, 200, { ok: true });
+  },
+
+  /* ---------- future-adds/process-due (GET/POST) ---------- */
+  "future-adds/process-due": async (req, res) => {
+    if (!checkCronAuth(req) && !checkAppSecret(req)) return bad(res, 401, "unauthorized_cron");
+    const qs = Object.fromEntries(new URL(req.url, `http://${req.headers.host}`).searchParams.entries());
+    const limit = Math.max(1, Math.min(30, Number(qs.limit || "15")));
+    const today = new Date().toISOString().slice(0, 10);
+    const dueR = await sb(
+      `/rest/v1/playlist_future_adds?select=*` +
+      `&status=eq.pending&release_date=lte.${encodeURIComponent(today)}` +
+      `&order=release_date.asc,created_at.asc&limit=${limit}`
+    );
+    if (!dueR.ok) return bad(res, 500, `future_add_due_select_failed:${await dueR.text()}`);
+    const due = await dueR.json().catch(() => []);
+    const results = [];
+    for (const item of due || []) {
+      try {
+        const playlistR = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id&limit=1&id=eq.${encodeURIComponent(item.playlist_id)}`);
+        const playlist = playlistR.ok ? (await playlistR.json().catch(() => []))?.[0] : null;
+        if (!playlist?.connection_id) throw new Error("playlist_or_connection_missing");
+        const access_token = await getAccessTokenFromConnection(playlist.connection_id);
+        const searchQuery = `track:${item.track_title} artist:${item.artist_name}`;
+        const search = await fetchJSON(
+          `https://api.spotify.com/v1/search?type=track&market=from_token&limit=10&q=${encodeURIComponent(searchQuery)}`,
+          { headers: { Authorization: `Bearer ${access_token}` } },
+          20000
+        );
+        if (!search.r.ok) throw new Error(`spotify_search_failed:${search.r.status}:${search.text || JSON.stringify(search.json)}`);
+        const ranked = (search.json?.tracks?.items || [])
+          .map((track) => ({ track, score: scoreFutureAddCandidate(track, item.artist_name, item.track_title) }))
+          .sort((a, b) => b.score - a.score);
+        const best = ranked[0];
+        if (!best?.track || best.score < 70) {
+          await sb(`/rest/v1/playlist_future_adds?id=eq.${encodeURIComponent(item.id)}`, {
+            method: "PATCH",
+            headers: { Prefer: "return=minimal" },
+            body: JSON.stringify({ status: "not_found", attempts: Number(item.attempts || 0) + 1, last_error: "no_confident_match", updated_at: new Date().toISOString() })
+          });
+          results.push({ id: item.id, status: "not_found" });
+          continue;
+        }
+        const addRes = await addTrackUriToPlaylist({ playlist, access_token, trackUriValue: best.track.uri, position: item.target_position });
+        if (!addRes.r.ok) throw new Error(`spotify_add_failed:${addRes.r.status}:${addRes.text || JSON.stringify(addRes.json)}`);
+        const nowIso = new Date().toISOString();
+        const cooldownUntil = await setPlaylistUpdateCooldown(playlist.id, 300);
+        await Promise.all([
+          sb(`/rest/v1/playlist_future_adds?id=eq.${encodeURIComponent(item.id)}`, {
+            method: "PATCH",
+            headers: { Prefer: "return=minimal" },
+            body: JSON.stringify({
+              status: "added",
+              attempts: Number(item.attempts || 0) + 1,
+              spotify_track_id: best.track.id || null,
+              spotify_track_uri: best.track.uri || null,
+              spotify_track_name: best.track.name || null,
+              spotify_artist_names: (best.track.artists || []).map((a) => a?.name).filter(Boolean).join(", "),
+              processed_at: nowIso,
+              updated_at: nowIso,
+              last_error: null,
+            })
+          }),
+          sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(playlist.id)}`, {
+            method: "PATCH",
+            headers: { Prefer: "return=minimal" },
+            body: JSON.stringify({ needs_sync: true, next_check_at: cooldownUntil })
+          })
+        ]);
+        try { await syncPlaylistItemsNow(playlist.id); } catch {}
+        results.push({ id: item.id, status: "added", track: best.track.uri });
+      } catch (e) {
+        const attempts = Number(item.attempts || 0) + 1;
+        await sb(`/rest/v1/playlist_future_adds?id=eq.${encodeURIComponent(item.id)}`, {
+          method: "PATCH",
+          headers: { Prefer: "return=minimal" },
+          body: JSON.stringify({ status: attempts >= 3 ? "failed" : "pending", attempts, last_error: String(e?.message || e).slice(0, 1000), updated_at: new Date().toISOString() })
+        }).catch(() => {});
+        results.push({ id: item.id, status: "failed", error: String(e?.message || e) });
+      }
+      await sleep(250);
+    }
+    return json(res, 200, { ok: true, processed: due.length, results });
   },
 
 
@@ -4181,7 +5142,7 @@ const routes = {
   const path =
     `/rest/v1/playlists` +
     `?select=id,playlist_id,name,image,tracks_total,followers,updated_at,` +
-    `auto_remove_enabled,auto_remove_weeks` +
+    `auto_remove_enabled,auto_remove_weeks,track_limit_enabled,track_limit_count,track_limit_strategy` +
     `&id=eq.${encodeURIComponent(playlist_id)}` +
     `&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}` +
     `&limit=1`;
@@ -4592,10 +5553,18 @@ const routes = {
        } catch (e) {
          console.error("oauth/spotify/callback: seats_used refresh failed", { error: String(e) });
        }
-   
+
+       console.log("oauth/spotify/callback: success", {
+         bubble_user_id,
+         spotify_user_id,
+         connection_mode: existing ? "reactivated" : "created",
+         credential_id: credentials.id || null,
+       });
+
        // zurück ins UI
        const qs   = `?spotify_linked=1&spotify_user=${encodeURIComponent(spotify_user_id)}`;
-       const back = (return_to || "/") + qs;
+       const returnBase = return_to || "/";
+       const back = `${returnBase}${returnBase.includes("?") ? "&" : "?"}${qs.slice(1)}`;
        return res.redirect(back);
      } catch (e) {
        const msg = e?.message || String(e);
@@ -4617,7 +5586,7 @@ const routes = {
      const bubbleUserId = await bubbleUserIdFromRequest(req);
      if (!bubbleUserId) return bad(res, 401, "Missing X-Bubble-User-Id");
    
-     const { playlist_id, auto_remove_enabled, auto_remove_weeks } = await readBody(req);
+     const { playlist_id, auto_remove_enabled, auto_remove_weeks, track_limit_enabled, track_limit_count, track_limit_strategy } = await readBody(req);
      if (!playlist_id) return bad(res, 400, "missing_playlist_id");
    
      // Ownership prüfen
@@ -4630,11 +5599,20 @@ const routes = {
      if (enabled && (!Number.isInteger(weeks) || weeks < 1 || weeks > 104)) {
        return bad(res, 400, "invalid_weeks_range_1_104");
      }
+     const limitEnabled = !!track_limit_enabled;
+     const limitCount = (track_limit_count == null || track_limit_count === "") ? null : Number(track_limit_count);
+     if (limitEnabled && (!Number.isInteger(limitCount) || limitCount < 1 || limitCount > 10000)) {
+       return bad(res, 400, "invalid_track_limit_range_1_10000");
+     }
+     const limitStrategy = ["back", "oldest"].includes(String(track_limit_strategy || "back")) ? String(track_limit_strategy || "back") : "back";
      const cooldownUntil = await setPlaylistUpdateCooldown(playlist_id, 300);
    
      const patch = {
        auto_remove_enabled: enabled,
        auto_remove_weeks: weeks,
+       track_limit_enabled: limitEnabled,
+       track_limit_count: limitEnabled ? limitCount : null,
+       track_limit_strategy: limitStrategy,
        next_check_at: cooldownUntil
      };
    
@@ -4930,22 +5908,67 @@ const routes = {
 
     const ownerRow = ownerRows[0];
     const expectedTracks = Number(ownerRow?.tracks_total || 0);
-    const selectPath =
-       `/rest/v1/playlist_items_ui` +
+    const itemsPath =
+       `/rest/v1/playlist_items` +
        `?select=playlist_id,position,track_id,track_name,artist_names,album_name,` +
-       `duration_ms,duration_formatted,added_at,age_days,age_label,track_uri,` +
-       `popularity,preview_url,cover_url,is_locked,locked_position,locked_at,expiry_weeks` +
+       `duration_ms,added_at,track_uri,popularity,preview_url,cover_url` +
        `&playlist_id=eq.${encodeURIComponent(playlist_row_id)}` +
        `&order=position.asc`;
+    const locksPath =
+      `/rest/v1/playlist_item_locks` +
+      `?select=track_id,is_locked,locked_position,locked_at,expiry_weeks` +
+      `&playlist_id=eq.${encodeURIComponent(playlist_row_id)}`;
+
+    const formatDuration = (durationMs) => {
+      const total = Math.max(0, Math.round(Number(durationMs || 0) / 1000));
+      if (!total) return null;
+      const minutes = Math.floor(total / 60);
+      const seconds = total % 60;
+      return `${minutes}:${String(seconds).padStart(2, "0")}`;
+    };
+    const ageInfo = (addedAt) => {
+      const ts = addedAt ? Date.parse(addedAt) : NaN;
+      if (!Number.isFinite(ts)) return { age_days: null, age_label: "" };
+      const days = Math.max(0, Math.floor((Date.now() - ts) / (24 * 3600 * 1000)));
+      if (days < 1) return { age_days: 0, age_label: "today" };
+      if (days === 1) return { age_days: days, age_label: "1 day" };
+      if (days < 14) return { age_days: days, age_label: `${days} days` };
+      const weeks = Math.floor(days / 7);
+      return { age_days: days, age_label: `${weeks}w` };
+    };
 
     const fetchItems = async () => {
-      const r = await fetch(SUPABASE_URL + selectPath, {
-        headers: { apikey: SRK, Authorization: `Bearer ${SRK}` },
-        cache: "no-store"
+      const [itemsR, locksR] = await Promise.all([
+        fetch(SUPABASE_URL + itemsPath, {
+          headers: { apikey: SRK, Authorization: `Bearer ${SRK}` },
+          cache: "no-store"
+        }),
+        fetch(SUPABASE_URL + locksPath, {
+          headers: { apikey: SRK, Authorization: `Bearer ${SRK}` },
+          cache: "no-store"
+        })
+      ]);
+      const itemsTxt = await itemsR.text();
+      if (!itemsR.ok) throw new Error(`supabase_items_error:${itemsR.status}:${itemsTxt}`);
+      const locksTxt = await locksR.text();
+      const locks = locksR.ok && locksTxt ? JSON.parse(locksTxt) : [];
+      const lockByTrack = new Map((Array.isArray(locks) ? locks : []).filter((row) => row?.track_id).map((row) => [row.track_id, row]));
+      const rows = itemsTxt ? JSON.parse(itemsTxt) : [];
+      return (Array.isArray(rows) ? rows : []).map((item) => {
+        const lock = lockByTrack.get(item.track_id) || {};
+        const age = ageInfo(item.added_at);
+        return {
+          ...item,
+          track_uri: item.track_uri || (item.track_id ? trackUri(item.track_id) : null),
+          duration_formatted: formatDuration(item.duration_ms),
+          age_days: age.age_days,
+          age_label: age.age_label,
+          is_locked: !!lock.is_locked,
+          locked_position: lock.locked_position ?? null,
+          locked_at: lock.locked_at ?? null,
+          expiry_weeks: lock.expiry_weeks ?? null,
+        };
       });
-      const txt = await r.text();
-      if (!r.ok) throw new Error(`supabase_error:${r.status}:${txt}`);
-      return txt ? JSON.parse(txt) : [];
     };
 
     let items = await fetchItems();
@@ -4953,9 +5976,27 @@ const routes = {
       const loadedTracks = Array.isArray(items) ? items.length : 0;
       return expectedTracks > 0 && loadedTracks < Math.max(1, Math.floor(expectedTracks * 0.8));
     };
+    const hasSuspiciousLockCluster = () => {
+      if (!Array.isArray(items) || items.length < 20) return false;
+      const firstTen = items.slice(0, 10);
+      const lockedInFirstTen = firstTen.filter((item) => item?.is_locked).length;
+      if (lockedInFirstTen < 5) return false;
+      const firstSix = items.slice(0, 6);
+      const lockedInFirstSix = firstSix.filter((item) => item?.is_locked).length;
+      if (lockedInFirstSix >= 4) return true;
+      const lockedPositions = items
+        .filter((item) => item?.is_locked)
+        .slice(0, 8)
+        .map((item) => Number(item.position))
+        .filter(Number.isFinite);
+      if (lockedPositions.length < 5) return false;
+      return lockedPositions.every((position, index) => index === 0 || position >= lockedPositions[index - 1]);
+    };
     let repaired = false;
     let repairAttempted = false;
+    let repairReason = "";
     if (isPartial() && req.query.repair !== "0") {
+      repairReason = "partial";
       repairAttempted = true;
       try {
         const base = internalBaseUrl();
@@ -4974,6 +6015,7 @@ const routes = {
       items = await fetchItems();
     }
     const partial = isPartial();
+    const suspicious_lock_cluster = hasSuspiciousLockCluster();
     if (req.query.meta === "1") {
       return json(res, 200, {
         items,
@@ -4981,7 +6023,9 @@ const routes = {
           expected_tracks: expectedTracks,
           loaded_tracks: Array.isArray(items) ? items.length : 0,
           partial,
+          suspicious_lock_cluster,
           repair_attempted: repairAttempted,
+          repair_reason: repairReason || null,
           repaired
         }
       });
@@ -5323,7 +6367,7 @@ const routes = {
            connection_id ? `connection_id=eq.${encodeURIComponent(connection_id)}` : "",
            requesterBubbleUserId ? `bubble_user_id=eq.${encodeURIComponent(requesterBubbleUserId)}` : "",
          ].filter(Boolean).join("&");
-         const r = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id,auto_remove_enabled,auto_remove_weeks,next_check_at&limit=1&${scopedFilters}`);
+         const r = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id,auto_remove_enabled,auto_remove_weeks,track_limit_enabled,track_limit_count,track_limit_strategy,next_check_at&limit=1&${scopedFilters}`);
          if (!r.ok) { console.timeEnd(timeLabel); return bad(res, 500, `supabase_select_failed: ${await r.text()}`); }
          const arr = await r.json();
          if (!arr[0]) { console.timeEnd(timeLabel); return bad(res, 404, "playlist_not_found_by_spotify_id"); }
@@ -5332,7 +6376,7 @@ const routes = {
        }
    
        // Playlist-Metadaten (+Settings)
-       const pr = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id,auto_remove_enabled,auto_remove_weeks,next_check_at&limit=1&id=eq.${encodeURIComponent(playlist_row_id)}`);
+       const pr = await sb(`/rest/v1/playlists?select=id,playlist_id,connection_id,bubble_user_id,auto_remove_enabled,auto_remove_weeks,track_limit_enabled,track_limit_count,track_limit_strategy,next_check_at&limit=1&id=eq.${encodeURIComponent(playlist_row_id)}`);
        if (!pr.ok) { console.timeEnd(timeLabel); return bad(res, 500, `supabase select playlist failed: ${await pr.text()}`); }
        const p = (await pr.json())[0];
        if (!p) { console.timeEnd(timeLabel); return bad(res, 404, "playlist_not_found"); }
@@ -5399,18 +6443,11 @@ const routes = {
          return json(res, 202, { ok:true, already_in_progress:true });
        }
    
-       // Connection & Token
-       const cr = await sb(`/rest/v1/spotify_connections?select=id,refresh_token_enc&limit=1&id=eq.${encodeURIComponent(p.connection_id)}`);
-       if (!cr.ok) { console.timeEnd(timeLabel); return bad(res, 500, `supabase select connection failed: ${await cr.text()}`); }
-       const conn = (await cr.json())[0];
-       if (!conn) { console.timeEnd(timeLabel); return bad(res, 404, "connection_not_found"); }
-   
-       const refresh_token = decryptToken(conn.refresh_token_enc);
+       // Connection & Token. Reuse the encrypted access token while it is valid;
+       // refreshing on every sync adds an avoidable Spotify Accounts round-trip.
        const t0 = Date.now();
-       const credentials = await getSpotifyAppCredentialsForConnection(conn.id);
-       const tokenRef = await refreshAccessToken(refresh_token, credentials);
-       const access_token = tokenRef.access_token;
-       console.log("sync-items:token_refreshed", { took_ms: Date.now() - t0, expires_in: tokenRef.expires_in });
+       const access_token = await getAccessTokenFromConnection(p.connection_id);
+       console.log("sync-items:token_ready", { took_ms: Date.now() - t0 });
    
        // Snapshot-ID (für positionsgenaue Delete/Reorder)
        let snapshot_id = null;
@@ -5623,18 +6660,29 @@ const routes = {
              console.warn("backup_insert_failed", text);
            }
          }
+         if (backupInsert?.ok) {
+           await compactPlaylistBackups(p.id, { max: 5 }).catch((err) => console.warn("backup_retention_failed", err?.message || err));
+         }
        } catch (e) {
          if (String(e?.message || e) !== "backup_skipped_duplicate_snapshot") {
            console.warn("backup_block_failed", e?.message || e);
          }
        }
    
-       /* === (A) Expiry: alte, UNGElOCKTE Items löschen (positionsgenau) === */
+       /* === (A) Cleanup: Expiry + Track-Limit, immer positionsgenau und ohne gelockte Tracks === */
        let removedPositionsSet = new Set();
+       const toRemoveMap = new Map(); // uri -> positions[]
+       const markRemove = (index, item) => {
+         const uri = item?.track?.uri;
+         if (!uri || removedPositionsSet.has(index)) return;
+         if (!toRemoveMap.has(uri)) toRemoveMap.set(uri, []);
+         toRemoveMap.get(uri).push(index);
+         removedPositionsSet.add(index);
+       };
+
        if (USER_ALLOW_AUTO && p.auto_remove_enabled && Number(p.auto_remove_weeks) > 0) {
          const masterExpiryWeeks = Number(p.auto_remove_weeks);
          const masterCutoffMs = Date.now() - masterExpiryWeeks * 7 * 24 * 3600 * 1000;
-         const toRemoveMap = new Map(); // uri -> positions[]
    
          for (let i = 0; i < items.length; i++) {
            const it = items[i] || {};
@@ -5653,61 +6701,87 @@ const routes = {
            }
            
            if (addedAt <= cutoffMs) {
-             if (!toRemoveMap.has(t.uri)) toRemoveMap.set(t.uri, []);
-             toRemoveMap.get(t.uri).push(i);
-             removedPositionsSet.add(i);
+             markRemove(i, it);
            }
          }
-   
-         const toRemovePayload = Array.from(toRemoveMap.entries()).map(([uri, positions]) => ({ uri, positions }));
-         if (toRemovePayload.length > 0 && snapshot_id) {
-           for (const batch of chunk(toRemovePayload, 100)) {
-             let attempt = 0;
-             while (true) {
-               const del = await fetchJSON(
-                 `https://api.spotify.com/v1/playlists/${encodeURIComponent(p.playlist_id)}/tracks`,
-                 {
-                   method: "DELETE",
-                   headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" },
-                   body: JSON.stringify({ tracks: batch, snapshot_id })
-                 },
-                 20000
-               );
-               if (del.r.status === 429) {
-                 const ra = Number(del.r.headers.get("retry-after") || "1");
-                 const waitSec = Math.min(60, Math.max(1, ra) * Math.pow(2, attempt)) + (Math.random() * 0.8);
-                 if (attempt++ >= 6) {
-                   await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
-                     method: "PATCH", headers: { Prefer: "return=minimal" },
-                     body: JSON.stringify({ sync_started_at: null, needs_sync: true, next_check_at: new Date(Date.now()+ (Math.max(1,ra)+5)*1000).toISOString() })
-                   }).catch(()=>{});
-                   console.timeEnd(timeLabel);
-                   return json(res, 202, { ok:false, rescheduled:true, reason:"rate_limited_delete" });
-                 }
-                 await sleep(waitSec * 1000);
-                 continue;
-               }
-               if (!del.r.ok) {
+       }
+
+       if (USER_ALLOW_AUTO && p.track_limit_enabled && Number(p.track_limit_count) > 0) {
+         const maxTracks = Math.max(1, Math.floor(Number(p.track_limit_count)));
+         const currentAfterPlannedRemovals = items.length - removedPositionsSet.size;
+         const overflow = currentAfterPlannedRemovals - maxTracks;
+         if (overflow > 0) {
+           const candidates = [];
+           for (let i = 0; i < items.length; i++) {
+             if (removedPositionsSet.has(i)) continue;
+             const it = items[i] || {};
+             const t = it.track || {};
+             if (!t?.id || !t?.uri) continue;
+             if (lockedSet.has(t.id)) continue;
+             candidates.push({
+               index: i,
+               item: it,
+               addedAt: it.added_at ? Date.parse(it.added_at) : Number.POSITIVE_INFINITY,
+             });
+           }
+           const strategy = String(p.track_limit_strategy || "back");
+           if (strategy === "oldest") {
+             candidates.sort((a, b) => (Number.isFinite(a.addedAt) ? a.addedAt : Number.POSITIVE_INFINITY) - (Number.isFinite(b.addedAt) ? b.addedAt : Number.POSITIVE_INFINITY) || a.index - b.index);
+           } else {
+             candidates.sort((a, b) => b.index - a.index);
+           }
+           candidates.slice(0, overflow).forEach((candidate) => markRemove(candidate.index, candidate.item));
+         }
+       }
+
+       const toRemovePayload = Array.from(toRemoveMap.entries()).map(([uri, positions]) => ({ uri, positions }));
+       if (toRemovePayload.length > 0 && snapshot_id) {
+         for (const batch of chunk(toRemovePayload, 100)) {
+           let attempt = 0;
+           while (true) {
+             const del = await fetchJSON(
+               `https://api.spotify.com/v1/playlists/${encodeURIComponent(p.playlist_id)}/tracks`,
+               {
+                 method: "DELETE",
+                 headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" },
+                 body: JSON.stringify({ tracks: batch, snapshot_id })
+               },
+               20000
+             );
+             if (del.r.status === 429) {
+               const ra = Number(del.r.headers.get("retry-after") || "1");
+               const waitSec = Math.min(60, Math.max(1, ra) * Math.pow(2, attempt)) + (Math.random() * 0.8);
+               if (attempt++ >= 6) {
                  await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
-                   method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ sync_started_at: null })
+                   method: "PATCH", headers: { Prefer: "return=minimal" },
+                   body: JSON.stringify({ sync_started_at: null, needs_sync: true, next_check_at: new Date(Date.now()+ (Math.max(1,ra)+5)*1000).toISOString() })
                  }).catch(()=>{});
                  console.timeEnd(timeLabel);
-                 return bad(res, del.r.status, `spotify delete failed: ${del.r.status} ${del.text || ""}`);
+                 return json(res, 202, { ok:false, rescheduled:true, reason:"rate_limited_delete" });
                }
-               snapshot_id = del.json?.snapshot_id || snapshot_id;
-               break;
+               await sleep(waitSec * 1000);
+               continue;
              }
-             await sleep(80);
+             if (!del.r.ok) {
+               await sb(`/rest/v1/playlists?id=eq.${encodeURIComponent(p.id)}`, {
+                 method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ sync_started_at: null })
+               }).catch(()=>{});
+               console.timeEnd(timeLabel);
+               return bad(res, del.r.status, `spotify delete failed: ${del.r.status} ${del.text || ""}`);
+             }
+             snapshot_id = del.json?.snapshot_id || snapshot_id;
+             break;
            }
-   
-           // lokales Array kompaktieren
-           const keep = [];
-           for (let i = 0; i < items.length; i++) {
-             if (!removedPositionsSet.has(i)) keep.push(items[i]);
-           }
-           items.length = 0;
-           items.push(...keep);
+           await sleep(80);
          }
+
+         // lokales Array kompaktieren
+         const keep = [];
+         for (let i = 0; i < items.length; i++) {
+           if (!removedPositionsSet.has(i)) keep.push(items[i]);
+         }
+         items.length = 0;
+         items.push(...keep);
        }
    
        /* === (B) Locks enforce (Reorder) === */
@@ -5883,6 +6957,7 @@ const routes = {
            needs_sync: false,
            sync_started_at: null,
            last_synced_at: new Date().toISOString(),
+           tracks_total: rows.length,
          }),
        }).catch(()=>{});
    
@@ -6518,21 +7593,21 @@ const routes = {
    
      // Ownership + Spotify target. Moves must hit Spotify immediately, otherwise
      // the next sync can read the old Spotify order back and make locked tracks jump.
-     const own = await sb(
-       `/rest/v1/playlists?select=id,playlist_id,connection_id,tracks_total&limit=1` +
-       `&id=eq.${encodeURIComponent(String(playlist_id))}` +
-       `&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`
-     ).then(r=>r.json());
+     const [own, beforePosR] = await Promise.all([
+       sb(
+         `/rest/v1/playlists?select=id,playlist_id,connection_id,tracks_total&limit=1` +
+         `&id=eq.${encodeURIComponent(String(playlist_id))}` +
+         `&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`
+       ).then(r => r.json()),
+       sb(
+         `/rest/v1/playlist_items?select=position` +
+         `&playlist_id=eq.${encodeURIComponent(playlist_id)}` +
+         `&track_id=eq.${encodeURIComponent(track_id)}` +
+         `&order=position.asc&limit=1`
+       ),
+     ]);
      const playlistRow = own?.[0];
      if (!playlistRow) return bad(res, 403, "Playlist not owned by user");
-     const cooldownUntil = await setPlaylistUpdateCooldown(playlist_id, 300);
-
-     const beforePosR = await sb(
-       `/rest/v1/playlist_items?select=position` +
-       `&playlist_id=eq.${encodeURIComponent(playlist_id)}` +
-       `&track_id=eq.${encodeURIComponent(track_id)}` +
-       `&order=position.asc&limit=1`
-     );
      const beforeRow = beforePosR.ok ? (await beforePosR.json())?.[0] : null;
      const requestedFromPosition = Number.isFinite(Number(from_position)) ? Number(from_position) : null;
      const beforePosition = requestedFromPosition ?? (Number.isFinite(Number(beforeRow?.position)) ? Number(beforeRow.position) : null);
@@ -6549,13 +7624,15 @@ const routes = {
          const accessToken = await getAccessTokenFromConnection(playlistRow.connection_id);
          let attempt = 0;
          while (attempt < 3) {
-           const spotifyFrom = await findPlaylistTrackPosition(playlistRow.playlist_id, track_id, accessToken, beforePosition);
+           const [spotifyFrom, meta] = await Promise.all([
+             findPlaylistTrackPositionFast(playlistRow.playlist_id, track_id, accessToken, beforePosition),
+             fetchJSON(
+               `https://api.spotify.com/v1/playlists/${encodeURIComponent(playlistRow.playlist_id)}?fields=snapshot_id,tracks(total)`,
+               { headers: { Authorization: `Bearer ${accessToken}` } },
+               20000
+             ),
+           ]);
            if (spotifyFrom < 0) break;
-           const meta = await fetchJSON(
-             `https://api.spotify.com/v1/playlists/${encodeURIComponent(playlistRow.playlist_id)}?fields=snapshot_id,tracks(total)`,
-             { headers: { Authorization: `Bearer ${accessToken}` } },
-             20000
-           );
            if (!meta.r.ok) return bad(res, meta.r.status, `spotify_meta_failed: ${meta.text || JSON.stringify(meta.json)}`);
            const spotifyTotal = Number(meta.json?.tracks?.total);
            const maxTarget = Number.isFinite(spotifyTotal) && spotifyTotal > 0 ? spotifyTotal - 1 : Math.max(0, Number(playlistRow.tracks_total || 1) - 1);
@@ -6589,67 +7666,41 @@ const routes = {
          return bad(res, 500, `spotify_reorder_exception: ${String(e?.message || e)}`);
        }
      }
-   
-     // RPC call
-     const r = await sb(`/rest/v1/rpc/playlist_move_at_position`, {
-       method: "POST",
-       body: JSON.stringify({
-         p_playlist_id: playlist_id,
-         p_from_position: beforePosition,
-         p_dir: direction,
-         p_steps: stepCount
-       })
-     });
+
+     // Persist the cooldown and the atomic local reorder in parallel. The RPC
+     // already updates every affected lock position inside the same transaction.
+     const [cooldownUntil, r] = await Promise.all([
+       setPlaylistUpdateCooldown(playlist_id, 300),
+       sb(`/rest/v1/rpc/playlist_move_at_position`, {
+         method: "POST",
+         body: JSON.stringify({
+           p_playlist_id: playlist_id,
+           p_from_position: beforePosition,
+           p_dir: direction,
+           p_steps: stepCount
+         })
+       }),
+     ]);
      const txt = await r.text();
      let j = null; try { j = txt ? JSON.parse(txt) : null; } catch {}
     if (!r.ok) return bad(res, r.status, `rpc_move_failed: ${txt}`);
 
-    const movedPosR = await sb(
-      `/rest/v1/playlist_items?select=position` +
-      `&playlist_id=eq.${encodeURIComponent(playlist_id)}` +
-      `&track_id=eq.${encodeURIComponent(track_id)}` +
-      `&order=position.asc&limit=1`
-    );
+    const [movedPosR, flexSlotPositionSync] = await Promise.all([
+      sb(
+        `/rest/v1/playlist_items?select=position` +
+        `&playlist_id=eq.${encodeURIComponent(playlist_id)}` +
+        `&track_id=eq.${encodeURIComponent(track_id)}` +
+        `&order=position.asc&limit=1`
+      ),
+      resyncFlexSlotPositionsForPlaylist(playlist_id).catch((e) => {
+        console.warn("playlist-items/move:flex_slot_position_resync_failed", String(e?.message || e));
+        return { updated: 0 };
+      }),
+    ]);
     let movedPosition = null;
     if (movedPosR.ok) {
       const movedRow = (await movedPosR.json())?.[0];
       if (Number.isFinite(Number(movedRow?.position))) movedPosition = Number(movedRow.position);
-    }
-
-    try {
-      const locksR = await sb(
-        `/rest/v1/playlist_item_locks?select=track_id&playlist_id=eq.${encodeURIComponent(playlist_id)}&is_locked=is.true`
-      );
-      const locks = locksR.ok ? await locksR.json() : [];
-      const lockedIds = Array.isArray(locks) ? locks.map((x) => x.track_id).filter(Boolean) : [];
-      if (lockedIds.length) {
-        const quotedIds = lockedIds.map((id) => `"${encodeURIComponent(String(id))}"`).join(",");
-        const posR = await sb(
-          `/rest/v1/playlist_items?select=track_id,position` +
-          `&playlist_id=eq.${encodeURIComponent(playlist_id)}` +
-          `&track_id=in.(${quotedIds})`
-        );
-        const positions = posR.ok ? await posR.json() : [];
-        const nowIso = new Date().toISOString();
-        const lockUpdates = (Array.isArray(positions) ? positions : [])
-          .filter((row) => Number.isFinite(Number(row.position)))
-          .map((row) => ({
-            playlist_id,
-            track_id: row.track_id,
-            locked_position: Number(row.position),
-            is_locked: true,
-            locked_at: nowIso,
-          }));
-        if (lockUpdates.length) {
-          await sb(`/rest/v1/playlist_item_locks?on_conflict=playlist_id,track_id`, {
-            method: "POST",
-            headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-            body: JSON.stringify(lockUpdates),
-          });
-        }
-      }
-    } catch (e) {
-      console.warn("playlist-items/move:lock_position_resync_failed", String(e?.message || e));
     }
 
      const base = internalBaseUrl();
@@ -6667,7 +7718,8 @@ const routes = {
       moved_position: movedPosition,
       spotify_moved: spotifyMoved,
       spotify_snapshot_id: spotifySnapshotId,
-      cooldown_until: cooldownUntil
+      cooldown_until: cooldownUntil,
+      flex_slots_resynced: flexSlotPositionSync.updated || 0
     });
   },
    
