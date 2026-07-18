@@ -2533,7 +2533,7 @@ const routes = {
           daily_budget: String(draft.daily_budget_minor),
           billing_event: "IMPRESSIONS",
           optimization_goal: "LINK_CLICKS",
-          bid_strategy: "LOWEST_COST_WITHOUT_CAP",
+          destination_type: "WEBSITE",
           targeting: JSON.stringify(targeting),
           start_time: draft.start_date ? `${draft.start_date}T08:00:00+0000` : undefined,
           end_time: draft.end_date ? `${draft.end_date}T23:59:00+0000` : undefined,
