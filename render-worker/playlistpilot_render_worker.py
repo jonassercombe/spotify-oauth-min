@@ -21,7 +21,8 @@ WORKER_ID = os.environ.get("RENDER_WORKER_ID", f"ffmpeg:{socket.gethostname()}")
 POLL_SECONDS = max(2, int(os.environ.get("RENDER_POLL_SECONDS", "5")))
 MAX_LOAD = max(0.5, float(os.environ.get("RENDER_MAX_LOAD", "3.6")))
 HTTP_TIMEOUT = max(30, int(os.environ.get("RENDER_HTTP_TIMEOUT", "180")))
-FONT_FILE = os.environ.get("RENDER_FONT_FILE", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+FONT_FILE = os.environ.get("RENDER_FONT_FILE", "/usr/share/fonts/truetype/lato/Lato-Black.ttf")
+FONT_REGULAR_FILE = os.environ.get("RENDER_FONT_REGULAR_FILE", "/usr/share/fonts/truetype/lato/Lato-Regular.ttf")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOG = logging.getLogger("playlistpilot-render-worker")
@@ -141,10 +142,10 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     width, height = dimensions(str(job.get("format") or editor.get("format") or "9:16"))
     template_id = str(editor.get("template_id") or "bold_center")
     template = {
-        "bold_center": {"font_ratio": 0.078, "safe_x": 0.08, "safe_top": 0.18, "safe_bottom": 0.72, "vertical": "center", "cover_ratio": 0.42},
-        "editorial_top": {"font_ratio": 0.064, "safe_x": 0.07, "safe_top": 0.10, "safe_bottom": 0.49, "vertical": "top", "cover_ratio": 0.34},
-        "minimal_bottom": {"font_ratio": 0.052, "safe_x": 0.07, "safe_top": 0.58, "safe_bottom": 0.84, "vertical": "top", "cover_ratio": 0.30},
-    }.get(template_id, {"font_ratio": 0.078, "safe_x": 0.08, "safe_top": 0.18, "safe_bottom": 0.72, "vertical": "center", "cover_ratio": 0.42})
+        "bold_center": {"font_ratio": 0.082, "safe_x": 0.11, "safe_top": 0.20, "safe_bottom": 0.57, "vertical": "center", "cover_ratio": 0.40},
+        "editorial_top": {"font_ratio": 0.068, "safe_x": 0.11, "safe_top": 0.17, "safe_bottom": 0.48, "vertical": "top", "cover_ratio": 0.29},
+        "minimal_bottom": {"font_ratio": 0.056, "safe_x": 0.11, "safe_top": 0.54, "safe_bottom": 0.75, "vertical": "center", "cover_ratio": 0.25},
+    }.get(template_id, {"font_ratio": 0.082, "safe_x": 0.11, "safe_top": 0.20, "safe_bottom": 0.57, "vertical": "center", "cover_ratio": 0.40})
     clip_start = max(0.0, float(editor.get("trim_start", editor.get("clip_start", 0)) or 0))
     clip_end = max(clip_start + 0.2, float(editor.get("trim_end", editor.get("clip_end", clip_start + 15)) or clip_start + 15))
     duration = min(30.0, clip_end - clip_start)
@@ -152,7 +153,7 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     hook_end = min(duration, max(hook_start + 0.2, float(editor.get("hook_end") or 4)))
     hook_position = str(editor.get("hook_position") or "center")
     if template_id == "bold_center":
-        position_zones = {"top": (0.10, 0.43, "top"), "center": (0.18, 0.72, "center"), "bottom": (0.57, 0.84, "top")}
+        position_zones = {"top": (0.17, 0.47, "top"), "center": (0.20, 0.57, "center"), "bottom": (0.52, 0.75, "center")}
         safe_top, safe_bottom, vertical = position_zones.get(hook_position, position_zones["center"])
     else:
         safe_top, safe_bottom, vertical = template["safe_top"], template["safe_bottom"], template["vertical"]
@@ -166,6 +167,7 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     overlay = min(0.85, max(0.0, float(editor.get("overlay_opacity", editor.get("overlay_strength", 0.28)) or 0.0)))
     hook = str(editor.get("hook_text") or job.get("hook_text") or "").strip()
     cta = str(editor.get("cta_text") or "").strip()
+    playlist_name = str(job.get("playlist_name") or "").strip()
     show_cta = bool(editor.get("show_cta", True)) and bool(cta)
     show_cover = bool(editor.get("show_cover", True)) and bool(job.get("playlist_cover_url"))
 
@@ -173,16 +175,23 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     output = workdir / "render.mp4"
     hook_file = workdir / "hook.txt"
     cta_file = workdir / "cta.txt"
+    playlist_file = workdir / "playlist.txt"
     download(str(job["video_url"]), source)
+    hook_fit_width = safe_width - (max(22, int(width * 0.04)) if template_id == "editorial_top" else 0)
     fitted_hook, hook_font_size, hook_line_spacing = fit_text(
-        hook, safe_width, safe_height, max(34, int(width * template["font_ratio"])), max(24, int(width * 0.038))
+        hook, hook_fit_width, safe_height, max(34, int(width * template["font_ratio"])), max(24, int(width * 0.038))
     )
     fitted_cta, cta_font_size, cta_line_spacing = fit_text(
-        cta, int(width * 0.84), int(height * 0.11), max(24, int(width * 0.043)), max(18, int(width * 0.027))
+        cta.upper(), int(width * 0.72), int(height * 0.08), max(18, int(width * 0.029)), max(15, int(width * 0.023))
+    )
+    playlist_width = int(width * (0.74 if template_id == "bold_center" else 0.44))
+    fitted_playlist, playlist_font_size, playlist_line_spacing = fit_text(
+        playlist_name, playlist_width, int(height * 0.13), max(25, int(width * 0.044)), max(18, int(width * 0.028))
     )
     hook_y = str(safe_top_px) if vertical == "top" else f"{safe_top_px}+({safe_height}-text_h)/2"
     hook_file.write_text(fitted_hook, encoding="utf-8")
     cta_file.write_text(fitted_cta, encoding="utf-8")
+    playlist_file.write_text(fitted_playlist, encoding="utf-8")
 
     command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{clip_start:.3f}", "-i", str(source)]
     cover = workdir / "cover.jpg"
@@ -192,25 +201,78 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
 
     filters = [f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},drawbox=x=0:y=0:w=iw:h=ih:color=black@{overlay:.3f}:t=fill[base]"]
     current = "base"
+    accent_color = str(editor.get("accent_color") or "#1ed760").replace("#", "0x")
+    reveal_start = min(duration, 4.0)
+    safe_bottom_ratio = 0.80 if height / width > 1.5 else 0.88
+    cta_bottom = int(height * (1.0 - safe_bottom_ratio))
+    cover_size = max(150, int(width * template["cover_ratio"]))
+    if template_id == "bold_center":
+        cover_x = int((width - cover_size) / 2)
+        cover_y = int(height * 0.34)
+        playlist_x = "(w-text_w)/2"
+        playlist_y = cover_y + cover_size + max(20, int(height * 0.022))
+    else:
+        cover_x = safe_x
+        cover_y = int(height * (0.31 if template_id == "editorial_top" else 0.20))
+        playlist_x = str(cover_x + cover_size + max(22, int(width * 0.035)))
+        playlist_y = cover_y + max(4, int(height * 0.008))
     if show_cover:
-        cover_size = max(160, int(width * template["cover_ratio"]))
-        filters.append(f"[1:v]scale={cover_size}:{cover_size}:force_original_aspect_ratio=decrease[cover]")
-        filters.append(f"[{current}][cover]overlay=(W-w)/2:H-h-{max(100, int(height * 0.10))}:enable='between(t,4,{duration:.3f})'[covered]")
+        shadow_pad = max(8, int(width * 0.018))
+        filters.append(
+            f"[{current}]drawbox=x={cover_x-shadow_pad}:y={cover_y-shadow_pad}:w={cover_size+shadow_pad*2}:h={cover_size+shadow_pad*2}:"
+            f"color=black@0.38:t=fill:enable='between(t,{reveal_start:.3f},{duration:.3f})'[coverbase]"
+        )
+        filters.append(f"[1:v]scale={cover_size}:{cover_size}:force_original_aspect_ratio=increase,crop={cover_size}:{cover_size}[cover]")
+        filters.append(f"[coverbase][cover]overlay={cover_x}:{cover_y}:enable='between(t,{reveal_start:.3f},{duration:.3f})'[covered]")
         current = "covered"
 
     text_filters = []
     if hook:
+        label_font_size = max(15, int(width * 0.024))
+        label_x = "(w-text_w)/2" if template_id == "bold_center" else str(safe_x)
+        label_y = max(int(height * 0.11), safe_top_px - max(30, int(height * 0.038)))
+        text_filters.append(
+            "drawtext="
+            f"fontfile='{FONT_REGULAR_FILE}':text='CURATED PLAYLIST':fontcolor={accent_color}:fontsize={label_font_size}:"
+            f"x={label_x}:y={label_y}:fix_bounds=1:shadowcolor=black@0.5:shadowx=1:shadowy=2:"
+            f"enable='between(t,{hook_start:.3f},{hook_end:.3f})'"
+        )
+        if template_id == "editorial_top":
+            text_filters.append(
+                f"drawbox=x={safe_x}:y={safe_top_px}:w={max(5, int(width * 0.009))}:h={safe_height}:color={accent_color}@1:t=fill:"
+                f"enable='between(t,{hook_start:.3f},{hook_end:.3f})'"
+            )
+            hook_x = str(safe_x + max(22, int(width * 0.04)))
+        elif template_id == "minimal_bottom":
+            panel_pad = max(18, int(width * 0.035))
+            text_filters.append(
+                f"drawbox=x={safe_x-panel_pad}:y={safe_top_px-panel_pad}:w={safe_width+panel_pad*2}:h={safe_height+panel_pad*2}:"
+                f"color=black@0.42:t=fill:enable='between(t,{hook_start:.3f},{hook_end:.3f})'"
+            )
+        else:
+            accent_width = int(width * 0.12)
+            text_filters.append(
+                f"drawbox=x=(iw-{accent_width})/2:y={safe_top_px+safe_height+max(14, int(height*0.012))}:w={accent_width}:h={max(5, int(height*0.005))}:"
+                f"color={accent_color}@1:t=fill:enable='between(t,{hook_start:.3f},{hook_end:.3f})'"
+            )
         text_filters.append(
             "drawtext="
             f"fontfile='{FONT_FILE}':textfile='{hook_file}':fontcolor={text_color}:fontsize={hook_font_size}:"
-            f"line_spacing={hook_line_spacing}:x={hook_x}:y={hook_y}:fix_bounds=1:shadowcolor=black@0.82:shadowx=3:shadowy=3:"
+            f"line_spacing={hook_line_spacing}:x={hook_x}:y={hook_y}:fix_bounds=1:shadowcolor=black@0.55:shadowx=2:shadowy=3:"
             f"enable='between(t,{hook_start:.3f},{hook_end:.3f})'"
+        )
+    if show_cover and playlist_name:
+        text_filters.append(
+            "drawtext="
+            f"fontfile='{FONT_FILE}':textfile='{playlist_file}':fontcolor=white:fontsize={playlist_font_size}:line_spacing={playlist_line_spacing}:"
+            f"x={playlist_x}:y={playlist_y}:fix_bounds=1:shadowcolor=black@0.65:shadowx=2:shadowy=2:"
+            f"enable='between(t,{reveal_start:.3f},{duration:.3f})'"
         )
     if show_cta:
         text_filters.append(
             "drawtext="
-            f"fontfile='{FONT_FILE}':textfile='{cta_file}':fontcolor=white:fontsize={cta_font_size}:line_spacing={cta_line_spacing}:"
-            f"x=(w-text_w)/2:y=h-text_h-{max(38, int(height * 0.035))}:fix_bounds=1:shadowcolor=black@0.75:shadowx=2:shadowy=2:"
+            f"fontfile='{FONT_REGULAR_FILE}':textfile='{cta_file}':fontcolor=white:fontsize={cta_font_size}:line_spacing={cta_line_spacing}:"
+            f"x=(w-text_w)/2:y=h-text_h-{cta_bottom}:fix_bounds=1:shadowcolor=black@0.65:shadowx=2:shadowy=2:"
             f"enable='between(t,{max(0.0, duration - 4):.3f},{duration:.3f})'"
         )
     tail = ",".join(text_filters + ["format=yuv420p"])
