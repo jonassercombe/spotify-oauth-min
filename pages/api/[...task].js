@@ -779,7 +779,11 @@ async function metaGraphMutation(connection, path, params = {}) {
     if (!response.ok || payload?.error) {
       const code = payload?.error?.code || response.status;
       const message = payload?.error?.message || `Meta request failed (${response.status})`;
-      throw new Error(`meta_graph_${code}: ${message}`);
+      const subcode = payload?.error?.error_subcode ? ` subcode ${payload.error.error_subcode}` : "";
+      const rawErrorData = payload?.error?.error_data;
+      const errorData = typeof rawErrorData === "string" ? rawErrorData : rawErrorData ? JSON.stringify(rawErrorData) : "";
+      const detail = payload?.error?.error_user_msg || payload?.error?.error_user_title || rawErrorData?.details || errorData;
+      throw new Error(`meta_graph_${code}${subcode}: ${message}${detail ? ` — ${detail}` : ""}`);
     }
     return payload || {};
   } finally {
