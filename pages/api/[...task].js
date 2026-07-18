@@ -2577,7 +2577,7 @@ const routes = {
           name: `${draft.name} — Creative`,
           object_story_spec: JSON.stringify({
             page_id: page.meta_id,
-            instagram_actor_id: String(instagramActor.id),
+            instagram_user_id: String(instagramActor.id),
             link_data: {
               message: draft.primary_text,
               link: draft.destination_url,
