@@ -9,6 +9,7 @@ import os
 import socket
 import subprocess
 import tempfile
+import textwrap
 import time
 import urllib.error
 import urllib.request
@@ -79,15 +80,22 @@ def probe_duration(path: Path) -> float:
 def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     editor = job.get("editor") or {}
     width, height = dimensions(str(job.get("format") or editor.get("format") or "9:16"))
-    clip_start = max(0.0, float(editor.get("clip_start") or 0))
-    clip_end = max(clip_start + 0.2, float(editor.get("clip_end") or clip_start + 15))
+    template_id = str(editor.get("template_id") or "bold_center")
+    template = {
+        "bold_center": {"font_ratio": 0.078, "wrap": 20, "hook_y": "(h-text_h)/2", "hook_x": "(w-text_w)/2", "cover_ratio": 0.42},
+        "editorial_top": {"font_ratio": 0.064, "wrap": 25, "hook_y": "h*0.13", "hook_x": "w*0.07", "cover_ratio": 0.34},
+        "minimal_bottom": {"font_ratio": 0.052, "wrap": 30, "hook_y": "h*0.68", "hook_x": "w*0.07", "cover_ratio": 0.30},
+    }.get(template_id, {"font_ratio": 0.078, "wrap": 20, "hook_y": "(h-text_h)/2", "hook_x": "(w-text_w)/2", "cover_ratio": 0.42})
+    clip_start = max(0.0, float(editor.get("trim_start", editor.get("clip_start", 0)) or 0))
+    clip_end = max(clip_start + 0.2, float(editor.get("trim_end", editor.get("clip_end", clip_start + 15)) or clip_start + 15))
     duration = min(30.0, clip_end - clip_start)
     hook_start = max(0.0, float(editor.get("hook_start") or 0))
     hook_end = min(duration, max(hook_start + 0.2, float(editor.get("hook_end") or 4)))
     hook_position = str(editor.get("hook_position") or "center")
-    hook_y = {"top": "h*0.13", "bottom": "h*0.72"}.get(hook_position, "(h-text_h)/2")
+    hook_y = template["hook_y"] if template_id in {"editorial_top", "minimal_bottom"} else {"top": "h*0.13", "bottom": "h*0.72"}.get(hook_position, template["hook_y"])
+    hook_x = template["hook_x"]
     text_color = str(editor.get("text_color") or "#ffffff").replace("#", "0x")
-    overlay = min(0.8, max(0.0, float(editor.get("overlay_strength") or 0.3)))
+    overlay = min(0.85, max(0.0, float(editor.get("overlay_opacity", editor.get("overlay_strength", 0.28)) or 0.0)))
     hook = str(editor.get("hook_text") or job.get("hook_text") or "").strip()
     cta = str(editor.get("cta_text") or "").strip()
     show_cta = bool(editor.get("show_cta", True)) and bool(cta)
@@ -98,8 +106,8 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     hook_file = workdir / "hook.txt"
     cta_file = workdir / "cta.txt"
     download(str(job["video_url"]), source)
-    hook_file.write_text(hook, encoding="utf-8")
-    cta_file.write_text(cta, encoding="utf-8")
+    hook_file.write_text("\n".join(textwrap.wrap(hook, width=template["wrap"], break_long_words=False, break_on_hyphens=False)), encoding="utf-8")
+    cta_file.write_text("\n".join(textwrap.wrap(cta, width=36, break_long_words=False, break_on_hyphens=False)), encoding="utf-8")
 
     command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{clip_start:.3f}", "-i", str(source)]
     cover = workdir / "cover.jpg"
@@ -110,7 +118,7 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     filters = [f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},drawbox=x=0:y=0:w=iw:h=ih:color=black@{overlay:.3f}:t=fill[base]"]
     current = "base"
     if show_cover:
-        cover_size = max(180, int(width * 0.42))
+        cover_size = max(160, int(width * template["cover_ratio"]))
         filters.append(f"[1:v]scale={cover_size}:{cover_size}:force_original_aspect_ratio=decrease[cover]")
         filters.append(f"[{current}][cover]overlay=(W-w)/2:H-h-{max(100, int(height * 0.10))}:enable='between(t,4,{duration:.3f})'[covered]")
         current = "covered"
@@ -119,8 +127,8 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     if hook:
         text_filters.append(
             "drawtext="
-            f"fontfile='{FONT_FILE}':textfile='{hook_file}':fontcolor={text_color}:fontsize={max(36, int(width * 0.075))}:"
-            f"x=(w-text_w)/2:y={hook_y}:shadowcolor=black@0.75:shadowx=3:shadowy=3:"
+            f"fontfile='{FONT_FILE}':textfile='{hook_file}':fontcolor={text_color}:fontsize={max(34, int(width * template['font_ratio']))}:"
+            f"line_spacing={max(4, int(width * 0.012))}:x={hook_x}:y={hook_y}:shadowcolor=black@0.82:shadowx=3:shadowy=3:"
             f"enable='between(t,{hook_start:.3f},{hook_end:.3f})'"
         )
     if show_cta:

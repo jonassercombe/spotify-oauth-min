@@ -1019,13 +1019,15 @@ function normalizeCreativeRenderSpec(body = {}, asset) {
   const trimStart = Math.max(0, Math.min(duration - 0.5, Number(body.trim_start) || 0));
   const requestedEnd = Number(body.trim_end);
   const trimEnd = Math.max(trimStart + 0.5, Math.min(duration, Number.isFinite(requestedEnd) ? requestedEnd : Math.min(duration, trimStart + 15)));
-  const hookStart = Math.max(trimStart, Math.min(trimEnd - 0.25, Number(body.hook_start) || trimStart));
-  const hookEnd = Math.max(hookStart + 0.25, Math.min(trimEnd, Number(body.hook_end) || Math.min(trimEnd, hookStart + 4)));
+  const renderDuration = trimEnd - trimStart;
+  const hookStart = Math.max(0, Math.min(renderDuration - 0.25, Number(body.hook_start) || 0));
+  const hookEnd = Math.max(hookStart + 0.25, Math.min(renderDuration, Number(body.hook_end) || Math.min(renderDuration, hookStart + 4)));
   const hookPosition = ["top", "center", "bottom"].includes(body.hook_position) ? body.hook_position : "center";
   const textAlign = ["left", "center", "right"].includes(body.text_align) ? body.text_align : "center";
   const coverPosition = ["top", "center", "bottom"].includes(body.cover_position) ? body.cover_position : "bottom";
   return {
-    version: 1,
+    version: 2,
+    template_id: ["bold_center", "editorial_top", "minimal_bottom"].includes(body.template_id) ? body.template_id : "bold_center",
     asset_id: asset.id,
     format: ["9:16", "4:5", "1:1"].includes(body.format) ? body.format : "9:16",
     hook_text: String(body.hook_text || "").replace(/\s+/g, " ").trim().slice(0, 120),
@@ -1045,6 +1047,16 @@ function normalizeCreativeRenderSpec(body = {}, asset) {
     show_cta: body.show_cta !== false,
     updated_at: new Date().toISOString(),
   };
+}
+
+const CREATIVE_RENDER_TEMPLATES = [
+  { id: "bold_center", name: "Bold Center", description: "Large centered hook, cover reveal and strong CTA.", hook_position: "center", text_align: "center" },
+  { id: "editorial_top", name: "Editorial Top", description: "Left-aligned headline in the upper safe zone.", hook_position: "top", text_align: "left" },
+  { id: "minimal_bottom", name: "Minimal Bottom", description: "Compact lower-third hook with a restrained CTA.", hook_position: "bottom", text_align: "left" },
+];
+
+function creativeTemplate(id) {
+  return CREATIVE_RENDER_TEMPLATES.find((template) => template.id === id) || CREATIVE_RENDER_TEMPLATES[0];
 }
 
 function json2VideoDimensions(format) {
@@ -3048,6 +3060,67 @@ const routes = {
     return json(res, 201, { job, reused: false });
   },
 
+  /* ---------- meta/creative-renders/batch (POST) ---------- */
+  "meta/creative-renders/batch": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+    const body = await readBody(req);
+    const projectId = String(body.project_id || "").trim();
+    if (!/^[0-9a-f-]{36}$/i.test(projectId)) return bad(res, 400, "creative_project_required");
+    const projectResponse = await sb(
+      `/rest/v1/meta_creative_projects?select=*&limit=1&id=eq.${encodeURIComponent(projectId)}` +
+      `&connection_id=eq.${encodeURIComponent(connection.id)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}`
+    );
+    const project = projectResponse.ok ? (await projectResponse.json().catch(() => []))[0] : null;
+    if (!project) return bad(res, 404, "creative_project_not_found");
+    const requestedTemplates = Array.isArray(body.template_ids) ? body.template_ids : [body.template_id || "bold_center"];
+    const templateIds = [...new Set(requestedTemplates.map((id) => creativeTemplate(String(id)).id))].slice(0, 3);
+    const requestedConceptIds = Array.isArray(body.concept_ids) ? body.concept_ids.filter((id) => /^[0-9a-f-]{36}$/i.test(String(id))) : [];
+    const conceptFilter = requestedConceptIds.length ? `&id=in.(${requestedConceptIds.map(encodeURIComponent).join(",")})` : "";
+    const conceptsResponse = await sb(`/rest/v1/meta_creative_concepts?select=*&project_id=eq.${encodeURIComponent(projectId)}${conceptFilter}&order=position.asc`);
+    const concepts = conceptsResponse.ok ? await conceptsResponse.json().catch(() => []) : [];
+    const ready = concepts.filter((concept) => concept.render_spec?.editor?.asset_id && concept.render_spec?.editor?.hook_text);
+    if (!ready.length) return bad(res, 409, "no_render_ready_concepts");
+    const activeResponse = await sb(`/rest/v1/meta_creative_render_jobs?select=concept_id,render_spec&project_id=eq.${encodeURIComponent(projectId)}&status=in.(queued,processing)`);
+    const active = activeResponse.ok ? await activeResponse.json().catch(() => []) : [];
+    const activeKeys = new Set(active.map((job) => `${job.concept_id}:${job.render_spec?.editor?.template_id || "bold_center"}`));
+    const batchId = randomUUID();
+    const queued = [];
+    for (const concept of ready) {
+      for (const templateId of templateIds) {
+        if (activeKeys.has(`${concept.id}:${templateId}`)) continue;
+        const template = creativeTemplate(templateId);
+        queued.push({
+          project_id: projectId,
+          concept_id: concept.id,
+          status: "queued",
+          priority: 100,
+          render_spec: {
+            provider: "playlistpilot_ffmpeg",
+            batch_id: batchId,
+            template: { id: template.id, name: template.name },
+            editor: { ...concept.render_spec.editor, template_id: template.id, hook_position: template.hook_position, text_align: template.text_align },
+          },
+        });
+      }
+    }
+    if (!queued.length) return json(res, 200, { batch_id: batchId, jobs: [], skipped: ready.length * templateIds.length, templates: CREATIVE_RENDER_TEMPLATES });
+    if (queued.length > 24) return bad(res, 400, "creative_batch_too_large");
+    const insertResponse = await sb(`/rest/v1/meta_creative_render_jobs`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(queued) });
+    const insertText = await insertResponse.text();
+    if (!insertResponse.ok) return bad(res, 500, `creative_render_batch_save_failed: ${insertText.slice(0, 500)}`);
+    const jobs = JSON.parse(insertText || "[]");
+    const now = new Date().toISOString();
+    await Promise.all([
+      ...ready.map((concept) => sb(`/rest/v1/meta_creative_concepts?id=eq.${encodeURIComponent(concept.id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "render_queued", updated_at: now }) })),
+      sb(`/rest/v1/meta_creative_projects?id=eq.${encodeURIComponent(projectId)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "rendering", current_step: 5, last_error: null, updated_at: now }) }),
+    ]);
+    return json(res, 201, { batch_id: batchId, jobs, skipped: ready.length * templateIds.length - jobs.length, templates: CREATIVE_RENDER_TEMPLATES });
+  },
+
   /* ---------- meta/creative-renders/sync (POST) ---------- */
   "meta/creative-renders/sync": async (req, res) => {
     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
@@ -3129,14 +3202,21 @@ const routes = {
     const storagePath = `${owner}/renders/${job.id}.mp4`;
     const publicUrl = `${need("SUPABASE_URL")}/storage/v1/object/public/meta-ad-creatives/${storagePath.split("/").map(encodeURIComponent).join("/")}`;
     const now = new Date().toISOString();
-    const assetInsert = await sb(`/rest/v1/meta_creative_assets`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify([{ project_id: job.project_id, concept_id: job.concept_id, asset_type: "render", source: "render_worker", provider_id: job.id, source_url: publicUrl, storage_path: storagePath, mime_type: "video/mp4", duration_seconds: Math.max(0, Number(body.duration_seconds || 0)) || null, width: Math.max(0, Number.parseInt(body.width, 10) || 0) || null, height: Math.max(0, Number.parseInt(body.height, 10) || 0) || null, metadata: { provider: "playlistpilot_ffmpeg", worker_id: identity, bytes: Math.max(0, Number(body.bytes || 0)) || null }, updated_at: now }]) });
+    const template = creativeTemplate(job.render_spec?.template?.id || job.render_spec?.editor?.template_id);
+    const assetInsert = await sb(`/rest/v1/meta_creative_assets`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify([{ project_id: job.project_id, concept_id: job.concept_id, asset_type: "render", source: "render_worker", provider_id: job.id, source_url: publicUrl, storage_path: storagePath, mime_type: "video/mp4", duration_seconds: Math.max(0, Number(body.duration_seconds || 0)) || null, width: Math.max(0, Number.parseInt(body.width, 10) || 0) || null, height: Math.max(0, Number.parseInt(body.height, 10) || 0) || null, metadata: { provider: "playlistpilot_ffmpeg", worker_id: identity, bytes: Math.max(0, Number(body.bytes || 0)) || null, template_id: template.id, template_name: template.name, batch_id: job.render_spec?.batch_id || null }, updated_at: now }]) });
     const assetText = await assetInsert.text();
     if (!assetInsert.ok) return bad(res, 500, `creative_render_asset_save_failed: ${assetText.slice(0, 500)}`);
     const outputAsset = JSON.parse(assetText || "[]")[0];
     const completeResponse = await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(job.id)}&status=eq.processing&worker_id=eq.${encodeURIComponent(identity)}`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ status: "completed", output_asset_id: outputAsset.id, finished_at: now, updated_at: now, error_code: null, error_message: null }) });
+    const [conceptActiveResponse, projectActiveResponse] = await Promise.all([
+      sb(`/rest/v1/meta_creative_render_jobs?select=id&concept_id=eq.${encodeURIComponent(job.concept_id)}&status=in.(queued,processing)&limit=1`),
+      sb(`/rest/v1/meta_creative_render_jobs?select=id&project_id=eq.${encodeURIComponent(job.project_id)}&status=in.(queued,processing)&limit=1`),
+    ]);
+    const conceptHasActiveJobs = conceptActiveResponse.ok && (await conceptActiveResponse.json().catch(() => [])).length > 0;
+    const projectHasActiveJobs = projectActiveResponse.ok && (await projectActiveResponse.json().catch(() => [])).length > 0;
     await Promise.all([
-      sb(`/rest/v1/meta_creative_concepts?id=eq.${encodeURIComponent(job.concept_id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "rendered", updated_at: now }) }),
-      sb(`/rest/v1/meta_creative_projects?id=eq.${encodeURIComponent(job.project_id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "review", current_step: 6, last_error: null, updated_at: now }) }),
+      sb(`/rest/v1/meta_creative_concepts?id=eq.${encodeURIComponent(job.concept_id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: conceptHasActiveJobs ? "render_queued" : "rendered", updated_at: now }) }),
+      sb(`/rest/v1/meta_creative_projects?id=eq.${encodeURIComponent(job.project_id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: projectHasActiveJobs ? "rendering" : "review", current_step: projectHasActiveJobs ? 5 : 6, last_error: null, updated_at: now }) }),
     ]);
     return json(res, 200, { job: completeResponse.ok ? (await completeResponse.json().catch(() => []))[0] : job, asset: outputAsset });
   },
