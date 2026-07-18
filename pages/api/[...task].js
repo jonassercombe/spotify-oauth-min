@@ -1037,11 +1037,15 @@ function creativeMediaRecommendationSchema(candidateIds) {
         items: {
           type: "object",
           additionalProperties: false,
-          required: ["video_id", "overall_score", "concept_match", "hook_space", "visual_quality", "vertical_suitability", "brand_safety", "production_ready", "rejection_reason", "best_template", "summary"],
+          required: ["video_id", "creative_mode", "match_type", "overall_score", "concept_match", "scroll_stop", "originality", "hook_space", "visual_quality", "vertical_suitability", "brand_safety", "production_ready", "rejection_reason", "best_template", "summary"],
           properties: {
             video_id: { type: "string", enum: candidateIds },
+            creative_mode: { type: "string", enum: ["safe", "creative", "wildcard"] },
+            match_type: { type: "string", enum: ["literal", "emotional", "contrast"] },
             overall_score: { type: "integer", minimum: 0, maximum: 100 },
             concept_match: { type: "integer", minimum: 0, maximum: 100 },
+            scroll_stop: { type: "integer", minimum: 0, maximum: 100 },
+            originality: { type: "integer", minimum: 0, maximum: 100 },
             hook_space: { type: "integer", minimum: 0, maximum: 100 },
             visual_quality: { type: "integer", minimum: 0, maximum: 100 },
             vertical_suitability: { type: "integer", minimum: 0, maximum: 100 },
@@ -1060,7 +1064,7 @@ function creativeMediaRecommendationSchema(candidateIds) {
 async function recommendCreativeMediaWithOpenAI({ concept, project, candidates }) {
   const content = [{
     type: "input_text",
-    text: `Select up to six diverse stock-video candidates for this playlist ad concept. Rank the best first. Judge actual concept fit, usable negative space for overlay text, visual quality, portrait suitability and commercial brand safety. Avoid near-duplicate scenes. Recommend the layout that preserves the subject. Do not infer facts not visible in the supplied preview frames. A primary stock clip only needs to communicate the hook and one clear core moment in the first seconds; it is not expected to depict every later beat of the multi-shot story. Missing secondary beats must not cause rejection. Set production_ready=false when the central visible action, object, person or setting contradicts the premise, is unrelated or too ambiguous to support the hook, or when there is a brand-safety problem. An attractive insert that does not communicate the hook remains not ready. Use rejection_reason only to explain a material blocker; otherwise return an empty string.\n\nConcept: ${concept.title}\nHook: ${concept.hook}\nAngle: ${concept.angle}\nStory: ${concept.story}\nVisual direction: ${concept.visual_direction}\nFormat: ${project.format}`,
+    text: `Act as a performance creative director, not a literal storyboard checker. Select up to six diverse stock-video candidates for this playlist ad concept and rank the strongest first. Build a useful test portfolio: SAFE candidates communicate the premise immediately and usually match literally; CREATIVE candidates match the emotion or idea without illustrating every word; WILDCARD candidates create an intentional, memorable contrast or pattern interrupt that can make the hook more interesting. Include all three modes when the footage supports them. A non-literal or strange image is not a flaw when its relationship to the hook can be explained clearly. Classify match_type as literal, emotional or contrast. Score scroll-stop potential and originality separately from concept fit, plus usable text space, visual quality, portrait suitability and commercial brand safety. Recommend the layout that preserves the subject. Do not infer facts not visible in the supplied preview frames. A primary stock clip only needs to communicate the hook, emotion or deliberate creative tension in the first seconds; it is not expected to depict every later story beat. Set production_ready=false only for a material blocker: unusable quality/crop, brand-safety risk, accidental or confusing contradiction, or no defensible relationship to the hook. A deliberate contrast with a crisp rationale can be production-ready. Use rejection_reason only for a material blocker; otherwise return an empty string.\n\nConcept: ${concept.title}\nHook: ${concept.hook}\nAngle: ${concept.angle}\nStory: ${concept.story}\nVisual direction: ${concept.visual_direction}\nFormat: ${project.format}`,
   }];
   for (const candidate of candidates) {
     content.push({ type: "input_text", text: `Candidate video_id=${candidate.id}; duration=${candidate.duration}s; dimensions=${candidate.source_width}x${candidate.source_height}. The following images are preview frames from this candidate.` });
@@ -3092,12 +3096,16 @@ const routes = {
         ai_recommendation: body.ai && typeof body.ai === "object" ? {
           overall_score: Math.max(0, Math.min(100, Number(body.ai.overall_score) || 0)),
           concept_match: Math.max(0, Math.min(100, Number(body.ai.concept_match) || 0)),
+          scroll_stop: Math.max(0, Math.min(100, Number(body.ai.scroll_stop) || 0)),
+          originality: Math.max(0, Math.min(100, Number(body.ai.originality) || 0)),
           hook_space: Math.max(0, Math.min(100, Number(body.ai.hook_space) || 0)),
           visual_quality: Math.max(0, Math.min(100, Number(body.ai.visual_quality) || 0)),
           vertical_suitability: Math.max(0, Math.min(100, Number(body.ai.vertical_suitability) || 0)),
           brand_safety: Math.max(0, Math.min(100, Number(body.ai.brand_safety) || 0)),
           production_ready: body.ai.production_ready === true,
           rejection_reason: String(body.ai.rejection_reason || "").slice(0, 180),
+          creative_mode: ["safe", "creative", "wildcard"].includes(body.ai.creative_mode) ? body.ai.creative_mode : "safe",
+          match_type: ["literal", "emotional", "contrast"].includes(body.ai.match_type) ? body.ai.match_type : "literal",
           best_template: ["bold_center", "editorial_top", "minimal_bottom"].includes(body.ai.best_template) ? body.ai.best_template : "bold_center",
           summary: String(body.ai.summary || "").slice(0, 240),
         } : null,
