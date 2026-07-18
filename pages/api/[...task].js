@@ -957,7 +957,7 @@ function normalizePexelsVideo(video) {
     const width = Number(file.width || 0);
     const height = Number(file.height || 0);
     const portraitBonus = height > width ? 10000000 : 0;
-    const sensibleSize = width <= 1080 && height <= 1920 ? 5000000 : 0;
+    const sensibleSize = width <= 1080 && height <= 1920 ? 50000000 : 0;
     return { ...file, _score: portraitBonus + sensibleSize + width * height };
   }).sort((a, b) => b._score - a._score);
   const source = scored[0] || files[0];
@@ -2814,6 +2814,17 @@ const routes = {
       headers: { Prefer: "return=minimal" },
       body: JSON.stringify({ status: "media_ready", updated_at: new Date().toISOString() }),
     });
+    const remainingResponse = await sb(
+      `/rest/v1/meta_creative_concepts?select=id&project_id=eq.${encodeURIComponent(owned.project.id)}&status=neq.media_ready&limit=1`
+    );
+    const remaining = remainingResponse.ok ? await remainingResponse.json().catch(() => [{}]) : [{}];
+    if (!remaining.length) {
+      await sb(`/rest/v1/meta_creative_projects?id=eq.${encodeURIComponent(owned.project.id)}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({ status: "render_ready", current_step: 4, updated_at: new Date().toISOString() }),
+      });
+    }
     return json(res, 201, { asset: JSON.parse(insertText || "[]")[0], reused: false });
   },
 
