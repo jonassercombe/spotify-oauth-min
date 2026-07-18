@@ -2508,6 +2508,7 @@ const routes = {
       if (!draft.meta_campaign_id) {
         const campaign = await metaGraphMutation(connection, `act_${adAccount.meta_id}/campaigns`, {
           name: draft.name, objective: "OUTCOME_TRAFFIC", configured_status: "PAUSED", special_ad_categories: "[]",
+          is_adset_budget_sharing_enabled: "false",
         });
         if (!campaign.id) throw new Error("meta_campaign_id_missing");
         await persistDraft({ meta_campaign_id: String(campaign.id), creation_stage: "campaign" });
