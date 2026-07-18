@@ -2547,6 +2547,7 @@ const routes = {
           daily_budget: String(draft.daily_budget_minor),
           billing_event: "IMPRESSIONS",
           optimization_goal: "LINK_CLICKS",
+          bid_strategy: "LOWEST_COST_WITHOUT_CAP",
           destination_type: "WEBSITE",
           dsa_beneficiary: connection.dsa_beneficiary || undefined,
           dsa_payor: connection.dsa_payor || undefined,
