@@ -2181,7 +2181,7 @@ export default function PlaylistManager() {
             body: { concept_id: concept.id, query },
           });
           const recommendations = data.recommendations || [];
-          const selected = recommendations.find((video) => !usedVideoIds.has(video.id)) || recommendations[0] || null;
+          const selected = recommendations.find((video) => video.ai?.production_ready === true && Number(video.ai?.overall_score || 0) >= 82 && !usedVideoIds.has(video.id)) || null;
           if (selected) usedVideoIds.add(selected.id);
           results[concept.id] = { concept, recommendations, selected_id: selected?.id || "", inspected: data.inspected || 0, queries: data.queries || [] };
         } catch (error) {
@@ -3639,6 +3639,7 @@ export default function PlaylistManager() {
                 const batchActive = batchJobs.some((job) => ["queued", "processing"].includes(job.status));
                 const projectMediaRun = creativeProjectMediaRuns[project.id];
                 const projectMediaResults = Object.values(projectMediaRun?.results || {}).sort((a, b) => Number(a.concept?.position || 0) - Number(b.concept?.position || 0));
+                const assignableMediaCount = projectMediaResults.filter((result) => result.selected_id).length;
                 return <article key={project.id} className={isOpen ? "isOpen" : ""}>
                   <div className="creativeProjectSummary">
                     <Artwork src={project.playlists?.image || project.brief?.cover_image} alt="" size="lg" />
@@ -3653,9 +3654,9 @@ export default function PlaylistManager() {
                       {projectMediaResults.length ? <div className="creativeProjectMediaReview">{projectMediaResults.map((result) => {
                         const selected = result.recommendations.find((video) => video.id === result.selected_id) || result.recommendations[0];
                         if (!selected) return null;
-                        return <article key={result.concept.id}><div className="creativeProjectMediaVisual"><img src={selected.image || selected.preview_images?.[0]} alt="" /><b>{selected.ai?.overall_score || 0}</b></div><div><span>Concept {result.concept.position}</span><h4>{result.concept.title}</h4><strong>{result.concept.hook}</strong><select aria-label={`AI video for ${result.concept.title}`} value={selected.id} onChange={(event) => chooseProjectMedia(project.id, result.concept.id, event.target.value)}>{result.recommendations.map((video, index) => <option key={video.id} value={video.id}>#{index + 1} · {video.ai?.overall_score || 0}/100 · {video.user?.name || "Pexels"}</option>)}</select><p>{selected.ai?.summary}</p><small>{selected.ai?.best_template?.replaceAll("_", " ")} · {selected.duration}s · {selected.source_width}×{selected.source_height}</small></div></article>;
+                        return <article key={result.concept.id} className={result.selected_id ? "isApproved" : "needsReview"}><div className="creativeProjectMediaVisual"><img src={selected.image || selected.preview_images?.[0]} alt="" /><b>{selected.ai?.overall_score || 0}</b></div><div><span>Concept {result.concept.position} · {result.selected_id ? "AI approved" : "Needs review"}</span><h4>{result.concept.title}</h4><strong>{result.concept.hook}</strong><select aria-label={`AI video for ${result.concept.title}`} value={result.selected_id || ""} onChange={(event) => chooseProjectMedia(project.id, result.concept.id, event.target.value)}><option value="">Choose a clip manually</option>{result.recommendations.map((video, index) => <option key={video.id} value={video.id}>#{index + 1} · {video.ai?.overall_score || 0}/100 · {video.ai?.production_ready ? "ready" : "review"} · {video.user?.name || "Pexels"}</option>)}</select><p>{result.selected_id ? selected.ai?.summary : selected.ai?.rejection_reason || selected.ai?.summary}</p><small>{selected.ai?.best_template?.replaceAll("_", " ")} · {selected.duration}s · {selected.source_width}×{selected.source_height}</small></div></article>;
                       })}</div> : null}
-                      {projectMediaRun?.status === "review" && projectMediaResults.length ? <div className="creativeMediaReviewActions"><button disabled={busy} onClick={() => assignProjectMedia(project)}>Assign {projectMediaResults.length} selected clips</button><small>This saves the selected Pexels assets but does not render videos yet.</small></div> : null}
+                      {projectMediaRun?.status === "review" && projectMediaResults.length ? <div className="creativeMediaReviewActions"><button disabled={busy || !assignableMediaCount} onClick={() => assignProjectMedia(project)}>Assign {assignableMediaCount} approved clip{assignableMediaCount === 1 ? "" : "s"}</button><small>{projectMediaResults.length - assignableMediaCount ? `${projectMediaResults.length - assignableMediaCount} concept${projectMediaResults.length - assignableMediaCount === 1 ? " needs" : "s need"} manual review. ` : ""}This does not render videos yet.</small></div> : null}
                     </section> : null}
                     {readyConcepts.length ? <section className="creativeBatchPanel">
                       <div className="creativeBatchHeader"><div><span>Batch render</span><h3>Turn {readyConcepts.length} ready concept{readyConcepts.length === 1 ? "" : "s"} into variants</h3><p>Select one or more layouts. Every ready concept is rendered once per template.</p></div><button disabled={busy || !batchTemplateIds.length || batchActive} onClick={() => queueCreativeBatch(project)}>{batchActive ? "Rendering…" : `Render ${readyConcepts.length * batchTemplateIds.length} variant${readyConcepts.length * batchTemplateIds.length === 1 ? "" : "s"}`}</button></div>
@@ -6592,6 +6593,9 @@ export default function PlaylistManager() {
         .creativeProjectMediaProgress small { color: #8994a2; }
         .creativeProjectMediaReview { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
         .creativeProjectMediaReview > article { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 10px; overflow: hidden; padding: 9px; border: 1px solid #303a4d; border-radius: 9px; background: #10151d; }
+        .creativeProjectMediaReview > article.isApproved { border-color: rgba(24, 224, 111, .34); }
+        .creativeProjectMediaReview > article.needsReview { border-color: rgba(255, 177, 64, .62); background: rgba(255, 177, 64, .045); }
+        .creativeProjectMediaReview > article.needsReview article span, .creativeProjectMediaReview > article.needsReview span { color: #ffb140; }
         .creativeProjectMediaVisual { position: relative; min-height: 150px; overflow: hidden; border-radius: 7px; background: #080b10; }
         .creativeProjectMediaVisual img { width: 100%; height: 100%; object-fit: cover; }
         .creativeProjectMediaVisual b { position: absolute; top: 6px; left: 6px; padding: 5px 7px; border-radius: 7px; color: #07140c; background: #18e06f; font-size: 14px; }

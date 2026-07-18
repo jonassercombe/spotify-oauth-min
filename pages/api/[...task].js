@@ -1037,7 +1037,7 @@ function creativeMediaRecommendationSchema(candidateIds) {
         items: {
           type: "object",
           additionalProperties: false,
-          required: ["video_id", "overall_score", "concept_match", "hook_space", "visual_quality", "vertical_suitability", "brand_safety", "best_template", "summary"],
+          required: ["video_id", "overall_score", "concept_match", "hook_space", "visual_quality", "vertical_suitability", "brand_safety", "production_ready", "rejection_reason", "best_template", "summary"],
           properties: {
             video_id: { type: "string", enum: candidateIds },
             overall_score: { type: "integer", minimum: 0, maximum: 100 },
@@ -1046,6 +1046,8 @@ function creativeMediaRecommendationSchema(candidateIds) {
             visual_quality: { type: "integer", minimum: 0, maximum: 100 },
             vertical_suitability: { type: "integer", minimum: 0, maximum: 100 },
             brand_safety: { type: "integer", minimum: 0, maximum: 100 },
+            production_ready: { type: "boolean" },
+            rejection_reason: { type: "string", maxLength: 180 },
             best_template: { type: "string", enum: ["bold_center", "editorial_top", "minimal_bottom"] },
             summary: { type: "string", maxLength: 240 },
           },
@@ -1058,7 +1060,7 @@ function creativeMediaRecommendationSchema(candidateIds) {
 async function recommendCreativeMediaWithOpenAI({ concept, project, candidates }) {
   const content = [{
     type: "input_text",
-    text: `Select up to six diverse stock-video candidates for this playlist ad concept. Rank the best first. Judge actual concept fit, usable negative space for overlay text, visual quality, portrait suitability and commercial brand safety. Avoid near-duplicate scenes. Recommend the layout that preserves the subject. Do not infer facts not visible in the supplied preview frames.\n\nConcept: ${concept.title}\nHook: ${concept.hook}\nAngle: ${concept.angle}\nStory: ${concept.story}\nVisual direction: ${concept.visual_direction}\nFormat: ${project.format}`,
+    text: `Select up to six diverse stock-video candidates for this playlist ad concept. Rank the best first. Judge actual concept fit, usable negative space for overlay text, visual quality, portrait suitability and commercial brand safety. Avoid near-duplicate scenes. Recommend the layout that preserves the subject. Do not infer facts not visible in the supplied preview frames. Set production_ready=true only when the clip can carry the ad as its primary visual. If an essential person, action, setting or object from the concept is visibly missing or ambiguous, production_ready must be false even when the footage is attractive; explain that briefly in rejection_reason. An insert shot that merely supports one detail is not production-ready as the primary clip.\n\nConcept: ${concept.title}\nHook: ${concept.hook}\nAngle: ${concept.angle}\nStory: ${concept.story}\nVisual direction: ${concept.visual_direction}\nFormat: ${project.format}`,
   }];
   for (const candidate of candidates) {
     content.push({ type: "input_text", text: `Candidate video_id=${candidate.id}; duration=${candidate.duration}s; dimensions=${candidate.source_width}x${candidate.source_height}. The following images are preview frames from this candidate.` });
@@ -3094,6 +3096,8 @@ const routes = {
           visual_quality: Math.max(0, Math.min(100, Number(body.ai.visual_quality) || 0)),
           vertical_suitability: Math.max(0, Math.min(100, Number(body.ai.vertical_suitability) || 0)),
           brand_safety: Math.max(0, Math.min(100, Number(body.ai.brand_safety) || 0)),
+          production_ready: body.ai.production_ready === true,
+          rejection_reason: String(body.ai.rejection_reason || "").slice(0, 180),
           best_template: ["bold_center", "editorial_top", "minimal_bottom"].includes(body.ai.best_template) ? body.ai.best_template : "bold_center",
           summary: String(body.ai.summary || "").slice(0, 240),
         } : null,
