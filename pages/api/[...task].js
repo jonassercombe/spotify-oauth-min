@@ -2081,11 +2081,17 @@ const routes = {
       ...(accessToken ? { access_token_enc: encToken(accessToken) } : {}),
       ...(appSecret ? { app_secret_enc: encToken(appSecret) } : {}),
     };
-    const response = await sb(`/rest/v1/meta_ads_connections?on_conflict=bubble_user_id`, {
-      method: "POST",
-      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
-      body: JSON.stringify([payload]),
-    });
+    const response = existing
+      ? await sb(`/rest/v1/meta_ads_connections?id=eq.${encodeURIComponent(existing.id)}`, {
+          method: "PATCH",
+          headers: { Prefer: "return=representation" },
+          body: JSON.stringify(payload),
+        })
+      : await sb(`/rest/v1/meta_ads_connections`, {
+          method: "POST",
+          headers: { Prefer: "return=representation" },
+          body: JSON.stringify([payload]),
+        });
     const text = await response.text();
     if (!response.ok) return bad(res, 500, `meta_connection_save_failed: ${text}`);
     const saved = JSON.parse(text || "[]")[0];
