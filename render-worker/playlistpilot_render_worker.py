@@ -52,9 +52,13 @@ def upload(url: str, source: Path) -> None:
         headers={"Content-Type": "video/mp4", "cache-control": "max-age=3600", "x-upsert": "true"},
         method="PUT",
     )
-    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
-        if response.status < 200 or response.status >= 300:
-            raise RuntimeError(f"upload_http_{response.status}")
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            if response.status < 200 or response.status >= 300:
+                raise RuntimeError(f"upload_http_{response.status}")
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", "replace")[:900]
+        raise RuntimeError(f"upload_http_{error.code}: {detail}") from error
 
 
 def dimensions(fmt: str) -> tuple[int, int]:
