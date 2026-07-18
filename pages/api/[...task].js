@@ -787,6 +787,9 @@ function normalizeMetaDraftInput(body = {}) {
   const primaryText = String(body.primary_text || "").trim().slice(0, 1000);
   const headline = String(body.headline || "").trim().slice(0, 255);
   const imageUrl = String(body.image_url || "").trim();
+  const startDate = String(body.start_date || "").trim();
+  const endDate = String(body.end_date || "").trim();
+  const placementMode = String(body.placement_mode || "automatic").trim();
   const dailyBudgetMinor = Math.round(Number(body.daily_budget_eur) * 100);
   const ageMin = Math.max(13, Math.min(65, Number.parseInt(body.age_min, 10) || 18));
   const ageMax = Math.max(ageMin, Math.min(65, Number.parseInt(body.age_max, 10) || 45));
@@ -802,6 +805,10 @@ function normalizeMetaDraftInput(body = {}) {
   if (!primaryText) throw new Error("primary_text_required");
   if (!headline) throw new Error("headline_required");
   if (!countries.length) throw new Error("target_country_required");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) throw new Error("campaign_dates_required");
+  if (endDate <= startDate) throw new Error("campaign_end_must_follow_start");
+  if (startDate < new Date().toISOString().slice(0, 10)) throw new Error("campaign_start_cannot_be_in_the_past");
+  if (!["automatic", "feeds", "stories_reels"].includes(placementMode)) throw new Error("invalid_placement_mode");
   return {
     playlist_id: playlistId,
     name,
@@ -814,6 +821,9 @@ function normalizeMetaDraftInput(body = {}) {
     countries,
     age_min: ageMin,
     age_max: ageMax,
+    start_date: startDate,
+    end_date: endDate,
+    placement_mode: placementMode,
   };
 }
 
@@ -2499,6 +2509,19 @@ const routes = {
         await persistDraft({ meta_campaign_id: String(campaign.id), creation_stage: "campaign" });
       }
       if (!draft.meta_adset_id) {
+        const targeting = {
+          age_min: draft.age_min,
+          age_max: draft.age_max,
+          geo_locations: { countries: draft.countries },
+          publisher_platforms: ["facebook", "instagram"],
+        };
+        if (draft.placement_mode === "feeds") {
+          targeting.facebook_positions = ["feed"];
+          targeting.instagram_positions = ["stream"];
+        } else if (draft.placement_mode === "stories_reels") {
+          targeting.facebook_positions = ["story", "facebook_reels"];
+          targeting.instagram_positions = ["story", "reels"];
+        }
         const adset = await metaGraphMutation(connection, `act_${adAccount.meta_id}/adsets`, {
           name: `${draft.name} — Ad Set`,
           campaign_id: draft.meta_campaign_id,
@@ -2506,12 +2529,9 @@ const routes = {
           billing_event: "IMPRESSIONS",
           optimization_goal: "LINK_CLICKS",
           bid_strategy: "LOWEST_COST_WITHOUT_CAP",
-          targeting: JSON.stringify({
-            age_min: draft.age_min,
-            age_max: draft.age_max,
-            geo_locations: { countries: draft.countries },
-            publisher_platforms: ["facebook", "instagram"],
-          }),
+          targeting: JSON.stringify(targeting),
+          start_time: draft.start_date ? `${draft.start_date}T08:00:00+0000` : undefined,
+          end_time: draft.end_date ? `${draft.end_date}T23:59:00+0000` : undefined,
           status: "PAUSED",
         });
         if (!adset.id) throw new Error("meta_adset_id_missing");

@@ -634,6 +634,9 @@ export default function PlaylistManager() {
     countries: "DE",
     age_min: "18",
     age_max: "45",
+    start_date: new Date(Date.now() + 86400000).toISOString().slice(0, 10),
+    end_date: new Date(Date.now() + 15 * 86400000).toISOString().slice(0, 10),
+    placement_mode: "automatic",
   });
   const [spotifyClientId, setSpotifyClientId] = useState("");
   const [spotifyClientSecret, setSpotifyClientSecret] = useState("");
@@ -3323,7 +3326,7 @@ export default function PlaylistManager() {
             <span className="metaReadOnlyBadge">Always PAUSED</span>
           </div>
           <div className="adsWizardSteps" aria-label="Campaign creation progress">
-            {["Destination", "Audience & budget", "Creative"].map((label, index) => <button key={label} className={adsWizardStep === index + 1 ? "active" : adsWizardStep > index + 1 ? "complete" : ""} onClick={() => setAdsWizardStep(index + 1)}><span>{index + 1}</span>{label}</button>)}
+            {["Destination", "Audience & budget", "Creative", "Delivery"].map((label, index) => <button key={label} className={adsWizardStep === index + 1 ? "active" : adsWizardStep > index + 1 ? "complete" : ""} onClick={() => setAdsWizardStep(index + 1)}><span>{index + 1}</span>{label}</button>)}
           </div>
           <div className="metaDraftGrid">
             {adsWizardStep === 1 ? <>
@@ -3347,10 +3350,16 @@ export default function PlaylistManager() {
                 {[{ platform: "Instagram", identity: (metaWorkspace?.assets || []).find((asset) => asset.asset_type === "instagram_account" && asset.is_selected)?.name || "Instagram" }, { platform: "Facebook", identity: (metaWorkspace?.assets || []).find((asset) => asset.asset_type === "page" && asset.is_selected)?.name || "Facebook Page" }].map((preview) => <aside className="adsCreativePreview" key={preview.platform}><div className="adsPreviewIdentity"><span>{preview.platform} feed</span><strong>{preview.identity}</strong></div><p>{metaDraftForm.primary_text || "Your primary text"}</p>{metaDraftForm.image_url ? <img src={metaDraftForm.image_url} alt={`${preview.platform} campaign preview`} /> : <div className="adsCreativePlaceholder">Image preview</div>}<div className="adsPreviewLink"><div><small>OPEN.SPOTIFY.COM</small><strong>{metaDraftForm.headline || "Your headline"}</strong></div><b>Learn more</b></div></aside>)}
               </div>
             </> : null}
+            {adsWizardStep === 4 ? <>
+              <label><span>Start date</span><input type="date" min={new Date().toISOString().slice(0, 10)} value={metaDraftForm.start_date} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, start_date: e.target.value })} /></label>
+              <label><span>End date</span><input type="date" min={metaDraftForm.start_date || new Date().toISOString().slice(0, 10)} value={metaDraftForm.end_date} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, end_date: e.target.value })} /></label>
+              <fieldset className="adsPlacementChoices"><legend>Placements</legend>{[{ id: "automatic", title: "Advantage+ placements", text: "Meta distributes across Facebook and Instagram." }, { id: "feeds", title: "Feeds", text: "Facebook Feed and Instagram Feed only." }, { id: "stories_reels", title: "Stories & Reels", text: "Vertical placements on both platforms." }].map((option) => <label className={metaDraftForm.placement_mode === option.id ? "selected" : ""} key={option.id}><input type="radio" name="placement_mode" value={option.id} checked={metaDraftForm.placement_mode === option.id} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, placement_mode: e.target.value })} /><span><strong>{option.title}</strong><small>{option.text}</small></span></label>)}</fieldset>
+              <aside className="adsDeliverySummary"><span>Delivery summary</span><strong>€{metaDraftForm.daily_budget_eur || "0"} per day</strong><p>{metaDraftForm.start_date || "Start date"} → {metaDraftForm.end_date || "End date"}</p><small>{metaDraftForm.placement_mode === "automatic" ? "Advantage+ placements" : metaDraftForm.placement_mode === "feeds" ? "Facebook + Instagram Feeds" : "Facebook + Instagram Stories & Reels"}</small><b>Created PAUSED</b></aside>
+            </> : null}
           </div>
           <div className="metaFormActions adsWizardActions">
             <button disabled={busy || adsWizardStep === 1} onClick={() => setAdsWizardStep((step) => Math.max(1, step - 1))}>Back</button>
-            {adsWizardStep < 3 ? <button disabled={busy || (adsWizardStep === 1 && (!metaDraftForm.playlist_id || !metaDraftForm.destination_url))} onClick={() => setAdsWizardStep((step) => Math.min(3, step + 1))}>Continue</button> : <button disabled={busy || !metaWorkspace?.readiness?.publishing_ready || !metaDraftForm.image_url} onClick={saveMetaDraft}>Save campaign draft</button>}
+            {adsWizardStep < 4 ? <button disabled={busy || (adsWizardStep === 1 && (!metaDraftForm.playlist_id || !metaDraftForm.destination_url)) || (adsWizardStep === 3 && !metaDraftForm.image_url)} onClick={() => setAdsWizardStep((step) => Math.min(4, step + 1))}>Continue</button> : <button disabled={busy || !metaWorkspace?.readiness?.publishing_ready || !metaDraftForm.start_date || !metaDraftForm.end_date || metaDraftForm.end_date <= metaDraftForm.start_date} onClick={saveMetaDraft}>Save campaign draft</button>}
             <small>Objective and delivery status are locked to <b>Traffic</b> and <b>PAUSED</b>.</small>
           </div>
         </section>
@@ -3363,7 +3372,7 @@ export default function PlaylistManager() {
             {metaDrafts.map((draft) => <article key={draft.id}>
               <div className="metaDraftCardHeader"><div><strong>{draft.name}</strong><small>{draft.status.replaceAll("_", " ")}</small></div><span>€{(Number(draft.daily_budget_minor || 0) / 100).toFixed(2)}/day</span></div>
               <p>{draft.primary_text}</p>
-              <dl><div><dt>Target</dt><dd>{(draft.countries || []).join(", ")} · {draft.age_min}–{draft.age_max}</dd></div><div><dt>Destination</dt><dd>{draft.destination_url}</dd></div><div><dt>Creation stage</dt><dd>{(draft.creation_stage || "local").replaceAll("_", " ")}</dd></div>{draft.meta_campaign_id ? <div><dt>Meta campaign</dt><dd>{draft.meta_campaign_id}</dd></div> : null}{draft.meta_adset_id ? <div><dt>Meta ad set</dt><dd>{draft.meta_adset_id}</dd></div> : null}{draft.meta_creative_id ? <div><dt>Meta creative</dt><dd>{draft.meta_creative_id}</dd></div> : null}{draft.meta_ad_id ? <div><dt>Meta ad</dt><dd>{draft.meta_ad_id}</dd></div> : null}</dl>
+              <dl><div><dt>Target</dt><dd>{(draft.countries || []).join(", ")} · {draft.age_min}–{draft.age_max}</dd></div><div><dt>Schedule</dt><dd>{draft.start_date && draft.end_date ? `${draft.start_date} → ${draft.end_date}` : "Not scheduled"}</dd></div><div><dt>Placements</dt><dd>{(draft.placement_mode || "automatic").replaceAll("_", " ")}</dd></div><div><dt>Destination</dt><dd>{draft.destination_url}</dd></div><div><dt>Creation stage</dt><dd>{(draft.creation_stage || "local").replaceAll("_", " ")}</dd></div>{draft.meta_campaign_id ? <div><dt>Meta campaign</dt><dd>{draft.meta_campaign_id}</dd></div> : null}{draft.meta_adset_id ? <div><dt>Meta ad set</dt><dd>{draft.meta_adset_id}</dd></div> : null}{draft.meta_creative_id ? <div><dt>Meta creative</dt><dd>{draft.meta_creative_id}</dd></div> : null}{draft.meta_ad_id ? <div><dt>Meta ad</dt><dd>{draft.meta_ad_id}</dd></div> : null}</dl>
               {draft.last_error ? <div className="metaWarnings"><p>{draft.last_error}</p></div> : null}
               <div className="metaDraftActions">
                 <button disabled={busy || draft.status !== "draft"} onClick={() => reviewMetaDraft(draft.id)}>{draft.status === "draft" ? "Approve review" : "Reviewed"}</button>
@@ -6079,7 +6088,7 @@ export default function PlaylistManager() {
         .adsConnectionSummary dd { margin: 0; text-align: right; }
         .adsWizardSteps {
           display: grid;
-          grid-template-columns: repeat(3, 1fr);
+          grid-template-columns: repeat(4, 1fr);
           gap: 8px;
           margin: 20px 0 6px;
         }
@@ -6152,6 +6161,47 @@ export default function PlaylistManager() {
         .adsPreviewLink b { padding: 7px 9px; border: 1px solid #3a4351; border-radius: 5px; font-size: 10px; white-space: nowrap; }
         .adsWizardActions { justify-content: flex-end; }
         .adsWizardActions small { margin-right: auto; order: -1; }
+        .adsPlacementChoices {
+          grid-column: 1 / -1;
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 10px;
+          margin: 4px 0 0;
+          padding: 0;
+          border: 0;
+        }
+        .adsPlacementChoices legend { margin-bottom: 10px; color: #a6adba; font-size: 12px; font-weight: 800; }
+        .adsPlacementChoices label {
+          display: flex;
+          grid-template-columns: auto 1fr;
+          align-items: flex-start;
+          gap: 10px;
+          padding: 14px;
+          border: 1px solid #303744;
+          border-radius: 9px;
+          background: #11151b;
+          cursor: pointer;
+        }
+        .adsPlacementChoices label.selected { border-color: #18e06f; background: rgba(24, 224, 111, 0.06); }
+        .adsPlacementChoices input { width: auto; margin-top: 3px; accent-color: #18e06f; }
+        .adsPlacementChoices label span { display: grid; gap: 5px; }
+        .adsPlacementChoices small { color: #7f8998; font-weight: 500; line-height: 1.4; }
+        .adsDeliverySummary {
+          grid-column: 1 / -1;
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto;
+          gap: 8px 20px;
+          align-items: center;
+          padding: 18px;
+          border: 1px solid rgba(24, 224, 111, 0.35);
+          border-radius: 9px;
+          background: rgba(24, 224, 111, 0.05);
+        }
+        .adsDeliverySummary > span { grid-column: 1 / -1; color: #7f8998; font-size: 10px; font-weight: 900; text-transform: uppercase; }
+        .adsDeliverySummary strong { font-size: 22px; }
+        .adsDeliverySummary p,
+        .adsDeliverySummary small { margin: 0; color: #a6adba; }
+        .adsDeliverySummary b { grid-column: 2; grid-row: 2 / span 3; padding: 8px 10px; border-radius: 999px; color: #07140c; background: #18e06f; font-size: 10px; }
         .metaFormActions {
           display: flex;
           align-items: center;
@@ -8305,6 +8355,9 @@ export default function PlaylistManager() {
           .adsWorkspaceNav { overflow-x: auto; }
           .adsWorkspaceNav button { flex: 1 0 135px; }
           .adsWizardSteps { grid-template-columns: 1fr; }
+          .adsPlacementChoices { grid-template-columns: 1fr; }
+          .adsDeliverySummary { grid-template-columns: 1fr; }
+          .adsDeliverySummary b { grid-column: auto; grid-row: auto; justify-self: start; }
           .adEventForm {
             grid-template-columns: 1fr;
           }
