@@ -3,6 +3,7 @@ export const config = { api: { bodyParser: false } };
 
 import Stripe from "stripe";
 import { randomUUID } from "crypto";
+import { createClient } from "@supabase/supabase-js";
 
 /* ==============================
    Shared Utils (Server-only)
@@ -69,6 +70,28 @@ async function sb(path, init = {}) {
     ...(init.headers || {}),
   };
   return fetch(url, { ...init, headers });
+}
+
+function requireRenderWorker(req, res) {
+  const expected = process.env.RENDER_WORKER_SECRET || "";
+  const supplied = String(req.headers?.["x-render-worker-secret"] || "");
+  if (!expected || !supplied || supplied.length !== expected.length) {
+    bad(res, 401, "render_worker_unauthorized");
+    return false;
+  }
+  let mismatch = 0;
+  for (let i = 0; i < expected.length; i += 1) mismatch |= expected.charCodeAt(i) ^ supplied.charCodeAt(i);
+  if (mismatch !== 0) {
+    bad(res, 401, "render_worker_unauthorized");
+    return false;
+  }
+  return true;
+}
+
+function supabaseServiceClient() {
+  return createClient(need("SUPABASE_URL"), need("SUPABASE_SERVICE_ROLE_KEY"), {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
 }
 
 async function scopedPlaylistUpsert(batch) {
@@ -3012,39 +3035,17 @@ const routes = {
     const draftResponse = await sb(`/rest/v1/meta_creative_render_jobs`, {
       method: "POST",
       headers: { Prefer: "return=representation" },
-      body: JSON.stringify([{ project_id: owned.project.id, concept_id: conceptId, status: "queued", priority: 100, render_spec: { editor, provider: "json2video" } }]),
+      body: JSON.stringify([{ project_id: owned.project.id, concept_id: conceptId, status: "queued", priority: 100, render_spec: { editor, provider: "playlistpilot_ffmpeg" } }]),
     });
     const draftText = await draftResponse.text();
     const job = draftResponse.ok ? JSON.parse(draftText || "[]")[0] : null;
     if (!job) return bad(res, 500, `creative_render_job_save_failed: ${draftText.slice(0, 500)}`);
-    const movie = buildJson2VideoMovie({ project: owned.project, concept: owned.concept, asset, jobId: job.id });
-    try {
-      const providerResponse = await fetch("https://api.json2video.com/v2/movies", {
-        method: "POST",
-        headers: { "x-api-key": need("JSON2VIDEO_API_KEY"), "Content-Type": "application/json", Accept: "application/json" },
-        body: JSON.stringify(movie),
-      });
-      const parsed = await parseJsonSafe(providerResponse);
-      if (!providerResponse.ok || !parsed.json?.success || !parsed.json?.project) {
-        throw new Error(`json2video_${providerResponse.status}: ${parsed.json?.message || parsed.text.slice(0, 500)}`);
-      }
-      const now = new Date().toISOString();
-      const renderSpec = { editor, provider: "json2video", provider_project: parsed.json.project, movie };
-      const patchResponse = await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(job.id)}`, {
-        method: "PATCH",
-        headers: { Prefer: "return=representation" },
-        body: JSON.stringify({ status: "processing", attempts: 1, worker_id: `json2video:${parsed.json.project}`, render_spec: renderSpec, started_at: now, updated_at: now }),
-      });
-      await Promise.all([
-        sb(`/rest/v1/meta_creative_concepts?id=eq.${encodeURIComponent(conceptId)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "render_queued", updated_at: now }) }),
-        sb(`/rest/v1/meta_creative_projects?id=eq.${encodeURIComponent(owned.project.id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "rendering", current_step: 5, last_error: null, updated_at: now }) }),
-      ]);
-      return json(res, 201, { job: patchResponse.ok ? (await patchResponse.json().catch(() => []))[0] : { ...job, status: "processing", render_spec: renderSpec }, reused: false });
-    } catch (error) {
-      const message = String(error?.message || error).slice(0, 1000);
-      await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(job.id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "failed", error_code: "provider_submit", error_message: message, finished_at: new Date().toISOString(), updated_at: new Date().toISOString() }) });
-      return bad(res, 502, message);
-    }
+    const now = new Date().toISOString();
+    await Promise.all([
+      sb(`/rest/v1/meta_creative_concepts?id=eq.${encodeURIComponent(conceptId)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "render_queued", updated_at: now }) }),
+      sb(`/rest/v1/meta_creative_projects?id=eq.${encodeURIComponent(owned.project.id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "rendering", current_step: 5, last_error: null, updated_at: now }) }),
+    ]);
+    return json(res, 201, { job, reused: false });
   },
 
   /* ---------- meta/creative-renders/sync (POST) ---------- */
@@ -3066,60 +3067,96 @@ const routes = {
     );
     const project = projectResponse.ok ? (await projectResponse.json().catch(() => []))[0] : null;
     if (!project) return bad(res, 404, "creative_render_job_not_found");
-    if (job.status === "completed") return json(res, 200, { job, done: true });
-    if (job.status === "failed" || job.status === "cancelled") return json(res, 200, { job, done: true });
-    const providerProject = job.render_spec?.provider_project || String(job.worker_id || "").replace(/^json2video:/, "");
-    if (!/^[A-Za-z0-9]{16}$/.test(providerProject)) return bad(res, 409, "creative_render_provider_id_missing");
-    const providerResponse = await fetch(`https://api.json2video.com/v2/movies?project=${encodeURIComponent(providerProject)}&format=simple`, {
-      headers: { "x-api-key": need("JSON2VIDEO_API_KEY"), Accept: "application/json" },
-    });
-    const parsed = await parseJsonSafe(providerResponse);
-    if (!providerResponse.ok || !parsed.json?.success) return bad(res, 502, `json2video_status_${providerResponse.status}: ${parsed.json?.message || parsed.text.slice(0, 500)}`);
-    const movie = parsed.json.movie || {};
-    const providerStatus = String(movie.status || "pending").toLowerCase();
+    return json(res, 200, { job, provider_status: job.status, done: ["completed", "failed", "cancelled"].includes(job.status) });
+  },
+
+  /* ---------- meta/render-worker/claim (POST, private worker) ---------- */
+  "meta/render-worker/claim": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    if (!requireRenderWorker(req, res)) return;
+    const body = await readBody(req);
+    const identity = String(body.worker_id || "playlistpilot-worker").replace(/[^a-zA-Z0-9:._-]/g, "").slice(0, 120) || "playlistpilot-worker";
+    const queuedResponse = await sb(`/rest/v1/meta_creative_render_jobs?select=*&status=eq.queued&order=priority.asc,created_at.asc&limit=1`);
+    const queued = queuedResponse.ok ? (await queuedResponse.json().catch(() => []))[0] : null;
+    if (!queued) return json(res, 200, { job: null });
     const now = new Date().toISOString();
-    if (["pending", "running", "queued"].includes(providerStatus)) {
-      const patchResponse = await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(job.id)}`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ status: "processing", updated_at: now }) });
-      return json(res, 200, { job: patchResponse.ok ? (await patchResponse.json().catch(() => []))[0] : job, provider_status: providerStatus, done: false });
+    const claimResponse = await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(queued.id)}&status=eq.queued`, {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ status: "processing", attempts: Math.min(20, Number(queued.attempts || 0) + 1), worker_id: identity, started_at: now, updated_at: now, error_code: null, error_message: null }),
+    });
+    const job = claimResponse.ok ? (await claimResponse.json().catch(() => []))[0] : null;
+    if (!job) return json(res, 200, { job: null });
+    const assetId = String(job.render_spec?.editor?.asset_id || "");
+    const [projectResponse, conceptResponse, assetResponse] = await Promise.all([
+      sb(`/rest/v1/meta_creative_projects?select=*,playlists(name,image)&id=eq.${encodeURIComponent(job.project_id)}&limit=1`),
+      sb(`/rest/v1/meta_creative_concepts?select=*&id=eq.${encodeURIComponent(job.concept_id)}&limit=1`),
+      sb(`/rest/v1/meta_creative_assets?select=*&id=eq.${encodeURIComponent(assetId)}&asset_type=eq.video&limit=1`),
+    ]);
+    const project = projectResponse.ok ? (await projectResponse.json().catch(() => []))[0] : null;
+    const concept = conceptResponse.ok ? (await conceptResponse.json().catch(() => []))[0] : null;
+    const asset = assetResponse.ok ? (await assetResponse.json().catch(() => []))[0] : null;
+    if (!project || !concept || !asset?.source_url) {
+      await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(job.id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "failed", error_code: "render_input_missing", error_message: "Render project, concept or video asset is missing", finished_at: now, updated_at: now }) });
+      return bad(res, 409, "render_input_missing");
     }
-    if (providerStatus !== "done" || !movie.url) {
-      const message = String(movie.message || `JSON2Video render ${providerStatus}`).slice(0, 1000);
-      const patchResponse = await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(job.id)}`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ status: "failed", error_code: providerStatus, error_message: message, finished_at: now, updated_at: now }) });
-      await sb(`/rest/v1/meta_creative_concepts?id=eq.${encodeURIComponent(job.concept_id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "media_ready", updated_at: now }) });
-      return json(res, 200, { job: patchResponse.ok ? (await patchResponse.json().catch(() => []))[0] : job, provider_status: providerStatus, done: true });
+    const owner = String(project.bubble_user_id || "admin").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80) || "admin";
+    const storagePath = `${owner}/renders/${job.id}.mp4`;
+    const storage = supabaseServiceClient().storage.from("meta-ad-creatives");
+    const { data: signedUpload, error: signedUploadError } = await storage.createSignedUploadUrl(storagePath, { upsert: true });
+    if (signedUploadError || !signedUpload?.signedUrl) {
+      await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(job.id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "queued", worker_id: null, error_code: "upload_url_failed", error_message: String(signedUploadError?.message || "Signed upload URL failed").slice(0, 1000), updated_at: now }) });
+      return bad(res, 502, "render_upload_url_failed");
     }
-    const existingAssetResponse = await sb(`/rest/v1/meta_creative_assets?select=*&limit=1&project_id=eq.${encodeURIComponent(job.project_id)}&concept_id=eq.${encodeURIComponent(job.concept_id)}&asset_type=eq.render&provider_id=eq.${encodeURIComponent(providerProject)}`);
-    let outputAsset = existingAssetResponse.ok ? (await existingAssetResponse.json().catch(() => []))[0] : null;
-    if (!outputAsset) {
-      let finalUrl = movie.url;
-      let storagePath = null;
-      try {
-        const download = await fetch(movie.url);
-        const size = Number(download.headers.get("content-length") || movie.size || 0);
-        if (download.ok && (!size || size <= 48 * 1024 * 1024)) {
-          const bytes = Buffer.from(await download.arrayBuffer());
-          if (bytes.length && bytes.length <= 48 * 1024 * 1024) {
-            const owner = String(ctx.bubble_user_id).replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80) || "admin";
-            storagePath = `${owner}/renders/${job.id}.mp4`;
-            const upload = await sb(`/storage/v1/object/meta-ad-creatives/${storagePath.split("/").map(encodeURIComponent).join("/")}`, { method: "POST", headers: { "Content-Type": "video/mp4", "x-upsert": "true" }, body: bytes });
-            if (upload.ok) finalUrl = `${need("SUPABASE_URL")}/storage/v1/object/public/meta-ad-creatives/${storagePath.split("/").map(encodeURIComponent).join("/")}`;
-            else storagePath = null;
-          }
-        }
-      } catch (error) {
-        console.warn("creative_render_storage_copy_failed", String(error?.message || error));
-      }
-      const assetInsert = await sb(`/rest/v1/meta_creative_assets`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify([{ project_id: job.project_id, concept_id: job.concept_id, asset_type: "render", source: "render_worker", provider_id: providerProject, source_url: finalUrl, storage_path: storagePath, mime_type: "video/mp4", duration_seconds: Number(movie.duration || 0) || null, width: Number(movie.width || 0) || null, height: Number(movie.height || 0) || null, metadata: { provider: "json2video", provider_url: movie.url, size: Number(movie.size || 0), rendering_time: Number(movie.rendering_time || 0) }, updated_at: now }]) });
-      const assetText = await assetInsert.text();
-      if (!assetInsert.ok) return bad(res, 500, `creative_render_asset_save_failed: ${assetText.slice(0, 500)}`);
-      outputAsset = JSON.parse(assetText || "[]")[0];
-    }
-    const completeResponse = await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(job.id)}`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ status: "completed", output_asset_id: outputAsset.id, finished_at: now, updated_at: now, error_code: null, error_message: null }) });
+    return json(res, 200, { job: { id: job.id, worker_id: identity, project_id: job.project_id, concept_id: job.concept_id, editor: job.render_spec.editor, format: project.format, playlist_name: project.playlists?.name || "", playlist_cover_url: project.playlists?.image || "", hook_text: concept.hook_text || job.render_spec.editor.hook_text, video_url: asset.source_url, storage_path: storagePath, upload_url: signedUpload.signedUrl } });
+  },
+
+  /* ---------- meta/render-worker/complete (POST, private worker) ---------- */
+  "meta/render-worker/complete": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    if (!requireRenderWorker(req, res)) return;
+    const body = await readBody(req);
+    const jobId = String(body.job_id || "");
+    const identity = String(body.worker_id || "");
+    if (!/^[0-9a-f-]{36}$/i.test(jobId) || !identity) return bad(res, 400, "invalid_render_completion");
+    const jobResponse = await sb(`/rest/v1/meta_creative_render_jobs?select=*&id=eq.${encodeURIComponent(jobId)}&status=eq.processing&worker_id=eq.${encodeURIComponent(identity)}&limit=1`);
+    const job = jobResponse.ok ? (await jobResponse.json().catch(() => []))[0] : null;
+    if (!job) return bad(res, 409, "render_job_not_owned");
+    const projectResponse = await sb(`/rest/v1/meta_creative_projects?select=*&id=eq.${encodeURIComponent(job.project_id)}&limit=1`);
+    const project = projectResponse.ok ? (await projectResponse.json().catch(() => []))[0] : null;
+    if (!project) return bad(res, 404, "creative_project_not_found");
+    const owner = String(project.bubble_user_id || "admin").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80) || "admin";
+    const storagePath = `${owner}/renders/${job.id}.mp4`;
+    const publicUrl = `${need("SUPABASE_URL")}/storage/v1/object/public/meta-ad-creatives/${storagePath.split("/").map(encodeURIComponent).join("/")}`;
+    const now = new Date().toISOString();
+    const assetInsert = await sb(`/rest/v1/meta_creative_assets`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify([{ project_id: job.project_id, concept_id: job.concept_id, asset_type: "render", source: "render_worker", provider_id: job.id, source_url: publicUrl, storage_path: storagePath, mime_type: "video/mp4", duration_seconds: Math.max(0, Number(body.duration_seconds || 0)) || null, width: Math.max(0, Number.parseInt(body.width, 10) || 0) || null, height: Math.max(0, Number.parseInt(body.height, 10) || 0) || null, metadata: { provider: "playlistpilot_ffmpeg", worker_id: identity, bytes: Math.max(0, Number(body.bytes || 0)) || null }, updated_at: now }]) });
+    const assetText = await assetInsert.text();
+    if (!assetInsert.ok) return bad(res, 500, `creative_render_asset_save_failed: ${assetText.slice(0, 500)}`);
+    const outputAsset = JSON.parse(assetText || "[]")[0];
+    const completeResponse = await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(job.id)}&status=eq.processing&worker_id=eq.${encodeURIComponent(identity)}`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ status: "completed", output_asset_id: outputAsset.id, finished_at: now, updated_at: now, error_code: null, error_message: null }) });
     await Promise.all([
       sb(`/rest/v1/meta_creative_concepts?id=eq.${encodeURIComponent(job.concept_id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "rendered", updated_at: now }) }),
-      sb(`/rest/v1/meta_creative_projects?id=eq.${encodeURIComponent(job.project_id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "review", current_step: 6, updated_at: now }) }),
+      sb(`/rest/v1/meta_creative_projects?id=eq.${encodeURIComponent(job.project_id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "review", current_step: 6, last_error: null, updated_at: now }) }),
     ]);
-    return json(res, 200, { job: completeResponse.ok ? (await completeResponse.json().catch(() => []))[0] : { ...job, status: "completed", output_asset_id: outputAsset.id }, asset: outputAsset, provider_status: providerStatus, done: true });
+    return json(res, 200, { job: completeResponse.ok ? (await completeResponse.json().catch(() => []))[0] : job, asset: outputAsset });
+  },
+
+  /* ---------- meta/render-worker/fail (POST, private worker) ---------- */
+  "meta/render-worker/fail": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    if (!requireRenderWorker(req, res)) return;
+    const body = await readBody(req);
+    const jobId = String(body.job_id || "");
+    const identity = String(body.worker_id || "");
+    if (!/^[0-9a-f-]{36}$/i.test(jobId) || !identity) return bad(res, 400, "invalid_render_failure");
+    const jobResponse = await sb(`/rest/v1/meta_creative_render_jobs?select=*&id=eq.${encodeURIComponent(jobId)}&status=eq.processing&worker_id=eq.${encodeURIComponent(identity)}&limit=1`);
+    const job = jobResponse.ok ? (await jobResponse.json().catch(() => []))[0] : null;
+    if (!job) return bad(res, 409, "render_job_not_owned");
+    const retry = Boolean(body.retryable) && Number(job.attempts || 0) < Number(job.max_attempts || 3);
+    const now = new Date().toISOString();
+    const patch = await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(job.id)}&status=eq.processing&worker_id=eq.${encodeURIComponent(identity)}`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ status: retry ? "queued" : "failed", worker_id: retry ? null : identity, error_code: String(body.error_code || "ffmpeg_render_failed").slice(0, 120), error_message: String(body.error_message || "FFmpeg render failed").slice(0, 1000), finished_at: retry ? null : now, updated_at: now }) });
+    if (!retry) await sb(`/rest/v1/meta_creative_concepts?id=eq.${encodeURIComponent(job.concept_id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "media_ready", updated_at: now }) });
+    return json(res, 200, { job: patch.ok ? (await patch.json().catch(() => []))[0] : job, retrying: retry });
   },
 
   /* ---------- meta/campaign-drafts (GET/POST) ---------- */

@@ -1,0 +1,29 @@
+[Unit]
+Description=PlaylistPilot FFmpeg render worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codex
+Group=codex
+WorkingDirectory=/opt/playlistpilot-render-worker
+EnvironmentFile=/etc/playlistpilot-render-worker.env
+ExecStart=/usr/bin/nice -n 10 /usr/bin/python3 /opt/playlistpilot-render-worker/playlistpilot_render_worker.py
+Restart=always
+RestartSec=10
+CPUQuota=150%
+MemoryMax=1800M
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
