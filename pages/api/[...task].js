@@ -990,6 +990,40 @@ async function loadOwnedCreativeConcept(conceptId, connectionId, bubbleUserId) {
   return project ? { concept, project } : null;
 }
 
+function normalizeCreativeRenderSpec(body = {}, asset) {
+  const hexColor = (value, fallback) => /^#[0-9a-f]{6}$/i.test(String(value || "")) ? String(value).toUpperCase() : fallback;
+  const duration = Math.max(1, Number(asset?.duration_seconds || 15));
+  const trimStart = Math.max(0, Math.min(duration - 0.5, Number(body.trim_start) || 0));
+  const requestedEnd = Number(body.trim_end);
+  const trimEnd = Math.max(trimStart + 0.5, Math.min(duration, Number.isFinite(requestedEnd) ? requestedEnd : Math.min(duration, trimStart + 15)));
+  const hookStart = Math.max(trimStart, Math.min(trimEnd - 0.25, Number(body.hook_start) || trimStart));
+  const hookEnd = Math.max(hookStart + 0.25, Math.min(trimEnd, Number(body.hook_end) || Math.min(trimEnd, hookStart + 4)));
+  const hookPosition = ["top", "center", "bottom"].includes(body.hook_position) ? body.hook_position : "center";
+  const textAlign = ["left", "center", "right"].includes(body.text_align) ? body.text_align : "center";
+  const coverPosition = ["top", "center", "bottom"].includes(body.cover_position) ? body.cover_position : "bottom";
+  return {
+    version: 1,
+    asset_id: asset.id,
+    format: ["9:16", "4:5", "1:1"].includes(body.format) ? body.format : "9:16",
+    hook_text: String(body.hook_text || "").replace(/\s+/g, " ").trim().slice(0, 120),
+    cta_text: String(body.cta_text || "Listen on Spotify").replace(/\s+/g, " ").trim().slice(0, 80),
+    hook_position: hookPosition,
+    text_align: textAlign,
+    text_color: hexColor(body.text_color, "#FFFFFF"),
+    accent_color: hexColor(body.accent_color, "#1ED760"),
+    overlay_color: hexColor(body.overlay_color, "#000000"),
+    overlay_opacity: Math.max(0, Math.min(0.85, Number(body.overlay_opacity) || 0.28)),
+    trim_start: Number(trimStart.toFixed(2)),
+    trim_end: Number(trimEnd.toFixed(2)),
+    hook_start: Number(hookStart.toFixed(2)),
+    hook_end: Number(hookEnd.toFixed(2)),
+    show_cover: body.show_cover !== false,
+    cover_position: coverPosition,
+    show_cta: body.show_cta !== false,
+    updated_at: new Date().toISOString(),
+  };
+}
+
 function fallbackSpotifyCredentials({ requireRedirect = false } = {}) {
   const client_id = process.env.SPOTIFY_CLIENT_ID || "";
   const client_secret = process.env.SPOTIFY_CLIENT_SECRET || "";
@@ -2826,6 +2860,44 @@ const routes = {
       });
     }
     return json(res, 201, { asset: JSON.parse(insertText || "[]")[0], reused: false });
+  },
+
+  /* ---------- meta/creative-editor/save (POST) ---------- */
+  "meta/creative-editor/save": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+    const body = await readBody(req);
+    const conceptId = String(body.concept_id || "").trim();
+    const assetId = String(body.asset_id || "").trim();
+    if (!/^[0-9a-f-]{36}$/i.test(conceptId)) return bad(res, 400, "creative_concept_required");
+    if (!/^[0-9a-f-]{36}$/i.test(assetId)) return bad(res, 400, "creative_asset_required");
+    const owned = await loadOwnedCreativeConcept(conceptId, connection.id, ctx.bubble_user_id);
+    if (!owned) return bad(res, 404, "creative_concept_not_found");
+    const assetResponse = await sb(
+      `/rest/v1/meta_creative_assets?select=*&limit=1&id=eq.${encodeURIComponent(assetId)}` +
+      `&project_id=eq.${encodeURIComponent(owned.project.id)}&concept_id=eq.${encodeURIComponent(conceptId)}&asset_type=eq.video`
+    );
+    const asset = assetResponse.ok ? (await assetResponse.json().catch(() => []))[0] : null;
+    if (!asset) return bad(res, 404, "creative_video_asset_not_found");
+    const editor = normalizeCreativeRenderSpec({ ...body, format: owned.project.format }, asset);
+    if (!editor.hook_text) return bad(res, 400, "creative_hook_required");
+    const renderSpec = { ...(owned.concept.render_spec || {}), editor };
+    const updateResponse = await sb(`/rest/v1/meta_creative_concepts?id=eq.${encodeURIComponent(conceptId)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ render_spec: renderSpec, updated_at: new Date().toISOString() }),
+    });
+    const updateText = await updateResponse.text();
+    if (!updateResponse.ok) return bad(res, 500, `creative_render_spec_save_failed: ${updateText.slice(0, 500)}`);
+    await sb(`/rest/v1/meta_creative_projects?id=eq.${encodeURIComponent(owned.project.id)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ current_step: Math.max(4, Number(owned.project.current_step || 1)), updated_at: new Date().toISOString() }),
+    });
+    return json(res, 200, { concept: JSON.parse(updateText || "[]")[0], editor });
   },
 
   /* ---------- meta/campaign-drafts (GET/POST) ---------- */

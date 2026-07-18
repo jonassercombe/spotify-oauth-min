@@ -627,6 +627,8 @@ export default function PlaylistManager() {
   const [creativeProjectForm, setCreativeProjectForm] = useState({ playlist_id: "", name: "", language: "en", format: "9:16" });
   const [openCreativeProjectId, setOpenCreativeProjectId] = useState("");
   const [creativeMediaSearches, setCreativeMediaSearches] = useState({});
+  const [openCreativeEditorId, setOpenCreativeEditorId] = useState("");
+  const [creativeEditorDrafts, setCreativeEditorDrafts] = useState({});
   const [adsSection, setAdsSection] = useState("overview");
   const [adsWizardStep, setAdsWizardStep] = useState(1);
   const [metaDraftForm, setMetaDraftForm] = useState({
@@ -2151,6 +2153,50 @@ export default function PlaylistManager() {
     });
   }
 
+  function openCreativeEditor(concept, asset) {
+    const saved = concept.render_spec?.editor || {};
+    const duration = Math.max(1, Number(asset.duration_seconds || 15));
+    setCreativeEditorDrafts((current) => ({
+      ...current,
+      [concept.id]: {
+        asset_id: saved.asset_id || asset.id,
+        hook_text: saved.hook_text || concept.hook || "",
+        cta_text: saved.cta_text || concept.cta || "Listen on Spotify",
+        hook_position: saved.hook_position || "center",
+        text_align: saved.text_align || "center",
+        text_color: saved.text_color || "#FFFFFF",
+        accent_color: saved.accent_color || "#1ED760",
+        overlay_color: saved.overlay_color || "#000000",
+        overlay_opacity: saved.overlay_opacity ?? 0.28,
+        trim_start: saved.trim_start ?? 0,
+        trim_end: saved.trim_end ?? Math.min(duration, 15),
+        hook_start: saved.hook_start ?? 0,
+        hook_end: saved.hook_end ?? Math.min(duration, 4),
+        show_cover: saved.show_cover !== false,
+        cover_position: saved.cover_position || "bottom",
+        show_cta: saved.show_cta !== false,
+      },
+    }));
+    setOpenCreativeEditorId((current) => current === concept.id ? "" : concept.id);
+  }
+
+  function updateCreativeEditor(conceptId, patch) {
+    setCreativeEditorDrafts((current) => ({ ...current, [conceptId]: { ...(current[conceptId] || {}), ...patch } }));
+  }
+
+  async function saveCreativeEditor(conceptId) {
+    const draft = creativeEditorDrafts[conceptId];
+    if (!draft) return;
+    await run("Render specification saved", async () => {
+      await api("/api/meta/creative-editor/save", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { concept_id: conceptId, ...draft },
+      });
+      return loadCreativeProjects();
+    });
+  }
+
   async function saveMetaDraft() {
     await run("Campaign draft saved", async () => {
       await api("/api/meta/campaign-drafts", { method: "POST", accessToken: accessToken(), body: metaDraftForm });
@@ -3405,8 +3451,37 @@ export default function PlaylistManager() {
                       const mediaState = creativeMediaSearches[concept.id] || {};
                       const defaultQuery = concept.visual_search_terms?.[0] || concept.visual_direction || "people listening music";
                       const assignedAssets = assets.filter((asset) => asset.concept_id === concept.id && asset.asset_type === "video");
+                      const editorDraft = creativeEditorDrafts[concept.id] || concept.render_spec?.editor || {};
+                      const editorAsset = assignedAssets.find((asset) => asset.id === editorDraft.asset_id) || assignedAssets[0];
                       return <article key={concept.id} className={assignedAssets.length ? "hasMedia" : ""}><span>Concept {concept.position} · {concept.status.replaceAll("_", " ")}</span><h3>{concept.title}</h3><strong>{concept.hook}</strong><p>{concept.story}</p><dl><div><dt>Angle</dt><dd>{concept.angle}</dd></div><div><dt>Visual</dt><dd>{concept.visual_direction}</dd></div><div><dt>Hypothesis</dt><dd>{concept.hypothesis}</dd></div></dl><div className="creativeConceptTerms">{(concept.visual_search_terms || []).map((term) => <button key={term} onClick={() => setCreativeMediaQuery(concept.id, term)}>{term}</button>)}</div>
-                        {assignedAssets.map((asset) => <div className="creativeAssignedMedia" key={asset.id}><video src={asset.source_url} poster={asset.metadata?.image || ""} muted controls playsInline preload="metadata" /><div><strong>Selected Pexels clip</strong><small>{asset.width}×{asset.height} · {Number(asset.duration_seconds || 0).toFixed(1)}s</small>{asset.metadata?.pexels_url ? <a href={asset.metadata.pexels_url} target="_blank" rel="noreferrer">Video by {asset.metadata?.creator_name || "creator"} on Pexels</a> : null}</div></div>)}
+                        {assignedAssets.map((asset) => <div className="creativeAssignedMedia" key={asset.id}><video src={asset.source_url} poster={asset.metadata?.image || ""} muted controls playsInline preload="metadata" /><div><strong>Selected Pexels clip</strong><small>{asset.width}×{asset.height} · {Number(asset.duration_seconds || 0).toFixed(1)}s</small>{asset.metadata?.pexels_url ? <a href={asset.metadata.pexels_url} target="_blank" rel="noreferrer">Video by {asset.metadata?.creator_name || "creator"} on Pexels</a> : null}<button onClick={() => openCreativeEditor(concept, asset)}>{openCreativeEditorId === concept.id ? "Close editor" : concept.render_spec?.editor ? "Edit render" : "Open editor"}</button></div></div>)}
+                        {openCreativeEditorId === concept.id && editorAsset ? <div className="creativeEditor">
+                          <div className={`creativeEditorPreview creativeEditorPreview--${project.format.replace(":", "x")}`} style={{ "--editor-overlay": editorDraft.overlay_color || "#000000", "--editor-opacity": editorDraft.overlay_opacity ?? 0.28, "--editor-text": editorDraft.text_color || "#FFFFFF", "--editor-accent": editorDraft.accent_color || "#1ED760" }}>
+                            <video src={editorAsset.source_url} poster={editorAsset.metadata?.image || ""} muted autoPlay loop playsInline />
+                            <div className="creativeEditorShade" />
+                            <div className={`creativeEditorHook creativeEditorHook--${editorDraft.hook_position || "center"}`} style={{ textAlign: editorDraft.text_align || "center" }}><strong>{editorDraft.hook_text || concept.hook}</strong></div>
+                            {editorDraft.show_cover !== false ? <div className={`creativeEditorBrand creativeEditorBrand--${editorDraft.cover_position || "bottom"}`}><Artwork src={project.playlists?.image || project.brief?.cover_image} alt="" size="md" /><span>{project.playlists?.name || project.brief?.playlist_name}</span></div> : null}
+                            {editorDraft.show_cta !== false ? <div className="creativeEditorCta">{editorDraft.cta_text || "Listen on Spotify"}</div> : null}
+                          </div>
+                          <div className="creativeEditorControls">
+                            {assignedAssets.length > 1 ? <label className="creativeEditorWide"><span>Video</span><select value={editorDraft.asset_id || editorAsset.id} onChange={(event) => updateCreativeEditor(concept.id, { asset_id: event.target.value })}>{assignedAssets.map((asset, index) => <option value={asset.id} key={asset.id}>Clip {index + 1} · {asset.width}×{asset.height}</option>)}</select></label> : null}
+                            <label className="creativeEditorWide"><span>Hook overlay</span><input value={editorDraft.hook_text || ""} maxLength={120} onChange={(event) => updateCreativeEditor(concept.id, { hook_text: event.target.value })} /></label>
+                            <label className="creativeEditorWide"><span>CTA</span><input value={editorDraft.cta_text || ""} maxLength={80} onChange={(event) => updateCreativeEditor(concept.id, { cta_text: event.target.value })} /></label>
+                            <label><span>Hook position</span><select value={editorDraft.hook_position || "center"} onChange={(event) => updateCreativeEditor(concept.id, { hook_position: event.target.value })}><option value="top">Top</option><option value="center">Center</option><option value="bottom">Bottom</option></select></label>
+                            <label><span>Text alignment</span><select value={editorDraft.text_align || "center"} onChange={(event) => updateCreativeEditor(concept.id, { text_align: event.target.value })}><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></label>
+                            <label><span>Text color</span><input type="color" value={editorDraft.text_color || "#FFFFFF"} onChange={(event) => updateCreativeEditor(concept.id, { text_color: event.target.value })} /></label>
+                            <label><span>Accent</span><input type="color" value={editorDraft.accent_color || "#1ED760"} onChange={(event) => updateCreativeEditor(concept.id, { accent_color: event.target.value })} /></label>
+                            <label><span>Clip starts</span><input type="number" min="0" max={Math.max(0, Number(editorAsset.duration_seconds || 1) - 0.5)} step="0.1" value={editorDraft.trim_start ?? 0} onChange={(event) => updateCreativeEditor(concept.id, { trim_start: Number(event.target.value) })} /></label>
+                            <label><span>Clip ends</span><input type="number" min="0.5" max={Number(editorAsset.duration_seconds || 15)} step="0.1" value={editorDraft.trim_end ?? Math.min(Number(editorAsset.duration_seconds || 15), 15)} onChange={(event) => updateCreativeEditor(concept.id, { trim_end: Number(event.target.value) })} /></label>
+                            <label><span>Hook starts</span><input type="number" min="0" step="0.1" value={editorDraft.hook_start ?? 0} onChange={(event) => updateCreativeEditor(concept.id, { hook_start: Number(event.target.value) })} /></label>
+                            <label><span>Hook ends</span><input type="number" min="0.25" step="0.1" value={editorDraft.hook_end ?? 4} onChange={(event) => updateCreativeEditor(concept.id, { hook_end: Number(event.target.value) })} /></label>
+                            <label><span>Overlay strength</span><input type="range" min="0" max="0.85" step="0.05" value={editorDraft.overlay_opacity ?? 0.28} onChange={(event) => updateCreativeEditor(concept.id, { overlay_opacity: Number(event.target.value) })} /></label>
+                            <label><span>Cover position</span><select value={editorDraft.cover_position || "bottom"} onChange={(event) => updateCreativeEditor(concept.id, { cover_position: event.target.value })}><option value="top">Top</option><option value="center">Center</option><option value="bottom">Bottom</option></select></label>
+                            <label className="creativeEditorToggle"><input type="checkbox" checked={editorDraft.show_cover !== false} onChange={(event) => updateCreativeEditor(concept.id, { show_cover: event.target.checked })} /><span>Show playlist cover</span></label>
+                            <label className="creativeEditorToggle"><input type="checkbox" checked={editorDraft.show_cta !== false} onChange={(event) => updateCreativeEditor(concept.id, { show_cta: event.target.checked })} /><span>Show CTA</span></label>
+                            <div className="creativeEditorActions"><button disabled={busy || !String(editorDraft.hook_text || "").trim()} onClick={() => saveCreativeEditor(concept.id)}>{concept.render_spec?.editor ? "Update render spec" : "Save render spec"}</button><small>{concept.render_spec?.editor ? "Saved specification loaded" : "No render is started yet"}</small></div>
+                          </div>
+                        </div> : null}
                         <div className="creativeMediaSearch"><div><input aria-label={`Pexels query for ${concept.title}`} value={mediaState.query ?? defaultQuery} onChange={(event) => setCreativeMediaQuery(concept.id, event.target.value)} /><button disabled={mediaState.loading} onClick={() => searchCreativeMedia(concept)}>{mediaState.loading ? "Searching…" : assignedAssets.length ? "Find another" : "Find videos"}</button></div>{mediaState.videos?.length ? <><small>{mediaState.total} Pexels results · select one to attach it</small><div className="creativeMediaResults">{mediaState.videos.map((video) => <div key={video.id}><video src={video.source_url} poster={video.image} muted controls playsInline preload="metadata" /><div><span>{video.duration}s · {video.source_width}×{video.source_height}</span><button disabled={busy} onClick={() => selectCreativeMedia(concept, video)}>Use clip</button><a href={video.url} target="_blank" rel="noreferrer">{video.user?.name || "Pexels"}</a></div></div>)}</div><a className="pexelsAttribution" href="https://www.pexels.com" target="_blank" rel="noreferrer">Videos provided by Pexels</a></> : null}</div>
                       </article>;
                     })}</div> : null}
@@ -6299,6 +6374,34 @@ export default function PlaylistManager() {
         .creativeAssignedMedia video { max-height: 150px; border-radius: 6px; }
         .creativeAssignedMedia > div { display: grid; gap: 4px; }
         .creativeAssignedMedia small, .creativeAssignedMedia a { color: #85909d; font-size: 10px; }
+        .creativeEditor { display: grid; grid-template-columns: minmax(210px, 0.7fr) minmax(0, 1.3fr); gap: 14px; padding: 14px; border: 1px solid rgba(24, 224, 111, 0.35); border-radius: 10px; background: #090d11; }
+        .creativeEditorPreview { position: relative; width: 100%; max-width: 320px; aspect-ratio: 9 / 16; justify-self: center; overflow: hidden; border-radius: 12px; background: #050608; box-shadow: 0 18px 48px rgba(0,0,0,.38); }
+        .creativeEditorPreview--4x5 { aspect-ratio: 4 / 5; }
+        .creativeEditorPreview--1x1 { aspect-ratio: 1; }
+        .creativeEditorPreview > video { width: 100%; height: 100%; object-fit: cover; }
+        .creativeEditorShade { position: absolute; inset: 0; background: var(--editor-overlay); opacity: var(--editor-opacity); pointer-events: none; }
+        .creativeEditorHook { position: absolute; z-index: 2; left: 7%; right: 7%; display: flex; align-items: center; color: var(--editor-text); }
+        .creativeEditorHook strong { width: 100%; font-size: clamp(20px, 3.1vw, 34px); line-height: .98; letter-spacing: -0.04em; text-shadow: 0 2px 16px rgba(0,0,0,.55); }
+        .creativeEditorHook strong::after { content: ""; display: block; width: 42px; height: 4px; margin: 10px auto 0; border-radius: 999px; background: var(--editor-accent); }
+        .creativeEditorHook[style*="left"] strong::after { margin-left: 0; }
+        .creativeEditorHook[style*="right"] strong::after { margin-right: 0; }
+        .creativeEditorHook--top { top: 10%; }
+        .creativeEditorHook--center { top: 39%; }
+        .creativeEditorHook--bottom { bottom: 20%; }
+        .creativeEditorBrand { position: absolute; z-index: 3; left: 7%; right: 7%; display: flex; align-items: center; gap: 8px; color: #fff; font-size: 10px; font-weight: 800; text-shadow: 0 2px 10px #000; }
+        .creativeEditorBrand--top { top: 4%; }
+        .creativeEditorBrand--center { top: 52%; }
+        .creativeEditorBrand--bottom { bottom: 8%; }
+        .creativeEditorCta { position: absolute; z-index: 4; right: 7%; bottom: 3%; padding: 7px 10px; border-radius: 999px; color: #07140c; background: var(--editor-accent); font-size: 9px; font-weight: 900; }
+        .creativeEditorControls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; align-content: start; }
+        .creativeEditorControls label { display: grid; gap: 5px; }
+        .creativeEditorControls label > span { color: #7f8998; font-size: 9px; font-weight: 800; text-transform: uppercase; }
+        .creativeEditorControls input[type="color"] { width: 100%; min-height: 38px; padding: 4px; }
+        .creativeEditorWide, .creativeEditorActions { grid-column: 1 / -1; }
+        .creativeEditorToggle { display: flex !important; grid-template-columns: auto 1fr; align-items: center; }
+        .creativeEditorToggle input { width: auto; }
+        .creativeEditorActions { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 6px; }
+        .creativeEditorActions small { color: #788391; }
         .creativeEmptyState, .creativeLibraryEmpty > div { display: grid; justify-items: start; gap: 8px; padding: 24px; border: 1px dashed #3a4351; border-radius: 10px; color: #8d96a4; }
         .creativeEmptyState p, .creativeLibraryEmpty p { margin: 0; color: #8d96a4; }
         .creativeLibraryEmpty { display: grid; gap: 14px; }
@@ -8606,6 +8709,9 @@ export default function PlaylistManager() {
           .creativeProjectSummary > button { grid-column: 1 / -1; }
           .creativeConceptGrid { grid-template-columns: 1fr; }
           .creativeMediaResults { grid-template-columns: 1fr 1fr; }
+          .creativeEditor { grid-template-columns: 1fr; }
+          .creativeEditorControls { grid-template-columns: 1fr; }
+          .creativeEditorWide, .creativeEditorActions { grid-column: auto; }
           .adsWizardSteps { grid-template-columns: 1fr; }
           .adsPlacementChoices { grid-template-columns: 1fr; }
           .adsDeliverySummary { grid-template-columns: 1fr; }
