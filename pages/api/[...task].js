@@ -781,6 +781,7 @@ async function metaGraphMutation(connection, path, params = {}) {
 }
 
 function normalizeMetaDraftInput(body = {}) {
+  const playlistId = String(body.playlist_id || "").trim();
   const name = String(body.name || "").trim().slice(0, 120);
   const destinationUrl = String(body.destination_url || "").trim();
   const primaryText = String(body.primary_text || "").trim().slice(0, 1000);
@@ -791,6 +792,7 @@ function normalizeMetaDraftInput(body = {}) {
   const ageMax = Math.max(ageMin, Math.min(65, Number.parseInt(body.age_max, 10) || 45));
   const countries = Array.from(new Set(String(body.countries || "DE").split(",").map((item) => item.trim().toUpperCase()).filter((item) => /^[A-Z]{2}$/.test(item)))).slice(0, 25);
   if (name.length < 3) throw new Error("campaign_name_required");
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(playlistId)) throw new Error("playlist_required");
   if (!Number.isInteger(dailyBudgetMinor) || dailyBudgetMinor < 100) throw new Error("daily_budget_must_be_at_least_1_eur");
   for (const [key, value] of [["destination_url", destinationUrl], ["image_url", imageUrl]]) {
     let parsed;
@@ -801,6 +803,7 @@ function normalizeMetaDraftInput(body = {}) {
   if (!headline) throw new Error("headline_required");
   if (!countries.length) throw new Error("target_country_required");
   return {
+    playlist_id: playlistId,
     name,
     objective: "OUTCOME_TRAFFIC",
     daily_budget_minor: dailyBudgetMinor,
@@ -2346,6 +2349,41 @@ const routes = {
     return json(res, 200, sanitizeMetaConnection(connection, assets));
   },
 
+  /* ---------- meta/creative-upload (POST) ---------- */
+  "meta/creative-upload": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const body = await readBody(req);
+    const contentType = String(body.content_type || "").toLowerCase();
+    const extensionByType = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" };
+    const extension = extensionByType[contentType];
+    if (!extension) return bad(res, 400, "creative_image_type_not_allowed");
+    const rawBase64 = String(body.data_base64 || "").replace(/^data:[^;]+;base64,/, "");
+    if (!rawBase64 || rawBase64.length > 4_300_000) return bad(res, 413, "creative_image_too_large");
+    let bytes;
+    try { bytes = Buffer.from(rawBase64, "base64"); }
+    catch { return bad(res, 400, "invalid_creative_image"); }
+    if (!bytes.length || bytes.length > 3 * 1024 * 1024) return bad(res, 413, "creative_image_too_large");
+    const signatures = {
+      "image/jpeg": bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff,
+      "image/png": bytes.slice(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+      "image/webp": bytes.slice(0, 4).toString("ascii") === "RIFF" && bytes.slice(8, 12).toString("ascii") === "WEBP",
+    };
+    if (!signatures[contentType]) return bad(res, 400, "creative_image_content_mismatch");
+    const owner = String(ctx.bubble_user_id).replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80) || "admin";
+    const objectPath = `${owner}/${Date.now()}-${randomUUID()}.${extension}`;
+    const upload = await sb(`/storage/v1/object/meta-ad-creatives/${objectPath.split("/").map(encodeURIComponent).join("/")}`, {
+      method: "POST",
+      headers: { "Content-Type": contentType, "x-upsert": "false" },
+      body: bytes,
+    });
+    const uploadText = await upload.text();
+    if (!upload.ok) return bad(res, 502, `creative_upload_failed: ${uploadText.slice(0, 500)}`);
+    const publicUrl = `${need("SUPABASE_URL")}/storage/v1/object/public/meta-ad-creatives/${objectPath.split("/").map(encodeURIComponent).join("/")}`;
+    return json(res, 201, { url: publicUrl, content_type: contentType, size: bytes.length });
+  },
+
   /* ---------- meta/campaign-drafts (GET/POST) ---------- */
   "meta/campaign-drafts": async (req, res) => {
     const ctx = await requireAdminContext(req, res);
@@ -2363,6 +2401,12 @@ const routes = {
     let input;
     try { input = normalizeMetaDraftInput(await readBody(req)); }
     catch (error) { return bad(res, 400, String(error?.message || "invalid_campaign_draft")); }
+    const playlistResponse = await sb(
+      `/rest/v1/playlists?select=id&limit=1&id=eq.${encodeURIComponent(input.playlist_id)}` +
+      `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}`
+    );
+    const ownedPlaylist = playlistResponse.ok ? (await playlistResponse.json().catch(() => []))[0] : null;
+    if (!ownedPlaylist) return bad(res, 404, "campaign_playlist_not_found");
     const payload = {
       connection_id: connection.id,
       bubble_user_id: ctx.bubble_user_id,

@@ -624,6 +624,7 @@ export default function PlaylistManager() {
   const [adsSection, setAdsSection] = useState("overview");
   const [adsWizardStep, setAdsWizardStep] = useState(1);
   const [metaDraftForm, setMetaDraftForm] = useState({
+    playlist_id: "",
     name: "Bored Indie Kid — Spotify traffic",
     daily_budget_eur: "10",
     destination_url: "",
@@ -2060,6 +2061,47 @@ export default function PlaylistManager() {
     });
   }
 
+  function selectMetaCampaignPlaylist(selectedId) {
+    const selected = playlists.find((item) => item.id === selectedId);
+    setMetaDraftForm((current) => ({
+      ...current,
+      playlist_id: selectedId,
+      name: selected ? `${selected.name} — Spotify traffic` : current.name,
+      destination_url: selected?.playlist_id ? `https://open.spotify.com/playlist/${selected.playlist_id}` : current.destination_url,
+      image_url: selected?.image || current.image_url,
+      headline: selected ? `Discover ${selected.name}`.slice(0, 255) : current.headline,
+    }));
+  }
+
+  async function uploadMetaCreative(event) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+      setError("Choose a JPEG, PNG, or WebP image.");
+      return;
+    }
+    if (file.size > 3 * 1024 * 1024) {
+      setError("Creative images must be 3 MB or smaller.");
+      return;
+    }
+    await run("Creative uploaded", async () => {
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(new Error("creative_file_read_failed"));
+        reader.readAsDataURL(file);
+      });
+      const data = await api("/api/meta/creative-upload", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { content_type: file.type, data_base64: dataUrl.split(",")[1] || "" },
+      });
+      setMetaDraftForm((current) => ({ ...current, image_url: data.url }));
+      return data;
+    });
+  }
+
   async function reviewMetaDraft(draftId) {
     await run("Campaign draft approved for paused creation", async () => {
       await api("/api/meta/campaign-drafts/review", { method: "POST", accessToken: accessToken(), body: { draft_id: draftId } });
@@ -3285,8 +3327,10 @@ export default function PlaylistManager() {
           </div>
           <div className="metaDraftGrid">
             {adsWizardStep === 1 ? <>
+              <label className="metaDraftWide"><span>Playlist</span><select value={metaDraftForm.playlist_id} onChange={(e) => selectMetaCampaignPlaylist(e.target.value)}><option value="">Select a playlist</option>{playlists.map((item) => <option key={item.id} value={item.id}>{item.name} · {formatNumber(item.followers)} followers</option>)}</select></label>
               <label className="metaDraftWide"><span>Campaign name</span><input value={metaDraftForm.name} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, name: e.target.value })} /></label>
               <label className="metaDraftWide"><span>Spotify destination URL</span><input type="url" value={metaDraftForm.destination_url} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, destination_url: e.target.value })} placeholder="https://open.spotify.com/playlist/..." /></label>
+              {metaDraftForm.playlist_id ? <article className="adsSelectedPlaylist"><Artwork src={playlists.find((item) => item.id === metaDraftForm.playlist_id)?.image} alt="" size="lg" /><div><span>Campaign destination</span><strong>{playlists.find((item) => item.id === metaDraftForm.playlist_id)?.name}</strong><small>Spotify link and cover imported automatically</small></div></article> : null}
             </> : null}
             {adsWizardStep === 2 ? <>
               <label><span>Daily budget (EUR)</span><input type="number" min="1" step="1" value={metaDraftForm.daily_budget_eur} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, daily_budget_eur: e.target.value })} /></label>
@@ -3296,14 +3340,17 @@ export default function PlaylistManager() {
             </> : null}
             {adsWizardStep === 3 ? <>
               <label className="metaDraftWide"><span>Creative image URL</span><input type="url" value={metaDraftForm.image_url} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, image_url: e.target.value })} placeholder="https://.../cover.jpg" /></label>
+              <label className="adsCreativeUpload metaDraftWide"><span>Or upload a custom image</span><input type="file" accept="image/jpeg,image/png,image/webp" disabled={busy} onChange={uploadMetaCreative} /><small>JPEG, PNG or WebP · maximum 3 MB · square images work best</small></label>
               <label className="metaDraftWide"><span>Headline</span><input value={metaDraftForm.headline} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, headline: e.target.value })} /></label>
               <label className="metaDraftWide"><span>Primary text</span><textarea rows="4" value={metaDraftForm.primary_text} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, primary_text: e.target.value })} /></label>
-              <aside className="adsCreativePreview"><span>Instagram preview</span>{metaDraftForm.image_url ? <img src={metaDraftForm.image_url} alt="Campaign creative preview" /> : <div className="adsCreativePlaceholder">Image preview</div>}<strong>{metaDraftForm.headline || "Your headline"}</strong><p>{metaDraftForm.primary_text || "Your primary text"}</p><small>Learn more</small></aside>
+              <div className="adsCreativePreviewGrid">
+                {[{ platform: "Instagram", identity: (metaWorkspace?.assets || []).find((asset) => asset.asset_type === "instagram_account" && asset.is_selected)?.name || "Instagram" }, { platform: "Facebook", identity: (metaWorkspace?.assets || []).find((asset) => asset.asset_type === "page" && asset.is_selected)?.name || "Facebook Page" }].map((preview) => <aside className="adsCreativePreview" key={preview.platform}><div className="adsPreviewIdentity"><span>{preview.platform} feed</span><strong>{preview.identity}</strong></div><p>{metaDraftForm.primary_text || "Your primary text"}</p>{metaDraftForm.image_url ? <img src={metaDraftForm.image_url} alt={`${preview.platform} campaign preview`} /> : <div className="adsCreativePlaceholder">Image preview</div>}<div className="adsPreviewLink"><div><small>OPEN.SPOTIFY.COM</small><strong>{metaDraftForm.headline || "Your headline"}</strong></div><b>Learn more</b></div></aside>)}
+              </div>
             </> : null}
           </div>
           <div className="metaFormActions adsWizardActions">
             <button disabled={busy || adsWizardStep === 1} onClick={() => setAdsWizardStep((step) => Math.max(1, step - 1))}>Back</button>
-            {adsWizardStep < 3 ? <button disabled={busy} onClick={() => setAdsWizardStep((step) => Math.min(3, step + 1))}>Continue</button> : <button disabled={busy || !metaWorkspace?.readiness?.publishing_ready} onClick={saveMetaDraft}>Save campaign draft</button>}
+            {adsWizardStep < 3 ? <button disabled={busy || (adsWizardStep === 1 && (!metaDraftForm.playlist_id || !metaDraftForm.destination_url))} onClick={() => setAdsWizardStep((step) => Math.min(3, step + 1))}>Continue</button> : <button disabled={busy || !metaWorkspace?.readiness?.publishing_ready || !metaDraftForm.image_url} onClick={saveMetaDraft}>Save campaign draft</button>}
             <small>Objective and delivery status are locked to <b>Traffic</b> and <b>PAUSED</b>.</small>
           </div>
         </section>
@@ -6057,8 +6104,34 @@ export default function PlaylistManager() {
         .adsWizardSteps button.active { border-color: #18e06f; color: #f4f6f8; }
         .adsWizardSteps button.active span,
         .adsWizardSteps button.complete span { color: #07140c; background: #18e06f; }
-        .adsCreativePreview {
+        .adsSelectedPlaylist {
           grid-column: span 2;
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          padding: 12px;
+          border: 1px solid rgba(24, 224, 111, 0.35);
+          border-radius: 9px;
+          background: rgba(24, 224, 111, 0.05);
+        }
+        .adsSelectedPlaylist div { display: grid; gap: 3px; }
+        .adsSelectedPlaylist span,
+        .adsSelectedPlaylist small { color: #7f8998; font-size: 11px; }
+        .adsCreativeUpload {
+          align-content: start;
+          padding: 10px 12px;
+          border: 1px dashed #3a4351;
+          border-radius: 8px;
+        }
+        .adsCreativeUpload small { color: #7f8998; font-weight: 500; }
+        .adsCreativeUpload input { padding: 7px 0; border: 0; background: transparent; }
+        .adsCreativePreviewGrid {
+          grid-column: 1 / -1;
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 12px;
+        }
+        .adsCreativePreview {
           display: grid;
           gap: 10px;
           overflow: hidden;
@@ -6067,12 +6140,16 @@ export default function PlaylistManager() {
           border-radius: 9px;
           background: #11151b;
         }
-        .adsCreativePreview > span { color: #7f8998; font-size: 11px; font-weight: 900; text-transform: uppercase; }
+        .adsPreviewIdentity { display: grid; gap: 3px; }
+        .adsPreviewIdentity span { color: #7f8998; font-size: 10px; font-weight: 900; text-transform: uppercase; }
         .adsCreativePreview img,
-        .adsCreativePlaceholder { width: 100%; height: 220px; border-radius: 6px; object-fit: cover; background: #202631; }
+        .adsCreativePlaceholder { width: calc(100% + 24px); height: 280px; margin: 0 -12px; object-fit: cover; background: #202631; }
         .adsCreativePlaceholder { display: grid; place-items: center; color: #657080; }
         .adsCreativePreview p { margin: 0; color: #a6adba; font-size: 12px; }
-        .adsCreativePreview small { color: #18e06f; font-weight: 900; }
+        .adsPreviewLink { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+        .adsPreviewLink div { display: grid; gap: 3px; }
+        .adsPreviewLink small { color: #7f8998; font-size: 9px; }
+        .adsPreviewLink b { padding: 7px 9px; border: 1px solid #3a4351; border-radius: 5px; font-size: 10px; white-space: nowrap; }
         .adsWizardActions { justify-content: flex-end; }
         .adsWizardActions small { margin-right: auto; order: -1; }
         .metaFormActions {
@@ -6212,6 +6289,7 @@ export default function PlaylistManager() {
           font-weight: 800;
         }
         .metaDraftGrid input,
+        .metaDraftGrid select,
         .metaDraftGrid textarea {
           width: 100%;
           border: 1px solid #303744;
@@ -8218,7 +8296,8 @@ export default function PlaylistManager() {
             grid-column: auto;
           }
           .metaDraftWide { grid-column: auto; }
-          .adsCreativePreview { grid-column: auto; }
+          .adsSelectedPlaylist { grid-column: auto; }
+          .adsCreativePreviewGrid { grid-template-columns: 1fr; }
           .metaFormActions {
             align-items: stretch;
             flex-direction: column;
