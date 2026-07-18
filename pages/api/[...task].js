@@ -991,6 +991,7 @@ function normalizePexelsVideo(video) {
     height: Number(video.height || source.height || 0),
     duration: Number(video.duration || 0),
     image: video.image || video.video_pictures?.[0]?.picture || "",
+    preview_images: (video.video_pictures || []).map((picture) => String(picture?.picture || "")).filter(Boolean).slice(0, 3),
     url: video.url || "",
     user: { name: video.user?.name || "Pexels creator", url: video.user?.url || "" },
     source_url: source.link,
@@ -999,6 +1000,93 @@ function normalizePexelsVideo(video) {
     source_quality: source.quality || "",
     source_file_type: source.file_type || "video/mp4",
   };
+}
+
+async function searchPexelsVideos({ query, format, language, perPage = 8 }) {
+  const params = new URLSearchParams({
+    query,
+    orientation: pexelsOrientation(format),
+    size: "medium",
+    locale: language === "de" ? "de-DE" : "en-US",
+    per_page: String(Math.max(1, Math.min(20, perPage))),
+    page: "1",
+  });
+  const response = await fetch(`https://api.pexels.com/v1/videos/search?${params}`, {
+    headers: { Authorization: need("PEXELS_API_KEY"), Accept: "application/json" },
+  });
+  const parsed = await parseJsonSafe(response);
+  if (!response.ok) throw new Error(`pexels_${response.status}: ${parsed.json?.error || parsed.text.slice(0, 500)}`);
+  return {
+    videos: (parsed.json?.videos || []).map(normalizePexelsVideo).filter(Boolean),
+    total: Number(parsed.json?.total_results || 0),
+    remaining: response.headers.get("x-ratelimit-remaining"),
+    reset: response.headers.get("x-ratelimit-reset"),
+  };
+}
+
+function creativeMediaRecommendationSchema(candidateIds) {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["recommendations"],
+    properties: {
+      recommendations: {
+        type: "array",
+        minItems: 1,
+        maxItems: 6,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["video_id", "overall_score", "concept_match", "hook_space", "visual_quality", "vertical_suitability", "brand_safety", "best_template", "summary"],
+          properties: {
+            video_id: { type: "string", enum: candidateIds },
+            overall_score: { type: "integer", minimum: 0, maximum: 100 },
+            concept_match: { type: "integer", minimum: 0, maximum: 100 },
+            hook_space: { type: "integer", minimum: 0, maximum: 100 },
+            visual_quality: { type: "integer", minimum: 0, maximum: 100 },
+            vertical_suitability: { type: "integer", minimum: 0, maximum: 100 },
+            brand_safety: { type: "integer", minimum: 0, maximum: 100 },
+            best_template: { type: "string", enum: ["bold_center", "editorial_top", "minimal_bottom"] },
+            summary: { type: "string", maxLength: 240 },
+          },
+        },
+      },
+    },
+  };
+}
+
+async function recommendCreativeMediaWithOpenAI({ concept, project, candidates }) {
+  const content = [{
+    type: "input_text",
+    text: `Select up to six diverse stock-video candidates for this playlist ad concept. Rank the best first. Judge actual concept fit, usable negative space for overlay text, visual quality, portrait suitability and commercial brand safety. Avoid near-duplicate scenes. Recommend the layout that preserves the subject. Do not infer facts not visible in the supplied preview frames.\n\nConcept: ${concept.title}\nHook: ${concept.hook}\nAngle: ${concept.angle}\nStory: ${concept.story}\nVisual direction: ${concept.visual_direction}\nFormat: ${project.format}`,
+  }];
+  for (const candidate of candidates) {
+    content.push({ type: "input_text", text: `Candidate video_id=${candidate.id}; duration=${candidate.duration}s; dimensions=${candidate.source_width}x${candidate.source_height}. The following images are preview frames from this candidate.` });
+    for (const imageUrl of (candidate.preview_images?.length ? candidate.preview_images : [candidate.image]).filter(Boolean).slice(0, 3)) {
+      content.push({ type: "input_image", image_url: imageUrl, detail: "low" });
+    }
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 110000);
+  try {
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      signal: controller.signal,
+      headers: { Authorization: `Bearer ${need("OPENAI_API_KEY")}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || "gpt-5.6",
+        input: [{ role: "user", content }],
+        text: { format: { type: "json_schema", name: "creative_media_recommendations", strict: true, schema: creativeMediaRecommendationSchema(candidates.map((candidate) => candidate.id)) } },
+        max_output_tokens: 3500,
+        store: false,
+      }),
+    });
+    const parsed = await parseJsonSafe(response);
+    if (!response.ok) throw new Error(`openai_${response.status}: ${parsed.json?.error?.message || parsed.text.slice(0, 500)}`);
+    return JSON.parse(extractOpenAIText(parsed.json));
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function loadOwnedCreativeConcept(conceptId, connectionId, bubbleUserId) {
@@ -2906,6 +2994,54 @@ const routes = {
     });
   },
 
+  /* ---------- meta/creative-media/recommend (POST) ---------- */
+  "meta/creative-media/recommend": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+    const body = await readBody(req);
+    const conceptId = String(body.concept_id || "").trim();
+    if (!/^[0-9a-f-]{36}$/i.test(conceptId)) return bad(res, 400, "creative_concept_required");
+    const owned = await loadOwnedCreativeConcept(conceptId, connection.id, ctx.bubble_user_id);
+    if (!owned) return bad(res, 404, "creative_concept_not_found");
+
+    const requestedQuery = String(body.query || "").replace(/\s+/g, " ").trim().slice(0, 120);
+    const queries = [requestedQuery, ...(owned.concept.visual_search_terms || []), owned.concept.visual_direction]
+      .map((value) => String(value || "").replace(/\s+/g, " ").trim().slice(0, 120))
+      .filter((value, index, values) => value.length >= 2 && values.indexOf(value) === index)
+      .slice(0, 2);
+    if (!queries.length) queries.push("people listening music");
+
+    try {
+      const searches = await Promise.all(queries.map((query) => searchPexelsVideos({ query, format: owned.project.format, language: owned.project.language, perPage: 8 })));
+      const unique = new Map();
+      searches.flatMap((search) => search.videos).forEach((video) => {
+        const portraitEnough = video.source_height >= video.source_width;
+        const usefulDuration = video.duration >= 5 && video.duration <= 30;
+        if (portraitEnough && usefulDuration && !unique.has(video.id)) unique.set(video.id, video);
+      });
+      const candidates = [...unique.values()].slice(0, 12);
+      if (!candidates.length) return bad(res, 404, "no_suitable_pexels_videos");
+      const ranked = await recommendCreativeMediaWithOpenAI({ concept: owned.concept, project: owned.project, candidates });
+      const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+      const recommendations = (ranked.recommendations || []).map((recommendation) => {
+        const video = byId.get(String(recommendation.video_id));
+        return video ? { ...video, ai: recommendation } : null;
+      }).filter(Boolean);
+      return json(res, 200, {
+        queries,
+        inspected: candidates.length,
+        recommendations,
+        rate_limit: { remaining: searches.map((search) => search.remaining).filter(Boolean).at(-1) || null, reset: searches.map((search) => search.reset).filter(Boolean).at(-1) || null },
+        model: process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || "gpt-5.6",
+      });
+    } catch (error) {
+      return bad(res, 502, String(error?.name === "AbortError" ? "creative_media_recommendation_timed_out" : error?.message || error).slice(0, 1000));
+    }
+  },
+
   /* ---------- meta/creative-media/select (POST) ---------- */
   "meta/creative-media/select": async (req, res) => {
     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
@@ -2951,6 +3087,16 @@ const routes = {
         pexels_url: String(body.pexels_url || "").slice(0, 1000),
         creator_name: String(body.creator_name || "").slice(0, 200),
         creator_url: String(body.creator_url || "").slice(0, 1000),
+        ai_recommendation: body.ai && typeof body.ai === "object" ? {
+          overall_score: Math.max(0, Math.min(100, Number(body.ai.overall_score) || 0)),
+          concept_match: Math.max(0, Math.min(100, Number(body.ai.concept_match) || 0)),
+          hook_space: Math.max(0, Math.min(100, Number(body.ai.hook_space) || 0)),
+          visual_quality: Math.max(0, Math.min(100, Number(body.ai.visual_quality) || 0)),
+          vertical_suitability: Math.max(0, Math.min(100, Number(body.ai.vertical_suitability) || 0)),
+          brand_safety: Math.max(0, Math.min(100, Number(body.ai.brand_safety) || 0)),
+          best_template: ["bold_center", "editorial_top", "minimal_bottom"].includes(body.ai.best_template) ? body.ai.best_template : "bold_center",
+          summary: String(body.ai.summary || "").slice(0, 240),
+        } : null,
       },
       updated_at: new Date().toISOString(),
     };

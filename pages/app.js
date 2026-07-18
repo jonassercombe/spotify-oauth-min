@@ -2138,6 +2138,26 @@ export default function PlaylistManager() {
     }
   }
 
+  async function recommendCreativeMedia(concept) {
+    const fallback = concept.visual_search_terms?.[0] || concept.visual_direction || "people listening music";
+    const query = creativeMediaSearches[concept.id]?.query || fallback;
+    setCreativeMediaSearches((current) => ({ ...current, [concept.id]: { ...(current[concept.id] || {}), query, recommending: true } }));
+    try {
+      const data = await api("/api/meta/creative-media/recommend", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { concept_id: concept.id, query },
+      });
+      setCreativeMediaSearches((current) => ({
+        ...current,
+        [concept.id]: { query, videos: data.recommendations || [], total: data.inspected || 0, recommending: false, aiRanked: true, queries: data.queries || [] },
+      }));
+    } catch (e) {
+      setCreativeMediaSearches((current) => ({ ...current, [concept.id]: { ...(current[concept.id] || {}), recommending: false } }));
+      setError(e.message || "AI video selection failed.");
+    }
+  }
+
   async function selectCreativeMedia(concept, video) {
     await run("Video assigned to concept", async () => {
       await api("/api/meta/creative-media/select", {
@@ -2155,6 +2175,7 @@ export default function PlaylistManager() {
           creator_name: video.user?.name,
           creator_url: video.user?.url,
           query: creativeMediaSearches[concept.id]?.query || "",
+          ai: video.ai || null,
         },
       });
       setCreativeMediaSearches((current) => ({ ...current, [concept.id]: { ...(current[concept.id] || {}), videos: [] } }));
@@ -2164,16 +2185,17 @@ export default function PlaylistManager() {
 
   function openCreativeEditor(concept, asset) {
     const saved = concept.render_spec?.editor || {};
+    const recommendedTemplate = CREATIVE_RENDER_TEMPLATES.find((template) => template.id === asset.metadata?.ai_recommendation?.best_template) || CREATIVE_RENDER_TEMPLATES[0];
     const duration = Math.max(1, Number(asset.duration_seconds || 15));
     setCreativeEditorDrafts((current) => ({
       ...current,
       [concept.id]: {
-        template_id: saved.template_id || "bold_center",
+        template_id: saved.template_id || recommendedTemplate.id,
         asset_id: saved.asset_id || asset.id,
         hook_text: saved.hook_text || concept.hook || "",
         cta_text: saved.cta_text || concept.cta || "Listen on Spotify",
-        hook_position: saved.hook_position || "center",
-        text_align: saved.text_align || "center",
+        hook_position: saved.hook_position || recommendedTemplate.hook_position,
+        text_align: saved.text_align || recommendedTemplate.text_align,
         text_color: saved.text_color || "#FFFFFF",
         accent_color: saved.accent_color || "#1ED760",
         overlay_color: saved.overlay_color || "#000000",
@@ -3600,7 +3622,7 @@ export default function PlaylistManager() {
                             <div className="creativeEditorActions"><div><button disabled={busy || !String(editorDraft.hook_text || "").trim()} onClick={() => saveCreativeEditor(concept.id)}>{concept.render_spec?.editor ? "Update render spec" : "Save render spec"}</button>{concept.render_spec?.editor && !["processing", "queued"].includes(latestRenderJob?.status) ? <button className="secondary" disabled={busy} onClick={() => queueCreativeRender(concept.id)}>Render video</button> : null}{["processing", "queued"].includes(latestRenderJob?.status) ? <button className="secondary" disabled={busy} onClick={() => syncCreativeRender(latestRenderJob.id)}>Refresh render</button> : null}</div><small>{latestRenderJob ? `Render: ${creativeRenderPolling[latestRenderJob.id] || latestRenderJob.status}` : concept.render_spec?.editor ? "Ready for rendering" : "No render is started yet"}{latestRenderJob?.error_message ? ` · ${latestRenderJob.error_message}` : ""}</small></div>
                           </div>
                         </div> : null}
-                        <div className="creativeMediaSearch"><div><input aria-label={`Pexels query for ${concept.title}`} value={mediaState.query ?? defaultQuery} onChange={(event) => setCreativeMediaQuery(concept.id, event.target.value)} /><button disabled={mediaState.loading} onClick={() => searchCreativeMedia(concept)}>{mediaState.loading ? "Searching…" : assignedAssets.length ? "Find another" : "Find videos"}</button></div>{mediaState.videos?.length ? <><small>{mediaState.total} Pexels results · select one to attach it</small><div className="creativeMediaResults">{mediaState.videos.map((video) => <div key={video.id}><video src={video.source_url} poster={video.image} muted controls playsInline preload="metadata" /><div><span>{video.duration}s · {video.source_width}×{video.source_height}</span><button disabled={busy} onClick={() => selectCreativeMedia(concept, video)}>Use clip</button><a href={video.url} target="_blank" rel="noreferrer">{video.user?.name || "Pexels"}</a></div></div>)}</div><a className="pexelsAttribution" href="https://www.pexels.com" target="_blank" rel="noreferrer">Videos provided by Pexels</a></> : null}</div>
+                        <div className="creativeMediaSearch"><div><input aria-label={`Pexels query for ${concept.title}`} value={mediaState.query ?? defaultQuery} onChange={(event) => setCreativeMediaQuery(concept.id, event.target.value)} /><button disabled={mediaState.loading || mediaState.recommending} onClick={() => searchCreativeMedia(concept)}>{mediaState.loading ? "Searching…" : assignedAssets.length ? "Find another" : "Find videos"}</button><button className="aiMediaButton" disabled={mediaState.loading || mediaState.recommending} onClick={() => recommendCreativeMedia(concept)}>{mediaState.recommending ? "AI reviewing…" : "AI shortlist"}</button></div>{mediaState.videos?.length ? <><small>{mediaState.aiRanked ? `${mediaState.videos.length} AI recommendations from ${mediaState.total} inspected clips` : `${mediaState.total} Pexels results · select one to attach it`}{mediaState.queries?.length ? ` · ${mediaState.queries.join(" + ")}` : ""}</small><div className={`creativeMediaResults ${mediaState.aiRanked ? "isAiRanked" : ""}`}>{mediaState.videos.map((video) => <div key={video.id}>{video.ai ? <div className="creativeAiScore"><b>{video.ai.overall_score}</b><span>AI match</span><small>{video.ai.best_template.replaceAll("_", " ")}</small></div> : null}<video src={video.source_url} poster={video.image} muted controls playsInline preload="metadata" />{video.ai && video.preview_images?.length ? <div className="creativePreviewFrames">{video.preview_images.map((image, index) => <img key={`${video.id}-${index}`} src={image} alt={`Preview frame ${index + 1}`} />)}</div> : null}<div><span>{video.duration}s · {video.source_width}×{video.source_height}</span><button disabled={busy} onClick={() => selectCreativeMedia(concept, video)}>Use clip</button>{video.ai ? <p>{video.ai.summary}</p> : null}<a href={video.url} target="_blank" rel="noreferrer">{video.user?.name || "Pexels"}</a></div></div>)}</div><a className="pexelsAttribution" href="https://www.pexels.com" target="_blank" rel="noreferrer">Videos provided by Pexels</a></> : null}</div>
                       </article>;
                     })}</div> : null}
                   </div> : null}
@@ -6494,13 +6516,22 @@ export default function PlaylistManager() {
         .creativeConceptGrid dt { color: #677282; font-size: 9px; font-weight: 800; text-transform: uppercase; }
         .creativeConceptGrid dd { margin: 0; color: #b8c0cb; font-size: 11px; line-height: 1.45; }
         .creativeMediaSearch { display: grid; gap: 8px; margin-top: 4px; padding-top: 12px; border-top: 1px solid #2b333e; }
-        .creativeMediaSearch > div:first-child { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
+        .creativeMediaSearch > div:first-child { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 7px; }
+        .creativeMediaSearch .aiMediaButton { color: #07140c; background: #18e06f; }
         .creativeMediaSearch input { min-width: 0; }
         .creativeMediaSearch > small { color: #788391; font-size: 10px; }
         .creativeMediaResults { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
         .creativeMediaResults > div { display: grid; overflow: hidden; border: 1px solid #323b47; border-radius: 8px; background: #0c1015; }
+        .creativeMediaResults.isAiRanked > div { position: relative; border-color: rgba(24, 224, 111, .38); }
+        .creativeAiScore { position: absolute; z-index: 4; top: 7px; left: 7px; display: grid; grid-template-columns: auto auto; align-items: center; gap: 0 5px; padding: 6px 8px; border: 1px solid rgba(255,255,255,.18); border-radius: 8px; color: #fff; background: rgba(5, 9, 12, .88); backdrop-filter: blur(8px); }
+        .creativeAiScore b { grid-row: 1 / 3; color: #18e06f; font-size: 20px; }
+        .creativeAiScore span, .creativeAiScore small { font-size: 8px; line-height: 1; text-transform: uppercase; }
+        .creativeAiScore small { color: #94a0ad; }
+        .creativePreviewFrames { display: grid !important; grid-template-columns: repeat(3, minmax(0, 1fr)) !important; gap: 2px !important; padding: 2px !important; }
+        .creativePreviewFrames img { width: 100%; aspect-ratio: 9 / 16; max-height: 90px; object-fit: cover; }
         .creativeMediaResults video, .creativeAssignedMedia video { width: 100%; aspect-ratio: 9 / 16; max-height: 270px; object-fit: cover; background: #080a0d; }
         .creativeMediaResults > div > div { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px; align-items: center; padding: 7px; }
+        .creativeMediaResults > div > div > p { grid-column: 1 / -1; margin: 2px 0; color: #aab3bf; font-size: 10px; line-height: 1.4; }
         .creativeMediaResults span, .creativeMediaResults a { color: #7f8998; font-size: 9px; }
         .creativeMediaResults a { grid-column: 1 / -1; }
         .pexelsAttribution { color: #929daa; font-size: 10px; }
@@ -8859,6 +8890,8 @@ export default function PlaylistManager() {
           .creativeProjectSummary > button { grid-column: 1 / -1; }
           .creativeConceptGrid { grid-template-columns: 1fr; }
           .creativeMediaResults { grid-template-columns: 1fr 1fr; }
+          .creativeMediaSearch > div:first-child { grid-template-columns: 1fr 1fr; }
+          .creativeMediaSearch > div:first-child input { grid-column: 1 / -1; }
           .creativeEditor { grid-template-columns: 1fr; }
           .creativeTemplateGrid { grid-template-columns: 1fr; }
           .creativeBatchHeader { align-items: stretch; flex-direction: column; }
