@@ -1024,6 +1024,89 @@ function normalizeCreativeRenderSpec(body = {}, asset) {
   };
 }
 
+function json2VideoDimensions(format) {
+  if (format === "1:1") return { width: 1080, height: 1080 };
+  if (format === "4:5") return { width: 1080, height: 1350 };
+  return { width: 1080, height: 1920 };
+}
+
+function buildJson2VideoMovie({ project, concept, asset, jobId }) {
+  const editor = concept.render_spec?.editor || {};
+  const { width, height } = json2VideoDimensions(project.format);
+  const duration = Math.max(0.5, Number(editor.trim_end || 15) - Number(editor.trim_start || 0));
+  const hookY = editor.hook_position === "top" ? Math.round(height * 0.1) : editor.hook_position === "bottom" ? Math.round(height * 0.66) : Math.round(height * 0.38);
+  const coverY = editor.cover_position === "top" ? Math.round(height * 0.04) : editor.cover_position === "center" ? Math.round(height * 0.54) : Math.round(height * 0.82);
+  const elements = [{
+    type: "video",
+    src: asset.source_url,
+    resize: "cover",
+    seek: Number(editor.trim_start || 0),
+    duration,
+    muted: true,
+  }];
+  if (editor.hook_text) {
+    elements.push({
+      type: "text",
+      style: "001",
+      text: editor.hook_text,
+      position: "custom",
+      x: Math.round(width * 0.07),
+      y: hookY,
+      width: Math.round(width * 0.86),
+      height: Math.round(height * 0.2),
+      start: Math.max(0, Number(editor.hook_start || 0) - Number(editor.trim_start || 0)),
+      duration: Math.max(0.25, Number(editor.hook_end || 4) - Number(editor.hook_start || 0)),
+      settings: {
+        "font-family": "Montserrat",
+        "font-size": `${Math.round(width * 0.075)}px`,
+        "font-weight": "800",
+        "font-color": editor.text_color || "#FFFFFF",
+        color: editor.text_color || "#FFFFFF",
+        "text-align": editor.text_align || "center",
+        "vertical-position": "center",
+      },
+    });
+  }
+  const coverImage = project.brief?.cover_image || "";
+  if (editor.show_cover !== false && coverImage) {
+    const size = Math.round(width * 0.18);
+    elements.push({ type: "image", src: coverImage, position: "custom", x: Math.round(width * 0.07), y: coverY, width: size, height: size, resize: "cover", duration });
+  }
+  if (editor.show_cta !== false && editor.cta_text) {
+    elements.push({
+      type: "text",
+      style: "001",
+      text: editor.cta_text,
+      position: "custom",
+      x: Math.round(width * 0.5),
+      y: Math.round(height * 0.88),
+      width: Math.round(width * 0.43),
+      height: Math.round(height * 0.08),
+      duration,
+      settings: {
+        "font-family": "Montserrat",
+        "font-size": `${Math.round(width * 0.03)}px`,
+        "font-weight": "800",
+        "font-color": editor.accent_color || "#1ED760",
+        color: editor.accent_color || "#1ED760",
+        "text-align": "center",
+        "vertical-position": "center",
+      },
+    });
+  }
+  return {
+    comment: `${project.name} — ${concept.title}`.slice(0, 250),
+    resolution: "custom",
+    width,
+    height,
+    quality: "high",
+    fps: 25,
+    cache: true,
+    "client-data": { render_job_id: jobId, project_id: project.id, concept_id: concept.id },
+    scenes: [{ elements }],
+  };
+}
+
 function fallbackSpotifyCredentials({ requireRedirect = false } = {}) {
   const client_id = process.env.SPOTIFY_CLIENT_ID || "";
   const client_secret = process.env.SPOTIFY_CLIENT_SECRET || "";
@@ -2603,7 +2686,7 @@ const routes = {
     if (!connection) return bad(res, 400, "meta_connection_not_configured");
     if (req.method === "GET") {
       const response = await sb(
-        `/rest/v1/meta_creative_projects?select=*,playlists(name,image,playlist_id,followers,tracks_total),meta_creative_concepts(*),meta_creative_assets(*),meta_creative_render_jobs(id,status)` +
+        `/rest/v1/meta_creative_projects?select=*,playlists(name,image,playlist_id,followers,tracks_total),meta_creative_concepts(*),meta_creative_assets(*),meta_creative_render_jobs(*)` +
         `&connection_id=eq.${encodeURIComponent(connection.id)}&order=created_at.desc&limit=50`
       );
       if (!response.ok) return bad(res, 500, `meta_creative_projects_load_failed: ${(await response.text()).slice(0, 1000)}`);
@@ -2898,6 +2981,145 @@ const routes = {
       body: JSON.stringify({ current_step: Math.max(4, Number(owned.project.current_step || 1)), updated_at: new Date().toISOString() }),
     });
     return json(res, 200, { concept: JSON.parse(updateText || "[]")[0], editor });
+  },
+
+  /* ---------- meta/creative-renders/queue (POST) ---------- */
+  "meta/creative-renders/queue": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+    const body = await readBody(req);
+    const conceptId = String(body.concept_id || "").trim();
+    if (!/^[0-9a-f-]{36}$/i.test(conceptId)) return bad(res, 400, "creative_concept_required");
+    const owned = await loadOwnedCreativeConcept(conceptId, connection.id, ctx.bubble_user_id);
+    if (!owned) return bad(res, 404, "creative_concept_not_found");
+    const editor = owned.concept.render_spec?.editor;
+    if (!editor?.asset_id || !editor?.hook_text) return bad(res, 409, "creative_render_spec_required");
+    const activeResponse = await sb(
+      `/rest/v1/meta_creative_render_jobs?select=*&limit=1&concept_id=eq.${encodeURIComponent(conceptId)}` +
+      `&status=in.(queued,processing)&order=created_at.desc`
+    );
+    const active = activeResponse.ok ? (await activeResponse.json().catch(() => []))[0] : null;
+    if (active) return json(res, 200, { job: active, reused: true });
+    const assetResponse = await sb(
+      `/rest/v1/meta_creative_assets?select=*&limit=1&id=eq.${encodeURIComponent(editor.asset_id)}` +
+      `&project_id=eq.${encodeURIComponent(owned.project.id)}&concept_id=eq.${encodeURIComponent(conceptId)}&asset_type=eq.video`
+    );
+    const asset = assetResponse.ok ? (await assetResponse.json().catch(() => []))[0] : null;
+    if (!asset) return bad(res, 404, "creative_video_asset_not_found");
+    const draftResponse = await sb(`/rest/v1/meta_creative_render_jobs`, {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify([{ project_id: owned.project.id, concept_id: conceptId, status: "queued", priority: 100, render_spec: { editor, provider: "json2video" } }]),
+    });
+    const draftText = await draftResponse.text();
+    const job = draftResponse.ok ? JSON.parse(draftText || "[]")[0] : null;
+    if (!job) return bad(res, 500, `creative_render_job_save_failed: ${draftText.slice(0, 500)}`);
+    const movie = buildJson2VideoMovie({ project: owned.project, concept: owned.concept, asset, jobId: job.id });
+    try {
+      const providerResponse = await fetch("https://api.json2video.com/v2/movies", {
+        method: "POST",
+        headers: { "x-api-key": need("JSON2VIDEO_API_KEY"), "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify(movie),
+      });
+      const parsed = await parseJsonSafe(providerResponse);
+      if (!providerResponse.ok || !parsed.json?.success || !parsed.json?.project) {
+        throw new Error(`json2video_${providerResponse.status}: ${parsed.json?.message || parsed.text.slice(0, 500)}`);
+      }
+      const now = new Date().toISOString();
+      const renderSpec = { editor, provider: "json2video", provider_project: parsed.json.project, movie };
+      const patchResponse = await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(job.id)}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify({ status: "processing", attempts: 1, worker_id: `json2video:${parsed.json.project}`, render_spec: renderSpec, started_at: now, updated_at: now }),
+      });
+      await Promise.all([
+        sb(`/rest/v1/meta_creative_concepts?id=eq.${encodeURIComponent(conceptId)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "render_queued", updated_at: now }) }),
+        sb(`/rest/v1/meta_creative_projects?id=eq.${encodeURIComponent(owned.project.id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "rendering", current_step: 5, last_error: null, updated_at: now }) }),
+      ]);
+      return json(res, 201, { job: patchResponse.ok ? (await patchResponse.json().catch(() => []))[0] : { ...job, status: "processing", render_spec: renderSpec }, reused: false });
+    } catch (error) {
+      const message = String(error?.message || error).slice(0, 1000);
+      await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(job.id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "failed", error_code: "provider_submit", error_message: message, finished_at: new Date().toISOString(), updated_at: new Date().toISOString() }) });
+      return bad(res, 502, message);
+    }
+  },
+
+  /* ---------- meta/creative-renders/sync (POST) ---------- */
+  "meta/creative-renders/sync": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+    const body = await readBody(req);
+    const jobId = String(body.render_job_id || "").trim();
+    if (!/^[0-9a-f-]{36}$/i.test(jobId)) return bad(res, 400, "creative_render_job_required");
+    const jobResponse = await sb(`/rest/v1/meta_creative_render_jobs?select=*&limit=1&id=eq.${encodeURIComponent(jobId)}`);
+    const job = jobResponse.ok ? (await jobResponse.json().catch(() => []))[0] : null;
+    if (!job) return bad(res, 404, "creative_render_job_not_found");
+    const projectResponse = await sb(
+      `/rest/v1/meta_creative_projects?select=*&limit=1&id=eq.${encodeURIComponent(job.project_id)}` +
+      `&connection_id=eq.${encodeURIComponent(connection.id)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}`
+    );
+    const project = projectResponse.ok ? (await projectResponse.json().catch(() => []))[0] : null;
+    if (!project) return bad(res, 404, "creative_render_job_not_found");
+    if (job.status === "completed") return json(res, 200, { job, done: true });
+    if (job.status === "failed" || job.status === "cancelled") return json(res, 200, { job, done: true });
+    const providerProject = job.render_spec?.provider_project || String(job.worker_id || "").replace(/^json2video:/, "");
+    if (!/^[A-Za-z0-9]{16}$/.test(providerProject)) return bad(res, 409, "creative_render_provider_id_missing");
+    const providerResponse = await fetch(`https://api.json2video.com/v2/movies?project=${encodeURIComponent(providerProject)}&format=simple`, {
+      headers: { "x-api-key": need("JSON2VIDEO_API_KEY"), Accept: "application/json" },
+    });
+    const parsed = await parseJsonSafe(providerResponse);
+    if (!providerResponse.ok || !parsed.json?.success) return bad(res, 502, `json2video_status_${providerResponse.status}: ${parsed.json?.message || parsed.text.slice(0, 500)}`);
+    const movie = parsed.json.movie || {};
+    const providerStatus = String(movie.status || "pending").toLowerCase();
+    const now = new Date().toISOString();
+    if (["pending", "running", "queued"].includes(providerStatus)) {
+      const patchResponse = await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(job.id)}`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ status: "processing", updated_at: now }) });
+      return json(res, 200, { job: patchResponse.ok ? (await patchResponse.json().catch(() => []))[0] : job, provider_status: providerStatus, done: false });
+    }
+    if (providerStatus !== "done" || !movie.url) {
+      const message = String(movie.message || `JSON2Video render ${providerStatus}`).slice(0, 1000);
+      const patchResponse = await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(job.id)}`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ status: "failed", error_code: providerStatus, error_message: message, finished_at: now, updated_at: now }) });
+      await sb(`/rest/v1/meta_creative_concepts?id=eq.${encodeURIComponent(job.concept_id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "media_ready", updated_at: now }) });
+      return json(res, 200, { job: patchResponse.ok ? (await patchResponse.json().catch(() => []))[0] : job, provider_status: providerStatus, done: true });
+    }
+    const existingAssetResponse = await sb(`/rest/v1/meta_creative_assets?select=*&limit=1&project_id=eq.${encodeURIComponent(job.project_id)}&concept_id=eq.${encodeURIComponent(job.concept_id)}&asset_type=eq.render&provider_id=eq.${encodeURIComponent(providerProject)}`);
+    let outputAsset = existingAssetResponse.ok ? (await existingAssetResponse.json().catch(() => []))[0] : null;
+    if (!outputAsset) {
+      let finalUrl = movie.url;
+      let storagePath = null;
+      try {
+        const download = await fetch(movie.url);
+        const size = Number(download.headers.get("content-length") || movie.size || 0);
+        if (download.ok && (!size || size <= 48 * 1024 * 1024)) {
+          const bytes = Buffer.from(await download.arrayBuffer());
+          if (bytes.length && bytes.length <= 48 * 1024 * 1024) {
+            const owner = String(ctx.bubble_user_id).replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80) || "admin";
+            storagePath = `${owner}/renders/${job.id}.mp4`;
+            const upload = await sb(`/storage/v1/object/meta-ad-creatives/${storagePath.split("/").map(encodeURIComponent).join("/")}`, { method: "POST", headers: { "Content-Type": "video/mp4", "x-upsert": "true" }, body: bytes });
+            if (upload.ok) finalUrl = `${need("SUPABASE_URL")}/storage/v1/object/public/meta-ad-creatives/${storagePath.split("/").map(encodeURIComponent).join("/")}`;
+            else storagePath = null;
+          }
+        }
+      } catch (error) {
+        console.warn("creative_render_storage_copy_failed", String(error?.message || error));
+      }
+      const assetInsert = await sb(`/rest/v1/meta_creative_assets`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify([{ project_id: job.project_id, concept_id: job.concept_id, asset_type: "render", source: "render_worker", provider_id: providerProject, source_url: finalUrl, storage_path: storagePath, mime_type: "video/mp4", duration_seconds: Number(movie.duration || 0) || null, width: Number(movie.width || 0) || null, height: Number(movie.height || 0) || null, metadata: { provider: "json2video", provider_url: movie.url, size: Number(movie.size || 0), rendering_time: Number(movie.rendering_time || 0) }, updated_at: now }]) });
+      const assetText = await assetInsert.text();
+      if (!assetInsert.ok) return bad(res, 500, `creative_render_asset_save_failed: ${assetText.slice(0, 500)}`);
+      outputAsset = JSON.parse(assetText || "[]")[0];
+    }
+    const completeResponse = await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(job.id)}`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ status: "completed", output_asset_id: outputAsset.id, finished_at: now, updated_at: now, error_code: null, error_message: null }) });
+    await Promise.all([
+      sb(`/rest/v1/meta_creative_concepts?id=eq.${encodeURIComponent(job.concept_id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "rendered", updated_at: now }) }),
+      sb(`/rest/v1/meta_creative_projects?id=eq.${encodeURIComponent(job.project_id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "review", current_step: 6, updated_at: now }) }),
+    ]);
+    return json(res, 200, { job: completeResponse.ok ? (await completeResponse.json().catch(() => []))[0] : { ...job, status: "completed", output_asset_id: outputAsset.id }, asset: outputAsset, provider_status: providerStatus, done: true });
   },
 
   /* ---------- meta/campaign-drafts (GET/POST) ---------- */

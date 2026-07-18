@@ -629,6 +629,7 @@ export default function PlaylistManager() {
   const [creativeMediaSearches, setCreativeMediaSearches] = useState({});
   const [openCreativeEditorId, setOpenCreativeEditorId] = useState("");
   const [creativeEditorDrafts, setCreativeEditorDrafts] = useState({});
+  const [creativeRenderPolling, setCreativeRenderPolling] = useState({});
   const [adsSection, setAdsSection] = useState("overview");
   const [adsWizardStep, setAdsWizardStep] = useState(1);
   const [metaDraftForm, setMetaDraftForm] = useState({
@@ -2197,6 +2198,51 @@ export default function PlaylistManager() {
     });
   }
 
+  async function pollCreativeRender(renderJobId) {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 8000));
+      try {
+        const data = await api("/api/meta/creative-renders/sync", {
+          method: "POST",
+          accessToken: accessToken(),
+          body: { render_job_id: renderJobId },
+        });
+        setCreativeRenderPolling((current) => ({ ...current, [renderJobId]: data.job?.status || data.provider_status || "processing" }));
+        if (data.done) {
+          await loadCreativeProjects();
+          return data;
+        }
+      } catch (e) {
+        setCreativeRenderPolling((current) => ({ ...current, [renderJobId]: "failed" }));
+        setError(e.message || "Render status failed.");
+        return null;
+      }
+    }
+    setCreativeRenderPolling((current) => ({ ...current, [renderJobId]: "still processing" }));
+    return null;
+  }
+
+  async function queueCreativeRender(conceptId) {
+    const data = await run("Render job queued", () => api("/api/meta/creative-renders/queue", {
+      method: "POST",
+      accessToken: accessToken(),
+      body: { concept_id: conceptId },
+    }));
+    if (data?.job?.id) {
+      setCreativeRenderPolling((current) => ({ ...current, [data.job.id]: data.job.status || "processing" }));
+      loadCreativeProjects();
+      pollCreativeRender(data.job.id);
+    }
+  }
+
+  async function syncCreativeRender(renderJobId) {
+    await run("Render status refreshed", async () => {
+      const data = await api("/api/meta/creative-renders/sync", { method: "POST", accessToken: accessToken(), body: { render_job_id: renderJobId } });
+      await loadCreativeProjects();
+      return data;
+    });
+  }
+
   async function saveMetaDraft() {
     await run("Campaign draft saved", async () => {
       await api("/api/meta/campaign-drafts", { method: "POST", accessToken: accessToken(), body: metaDraftForm });
@@ -3453,6 +3499,8 @@ export default function PlaylistManager() {
                       const assignedAssets = assets.filter((asset) => asset.concept_id === concept.id && asset.asset_type === "video");
                       const editorDraft = creativeEditorDrafts[concept.id] || concept.render_spec?.editor || {};
                       const editorAsset = assignedAssets.find((asset) => asset.id === editorDraft.asset_id) || assignedAssets[0];
+                      const conceptRenderJobs = renders.filter((job) => job.concept_id === concept.id).sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+                      const latestRenderJob = conceptRenderJobs[0];
                       return <article key={concept.id} className={assignedAssets.length ? "hasMedia" : ""}><span>Concept {concept.position} · {concept.status.replaceAll("_", " ")}</span><h3>{concept.title}</h3><strong>{concept.hook}</strong><p>{concept.story}</p><dl><div><dt>Angle</dt><dd>{concept.angle}</dd></div><div><dt>Visual</dt><dd>{concept.visual_direction}</dd></div><div><dt>Hypothesis</dt><dd>{concept.hypothesis}</dd></div></dl><div className="creativeConceptTerms">{(concept.visual_search_terms || []).map((term) => <button key={term} onClick={() => setCreativeMediaQuery(concept.id, term)}>{term}</button>)}</div>
                         {assignedAssets.map((asset) => <div className="creativeAssignedMedia" key={asset.id}><video src={asset.source_url} poster={asset.metadata?.image || ""} muted controls playsInline preload="metadata" /><div><strong>Selected Pexels clip</strong><small>{asset.width}×{asset.height} · {Number(asset.duration_seconds || 0).toFixed(1)}s</small>{asset.metadata?.pexels_url ? <a href={asset.metadata.pexels_url} target="_blank" rel="noreferrer">Video by {asset.metadata?.creator_name || "creator"} on Pexels</a> : null}<button onClick={() => openCreativeEditor(concept, asset)}>{openCreativeEditorId === concept.id ? "Close editor" : concept.render_spec?.editor ? "Edit render" : "Open editor"}</button></div></div>)}
                         {openCreativeEditorId === concept.id && editorAsset ? <div className="creativeEditor">
@@ -3479,7 +3527,7 @@ export default function PlaylistManager() {
                             <label><span>Cover position</span><select value={editorDraft.cover_position || "bottom"} onChange={(event) => updateCreativeEditor(concept.id, { cover_position: event.target.value })}><option value="top">Top</option><option value="center">Center</option><option value="bottom">Bottom</option></select></label>
                             <label className="creativeEditorToggle"><input type="checkbox" checked={editorDraft.show_cover !== false} onChange={(event) => updateCreativeEditor(concept.id, { show_cover: event.target.checked })} /><span>Show playlist cover</span></label>
                             <label className="creativeEditorToggle"><input type="checkbox" checked={editorDraft.show_cta !== false} onChange={(event) => updateCreativeEditor(concept.id, { show_cta: event.target.checked })} /><span>Show CTA</span></label>
-                            <div className="creativeEditorActions"><button disabled={busy || !String(editorDraft.hook_text || "").trim()} onClick={() => saveCreativeEditor(concept.id)}>{concept.render_spec?.editor ? "Update render spec" : "Save render spec"}</button><small>{concept.render_spec?.editor ? "Saved specification loaded" : "No render is started yet"}</small></div>
+                            <div className="creativeEditorActions"><div><button disabled={busy || !String(editorDraft.hook_text || "").trim()} onClick={() => saveCreativeEditor(concept.id)}>{concept.render_spec?.editor ? "Update render spec" : "Save render spec"}</button>{concept.render_spec?.editor && !["processing", "queued"].includes(latestRenderJob?.status) ? <button className="secondary" disabled={busy} onClick={() => queueCreativeRender(concept.id)}>Render video</button> : null}{["processing", "queued"].includes(latestRenderJob?.status) ? <button className="secondary" disabled={busy} onClick={() => syncCreativeRender(latestRenderJob.id)}>Refresh render</button> : null}</div><small>{latestRenderJob ? `Render: ${creativeRenderPolling[latestRenderJob.id] || latestRenderJob.status}` : concept.render_spec?.editor ? "Ready for rendering" : "No render is started yet"}</small></div>
                           </div>
                         </div> : null}
                         <div className="creativeMediaSearch"><div><input aria-label={`Pexels query for ${concept.title}`} value={mediaState.query ?? defaultQuery} onChange={(event) => setCreativeMediaQuery(concept.id, event.target.value)} /><button disabled={mediaState.loading} onClick={() => searchCreativeMedia(concept)}>{mediaState.loading ? "Searching…" : assignedAssets.length ? "Find another" : "Find videos"}</button></div>{mediaState.videos?.length ? <><small>{mediaState.total} Pexels results · select one to attach it</small><div className="creativeMediaResults">{mediaState.videos.map((video) => <div key={video.id}><video src={video.source_url} poster={video.image} muted controls playsInline preload="metadata" /><div><span>{video.duration}s · {video.source_width}×{video.source_height}</span><button disabled={busy} onClick={() => selectCreativeMedia(concept, video)}>Use clip</button><a href={video.url} target="_blank" rel="noreferrer">{video.user?.name || "Pexels"}</a></div></div>)}</div><a className="pexelsAttribution" href="https://www.pexels.com" target="_blank" rel="noreferrer">Videos provided by Pexels</a></> : null}</div>
@@ -3494,11 +3542,12 @@ export default function PlaylistManager() {
         </div>
         </> : null}
 
-        {adsSection === "library" ? <section className="dashboardPanel creativeLibraryEmpty">
-          <span className="metaReadOnlyBadge">Rendered assets</span>
-          <h2>Creative Library</h2>
-          <p>Approved renders will live here independently from campaigns, so one winning video can be reused without rendering it again.</p>
-          <div><strong>No rendered creatives yet</strong><small>Create a project in Creative Studio. Rendering will be connected in the next integration stage.</small><button onClick={() => openAdsSection("creatives")}>Open Creative Studio</button></div>
+        {adsSection === "library" ? <section className="dashboardPanel creativeLibrary">
+          <div className="panelHeader"><div><span className="metaReadOnlyBadge">Rendered assets</span><h2>Creative Library</h2><p>Finished videos remain reusable independently from a Meta campaign.</p></div><button onClick={loadCreativeProjects}>Refresh</button></div>
+          {creativeProjects.some((project) => (project.meta_creative_assets || []).some((asset) => asset.asset_type === "render")) ? <div className="creativeLibraryGrid">{creativeProjects.flatMap((project) => {
+            const conceptsById = new Map((project.meta_creative_concepts || []).map((concept) => [concept.id, concept]));
+            return (project.meta_creative_assets || []).filter((asset) => asset.asset_type === "render").map((asset) => ({ asset, project, concept: conceptsById.get(asset.concept_id) }));
+          }).map(({ asset, project, concept }) => <article key={asset.id}><video src={asset.source_url} controls muted playsInline preload="metadata" /><div><span>{project.format} · {Number(asset.duration_seconds || 0).toFixed(1)}s</span><h3>{concept?.title || project.name}</h3><strong>{concept?.hook || project.brief?.title}</strong><small>{project.playlists?.name || project.brief?.playlist_name}</small><a href={asset.source_url} target="_blank" rel="noreferrer">Open MP4</a></div></article>)}</div> : <div className="creativeEmptyState"><strong>No rendered creatives yet</strong><p>Save an editor specification and start the first render in Creative Studio.</p><button onClick={() => openAdsSection("creatives")}>Open Creative Studio</button></div>}
         </section> : null}
 
         {adsSection === "settings" ? <>
@@ -6401,7 +6450,20 @@ export default function PlaylistManager() {
         .creativeEditorToggle { display: flex !important; grid-template-columns: auto 1fr; align-items: center; }
         .creativeEditorToggle input { width: auto; }
         .creativeEditorActions { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 6px; }
+        .creativeEditorActions > div { display: flex; flex-wrap: wrap; gap: 7px; }
+        .creativeEditorActions button.secondary { color: #d7dde5; background: #252c35; }
         .creativeEditorActions small { color: #788391; }
+        .creativeLibrary { display: grid; gap: 16px; }
+        .creativeLibrary .panelHeader h2 { margin-top: 14px; }
+        .creativeLibrary .panelHeader p { margin: 4px 0 0; color: #8993a0; }
+        .creativeLibraryGrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+        .creativeLibraryGrid article { display: grid; overflow: hidden; border: 1px solid #303844; border-radius: 11px; background: #10151b; }
+        .creativeLibraryGrid video { width: 100%; aspect-ratio: 9 / 16; max-height: 520px; object-fit: cover; background: #07090c; }
+        .creativeLibraryGrid article > div { display: grid; gap: 6px; padding: 13px; }
+        .creativeLibraryGrid span { color: #18e06f; font-size: 9px; font-weight: 900; text-transform: uppercase; }
+        .creativeLibraryGrid h3 { margin: 0; }
+        .creativeLibraryGrid small { color: #7f8998; }
+        .creativeLibraryGrid a { justify-self: start; margin-top: 4px; color: #bfc8d3; font-size: 11px; }
         .creativeEmptyState, .creativeLibraryEmpty > div { display: grid; justify-items: start; gap: 8px; padding: 24px; border: 1px dashed #3a4351; border-radius: 10px; color: #8d96a4; }
         .creativeEmptyState p, .creativeLibraryEmpty p { margin: 0; color: #8d96a4; }
         .creativeLibraryEmpty { display: grid; gap: 14px; }
@@ -8712,6 +8774,7 @@ export default function PlaylistManager() {
           .creativeEditor { grid-template-columns: 1fr; }
           .creativeEditorControls { grid-template-columns: 1fr; }
           .creativeEditorWide, .creativeEditorActions { grid-column: auto; }
+          .creativeLibraryGrid { grid-template-columns: 1fr; }
           .adsWizardSteps { grid-template-columns: 1fr; }
           .adsPlacementChoices { grid-template-columns: 1fr; }
           .adsDeliverySummary { grid-template-columns: 1fr; }
