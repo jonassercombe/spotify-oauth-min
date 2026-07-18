@@ -13,6 +13,7 @@ const json = (res, code, payload) => res.status(code).json(payload);
 const bad  = (res, code, msg) => json(res, code, { error: msg });
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const ADMIN_EMAILS = new Set(["jonassercombe@googlemail.com"]);
+const EU_DSA_COUNTRIES = new Set(["AT", "BE", "BG", "HR", "CY", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GR", "HU", "IE", "IT", "LT", "LU", "LV", "MT", "NL", "PL", "PT", "RO", "SE", "SI", "SK"]);
 
 async function parseJsonSafe(resp) {
   const txt = await resp.text();
@@ -701,6 +702,8 @@ function sanitizeMetaConnection(connection, assets = []) {
     last_audit_at: connection.last_audit_at,
     last_error: connection.last_error,
     audit_summary: connection.audit_summary || {},
+    dsa_beneficiary: connection.dsa_beneficiary || "",
+    dsa_payor: connection.dsa_payor || "",
     has_app_secret: !!connection.app_secret_enc,
     assets,
     readiness: metaConnectionReadiness(connection, assets),
@@ -2150,6 +2153,8 @@ const routes = {
     const businessId = String(body.business_id || "").trim();
     const accessToken = String(body.access_token || "").trim();
     const appSecret = String(body.app_secret || "").trim();
+    const dsaBeneficiary = String(body.dsa_beneficiary || "").trim().slice(0, 255);
+    const dsaPayor = String(body.dsa_payor || "").trim().slice(0, 255);
     if (!/^\d{6,30}$/.test(appId)) return bad(res, 400, "invalid_meta_app_id");
     if (!/^\d{6,30}$/.test(businessId)) return bad(res, 400, "invalid_meta_business_id");
     const existing = await loadMetaConnection(ctx.bubble_user_id);
@@ -2161,6 +2166,8 @@ const routes = {
       app_id: appId,
       business_id: businessId,
       graph_version: normalizeMetaGraphVersion(body.graph_version),
+      dsa_beneficiary: dsaBeneficiary || null,
+      dsa_payor: dsaPayor || null,
       status: "unverified",
       last_error: null,
       updated_at: new Date().toISOString(),
@@ -2491,6 +2498,9 @@ const routes = {
     const page = assets.find((asset) => asset.asset_type === "page");
     const instagram = assets.find((asset) => asset.asset_type === "instagram_account");
     if (!adAccount || !page || !instagram) return bad(res, 409, "meta_selected_assets_incomplete");
+    if ((draft.countries || []).some((country) => EU_DSA_COUNTRIES.has(country)) && (!connection.dsa_beneficiary || !connection.dsa_payor)) {
+      return bad(res, 409, "meta_dsa_disclosure_required: add beneficiary and payor in Meta Settings");
+    }
     const persistDraft = async (patch, representation = false) => {
       const response = await sb(`/rest/v1/meta_ads_campaign_drafts?id=eq.${encodeURIComponent(draft.id)}`, {
         method: "PATCH",
@@ -2534,6 +2544,8 @@ const routes = {
           billing_event: "IMPRESSIONS",
           optimization_goal: "LINK_CLICKS",
           destination_type: "WEBSITE",
+          dsa_beneficiary: connection.dsa_beneficiary || undefined,
+          dsa_payor: connection.dsa_payor || undefined,
           targeting: JSON.stringify(targeting),
           start_time: draft.start_date ? `${draft.start_date}T08:00:00+0000` : undefined,
           end_time: draft.end_date ? `${draft.end_date}T23:59:00+0000` : undefined,

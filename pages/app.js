@@ -619,6 +619,8 @@ export default function PlaylistManager() {
     graph_version: "v25.0",
     access_token: "",
     app_secret: "",
+    dsa_beneficiary: "",
+    dsa_payor: "",
   });
   const [metaDrafts, setMetaDrafts] = useState([]);
   const [adsSection, setAdsSection] = useState("overview");
@@ -1998,6 +2000,8 @@ export default function PlaylistManager() {
         app_id: data.app_id || current.app_id,
         business_id: data.business_id || current.business_id,
         graph_version: data.graph_version || current.graph_version,
+        dsa_beneficiary: data.dsa_beneficiary || "",
+        dsa_payor: data.dsa_payor || "",
         access_token: "",
         app_secret: "",
       }));
@@ -3275,6 +3279,8 @@ export default function PlaylistManager() {
               <label><span>App ID</span><input value={metaForm.app_id} onChange={(e) => setMetaForm({ ...metaForm, app_id: e.target.value })} inputMode="numeric" /></label>
               <label><span>Business ID</span><input value={metaForm.business_id} onChange={(e) => setMetaForm({ ...metaForm, business_id: e.target.value })} inputMode="numeric" /></label>
               <label><span>Graph API version</span><input value={metaForm.graph_version} onChange={(e) => setMetaForm({ ...metaForm, graph_version: e.target.value })} placeholder="v25.0" /></label>
+              <label><span>EU ad beneficiary</span><input value={metaForm.dsa_beneficiary} onChange={(e) => setMetaForm({ ...metaForm, dsa_beneficiary: e.target.value })} placeholder="Legal person or company name" /></label>
+              <label><span>EU ad payor</span><input value={metaForm.dsa_payor} onChange={(e) => setMetaForm({ ...metaForm, dsa_payor: e.target.value })} placeholder="Legal person or company name" /></label>
               <label><span>{metaWorkspace?.configured ? "Replace access token" : "System user access token"}</span><input type="password" autoComplete="new-password" value={metaForm.access_token} onChange={(e) => setMetaForm({ ...metaForm, access_token: e.target.value })} placeholder={metaWorkspace?.configured ? "Leave empty to keep current token" : "Paste token"} /></label>
               <label className="metaFormWide"><span>App secret <small>optional, enables appsecret_proof</small></span><input type="password" autoComplete="new-password" value={metaForm.app_secret} onChange={(e) => setMetaForm({ ...metaForm, app_secret: e.target.value })} placeholder={metaWorkspace?.has_app_secret ? "Stored securely; leave empty to keep" : "Optional"} /></label>
             </div>
@@ -3282,6 +3288,7 @@ export default function PlaylistManager() {
               <button disabled={busy || !metaForm.app_id || !metaForm.business_id || (!metaWorkspace?.configured && !metaForm.access_token)} onClick={saveMetaConnection}>Save securely</button>
               <small>Use a dedicated system-user token with only <b>ads_read</b> and <b>ads_management</b>.</small>
             </div>
+            <p className="metaDsaNote">For ads targeting the EU, Meta publicly discloses who benefits from and who pays for the ad. Enter the legally correct names; PlaylistPilot will not infer them.</p>
           </section>
 
           <section className="dashboardPanel metaAuditPanel">
@@ -6215,6 +6222,15 @@ export default function PlaylistManager() {
         .metaFormActions small {
           color: #7f8998;
           line-height: 1.4;
+        }
+        .metaDsaNote {
+          margin: 14px 0 0;
+          padding: 11px 12px;
+          border-left: 3px solid #ffd066;
+          color: #a6adba;
+          background: rgba(255, 208, 102, 0.05);
+          font-size: 12px;
+          line-height: 1.5;
         }
         .metaIdentity {
           display: grid;
