@@ -745,6 +745,75 @@ async function metaGraphRequest(connection, path, params = {}) {
   }
 }
 
+async function metaGraphMutation(connection, path, params = {}) {
+  const token = decryptToken(connection.access_token_enc);
+  const body = new URLSearchParams();
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") body.set(key, String(value));
+  });
+  body.set("access_token", token);
+  if (connection.app_secret_enc) {
+    const proof = crypto.createHmac("sha256", decryptToken(connection.app_secret_enc)).update(token).digest("hex");
+    body.set("appsecret_proof", proof);
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(
+      `https://graph.facebook.com/${normalizeMetaGraphVersion(connection.graph_version)}/${String(path).replace(/^\/+/, "")}`,
+      {
+        method: "POST",
+        signal: controller.signal,
+        headers: { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" },
+        body: body.toString(),
+      }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok || payload?.error) {
+      const code = payload?.error?.code || response.status;
+      const message = payload?.error?.message || `Meta request failed (${response.status})`;
+      throw new Error(`meta_graph_${code}: ${message}`);
+    }
+    return payload || {};
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function normalizeMetaDraftInput(body = {}) {
+  const name = String(body.name || "").trim().slice(0, 120);
+  const destinationUrl = String(body.destination_url || "").trim();
+  const primaryText = String(body.primary_text || "").trim().slice(0, 1000);
+  const headline = String(body.headline || "").trim().slice(0, 255);
+  const imageUrl = String(body.image_url || "").trim();
+  const dailyBudgetMinor = Math.round(Number(body.daily_budget_eur) * 100);
+  const ageMin = Math.max(13, Math.min(65, Number.parseInt(body.age_min, 10) || 18));
+  const ageMax = Math.max(ageMin, Math.min(65, Number.parseInt(body.age_max, 10) || 45));
+  const countries = Array.from(new Set(String(body.countries || "DE").split(",").map((item) => item.trim().toUpperCase()).filter((item) => /^[A-Z]{2}$/.test(item)))).slice(0, 25);
+  if (name.length < 3) throw new Error("campaign_name_required");
+  if (!Number.isInteger(dailyBudgetMinor) || dailyBudgetMinor < 100) throw new Error("daily_budget_must_be_at_least_1_eur");
+  for (const [key, value] of [["destination_url", destinationUrl], ["image_url", imageUrl]]) {
+    let parsed;
+    try { parsed = new URL(value); } catch { throw new Error(`invalid_${key}`); }
+    if (parsed.protocol !== "https:") throw new Error(`${key}_must_use_https`);
+  }
+  if (!primaryText) throw new Error("primary_text_required");
+  if (!headline) throw new Error("headline_required");
+  if (!countries.length) throw new Error("target_country_required");
+  return {
+    name,
+    objective: "OUTCOME_TRAFFIC",
+    daily_budget_minor: dailyBudgetMinor,
+    destination_url: destinationUrl,
+    primary_text: primaryText,
+    headline,
+    image_url: imageUrl,
+    countries,
+    age_min: ageMin,
+    age_max: ageMax,
+  };
+}
+
 function fallbackSpotifyCredentials({ requireRedirect = false } = {}) {
   const client_id = process.env.SPOTIFY_CLIENT_ID || "";
   const client_secret = process.env.SPOTIFY_CLIENT_SECRET || "";
@@ -2275,6 +2344,116 @@ const routes = {
     if (!assetsResponse.ok) return bad(res, 500, `meta_assets_reload_failed: ${(await assetsResponse.text()).slice(0, 1000)}`);
     const assets = await assetsResponse.json().catch(() => []);
     return json(res, 200, sanitizeMetaConnection(connection, assets));
+  },
+
+  /* ---------- meta/campaign-drafts (GET/POST) ---------- */
+  "meta/campaign-drafts": async (req, res) => {
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+    if (req.method === "GET") {
+      const response = await sb(
+        `/rest/v1/meta_ads_campaign_drafts?select=*&connection_id=eq.${encodeURIComponent(connection.id)}&order=created_at.desc&limit=50`
+      );
+      if (!response.ok) return bad(res, 500, `meta_drafts_load_failed: ${(await response.text()).slice(0, 1000)}`);
+      return json(res, 200, { drafts: await response.json().catch(() => []) });
+    }
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    let input;
+    try { input = normalizeMetaDraftInput(await readBody(req)); }
+    catch (error) { return bad(res, 400, String(error?.message || "invalid_campaign_draft")); }
+    const payload = {
+      connection_id: connection.id,
+      bubble_user_id: ctx.bubble_user_id,
+      ...input,
+      status: "draft",
+      updated_at: new Date().toISOString(),
+    };
+    const response = await sb(`/rest/v1/meta_ads_campaign_drafts`, {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify([payload]),
+    });
+    const text = await response.text();
+    if (!response.ok) return bad(res, 500, `meta_draft_save_failed: ${text.slice(0, 1000)}`);
+    return json(res, 201, { draft: JSON.parse(text || "[]")[0] });
+  },
+
+  /* ---------- meta/campaign-drafts/review (POST) ---------- */
+  "meta/campaign-drafts/review": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+    const body = await readBody(req);
+    const draftId = String(body.draft_id || "").trim();
+    if (!/^[0-9a-f-]{36}$/i.test(draftId)) return bad(res, 400, "invalid_meta_draft_id");
+    const draftsResponse = await sb(`/rest/v1/meta_ads_campaign_drafts?select=*&id=eq.${encodeURIComponent(draftId)}&connection_id=eq.${encodeURIComponent(connection.id)}&limit=1`);
+    const draft = draftsResponse.ok ? (await draftsResponse.json().catch(() => []))[0] : null;
+    if (!draft) return bad(res, 404, "meta_draft_not_found");
+    const assetsResponse = await sb(`/rest/v1/meta_ads_assets?select=*&connection_id=eq.${encodeURIComponent(connection.id)}&is_selected=eq.true`);
+    const assets = assetsResponse.ok ? await assetsResponse.json().catch(() => []) : [];
+    const readiness = metaConnectionReadiness(connection, assets);
+    if (!readiness.publishing_ready) return bad(res, 409, `meta_preflight_incomplete: ${readiness.missing.join(", ")}`);
+    const reviewedAt = new Date().toISOString();
+    const update = await sb(`/rest/v1/meta_ads_campaign_drafts?id=eq.${encodeURIComponent(draft.id)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ status: "review_ready", review_confirmed_at: reviewedAt, last_error: null, updated_at: reviewedAt }),
+    });
+    const text = await update.text();
+    if (!update.ok) return bad(res, 500, `meta_draft_review_failed: ${text.slice(0, 1000)}`);
+    return json(res, 200, { draft: JSON.parse(text || "[]")[0] });
+  },
+
+  /* ---------- meta/campaign-drafts/create-paused (POST) ---------- */
+  "meta/campaign-drafts/create-paused": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+    const body = await readBody(req);
+    const draftId = String(body.draft_id || "").trim();
+    if (String(body.confirmation || "") !== "CREATE PAUSED") return bad(res, 400, "paused_campaign_confirmation_required");
+    const draftsResponse = await sb(`/rest/v1/meta_ads_campaign_drafts?select=*&id=eq.${encodeURIComponent(draftId)}&connection_id=eq.${encodeURIComponent(connection.id)}&limit=1`);
+    const draft = draftsResponse.ok ? (await draftsResponse.json().catch(() => []))[0] : null;
+    if (!draft) return bad(res, 404, "meta_draft_not_found");
+    if (draft.status !== "review_ready") return bad(res, 409, "meta_draft_review_required");
+    const assetsResponse = await sb(`/rest/v1/meta_ads_assets?select=*&connection_id=eq.${encodeURIComponent(connection.id)}&is_selected=eq.true`);
+    const assets = assetsResponse.ok ? await assetsResponse.json().catch(() => []) : [];
+    const readiness = metaConnectionReadiness(connection, assets);
+    if (!readiness.publishing_ready) return bad(res, 409, `meta_preflight_incomplete: ${readiness.missing.join(", ")}`);
+    const adAccount = assets.find((asset) => asset.asset_type === "ad_account");
+    const startedAt = new Date().toISOString();
+    await sb(`/rest/v1/meta_ads_campaign_drafts?id=eq.${encodeURIComponent(draft.id)}`, {
+      method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "creating", updated_at: startedAt }),
+    });
+    try {
+      const created = await metaGraphMutation(connection, `act_${adAccount.meta_id}/campaigns`, {
+        name: draft.name,
+        objective: "OUTCOME_TRAFFIC",
+        status: "PAUSED",
+        special_ad_categories: "[]",
+      });
+      const finishedAt = new Date().toISOString();
+      const update = await sb(`/rest/v1/meta_ads_campaign_drafts?id=eq.${encodeURIComponent(draft.id)}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify({ status: "created_paused", meta_campaign_id: String(created.id || ""), last_error: null, updated_at: finishedAt }),
+      });
+      const text = await update.text();
+      if (!update.ok) throw new Error(`meta_draft_finalize_failed: ${text.slice(0, 1000)}`);
+      return json(res, 200, { draft: JSON.parse(text || "[]")[0] });
+    } catch (error) {
+      const message = String(error?.message || "meta_campaign_create_failed").slice(0, 1000);
+      await sb(`/rest/v1/meta_ads_campaign_drafts?id=eq.${encodeURIComponent(draft.id)}`, {
+        method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "error", last_error: message, updated_at: new Date().toISOString() }),
+      }).catch(() => null);
+      return bad(res, 502, message);
+    }
   },
 
   /* ---------- admin/status (GET) ---------- */

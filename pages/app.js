@@ -620,6 +620,18 @@ export default function PlaylistManager() {
     access_token: "",
     app_secret: "",
   });
+  const [metaDrafts, setMetaDrafts] = useState([]);
+  const [metaDraftForm, setMetaDraftForm] = useState({
+    name: "Bored Indie Kid — Spotify traffic",
+    daily_budget_eur: "10",
+    destination_url: "",
+    primary_text: "Discover independent music worth saving. Listen now on Spotify.",
+    headline: "Discover Bored Indie Kid",
+    image_url: "",
+    countries: "DE",
+    age_min: "18",
+    age_max: "45",
+  });
   const [spotifyClientId, setSpotifyClientId] = useState("");
   const [spotifyClientSecret, setSpotifyClientSecret] = useState("");
   const [spotifyAppName, setSpotifyAppName] = useState("");
@@ -863,6 +875,7 @@ export default function PlaylistManager() {
   useEffect(() => {
     if (!userContext?.linked || !isAdmin || view !== "ads") return;
     loadMetaWorkspace();
+    loadMetaDrafts();
   }, [userContext?.linked, isAdmin, view]);
 
   useEffect(() => {
@@ -1993,6 +2006,41 @@ export default function PlaylistManager() {
     });
   }
 
+  async function loadMetaDrafts() {
+    if (!session?.access_token || !isAdmin) return null;
+    const data = await api("/api/meta/campaign-drafts", { accessToken: accessToken() }).catch((e) => {
+      if (!String(e.message || "").includes("not_configured")) setError(e.message || "Meta drafts failed.");
+      return null;
+    });
+    if (data) setMetaDrafts(data.drafts || []);
+    return data;
+  }
+
+  async function saveMetaDraft() {
+    await run("Campaign draft saved", async () => {
+      await api("/api/meta/campaign-drafts", { method: "POST", accessToken: accessToken(), body: metaDraftForm });
+      return loadMetaDrafts();
+    });
+  }
+
+  async function reviewMetaDraft(draftId) {
+    await run("Campaign draft approved for paused creation", async () => {
+      await api("/api/meta/campaign-drafts/review", { method: "POST", accessToken: accessToken(), body: { draft_id: draftId } });
+      return loadMetaDrafts();
+    });
+  }
+
+  async function createPausedMetaCampaign(draftId) {
+    await run("Paused Meta campaign created", async () => {
+      await api("/api/meta/campaign-drafts/create-paused", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { draft_id: draftId, confirmation: "CREATE PAUSED" },
+      });
+      return loadMetaDrafts();
+    });
+  }
+
   async function saveSpotifyCredentials() {
     await run("Spotify app settings saved", async () => {
       const data = await api("/api/spotify/credentials/save", {
@@ -3071,7 +3119,7 @@ export default function PlaylistManager() {
             <div className="metaTitleLine">
               <h2>Meta Ads Manager</h2>
               <span className="adminBadge">Admin preview</span>
-              <span className="metaReadOnlyBadge">Setup mode</span>
+              <span className="metaReadOnlyBadge">Draft mode</span>
             </div>
             <p>Connect and audit your Meta business assets before campaign publishing is enabled.</p>
           </div>
@@ -3164,7 +3212,46 @@ export default function PlaylistManager() {
           </div>
         </section>
 
-        <div className={`metaPublishLock ${metaWorkspace?.readiness?.publishing_ready ? "ready" : ""}`}><Lock aria-hidden="true" /><div><strong>{metaWorkspace?.readiness?.publishing_ready ? "Preflight complete; campaign writes remain locked" : "Campaign publishing is locked"}</strong><p>{metaWorkspace?.readiness?.publishing_ready ? "The connection is ready for the next phase, which will create paused drafts with an explicit review step." : `Still required: ${(metaWorkspace?.readiness?.missing || ["successful audit and three selected assets"]).join(", ")}.`}</p></div></div>
+        <section className="dashboardPanel metaDraftComposer">
+          <div className="panelHeader">
+            <div><h2>Paused campaign draft</h2><p>Prepare budget, targeting and creative. Nothing is sent to Meta until the reviewed draft is explicitly created.</p></div>
+            <span className="metaReadOnlyBadge">Always PAUSED</span>
+          </div>
+          <div className="metaDraftGrid">
+            <label className="metaDraftWide"><span>Campaign name</span><input value={metaDraftForm.name} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, name: e.target.value })} /></label>
+            <label><span>Daily budget (EUR)</span><input type="number" min="1" step="1" value={metaDraftForm.daily_budget_eur} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, daily_budget_eur: e.target.value })} /></label>
+            <label><span>Countries</span><input value={metaDraftForm.countries} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, countries: e.target.value })} placeholder="DE, AT, CH" /></label>
+            <label><span>Minimum age</span><input type="number" min="13" max="65" value={metaDraftForm.age_min} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, age_min: e.target.value })} /></label>
+            <label><span>Maximum age</span><input type="number" min="13" max="65" value={metaDraftForm.age_max} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, age_max: e.target.value })} /></label>
+            <label className="metaDraftWide"><span>Spotify destination URL</span><input type="url" value={metaDraftForm.destination_url} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, destination_url: e.target.value })} placeholder="https://open.spotify.com/playlist/..." /></label>
+            <label className="metaDraftWide"><span>Creative image URL</span><input type="url" value={metaDraftForm.image_url} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, image_url: e.target.value })} placeholder="https://.../cover.jpg" /></label>
+            <label className="metaDraftWide"><span>Primary text</span><textarea rows="3" value={metaDraftForm.primary_text} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, primary_text: e.target.value })} /></label>
+            <label className="metaDraftWide"><span>Headline</span><input value={metaDraftForm.headline} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, headline: e.target.value })} /></label>
+          </div>
+          <div className="metaFormActions">
+            <button disabled={busy || !metaWorkspace?.readiness?.publishing_ready} onClick={saveMetaDraft}>Save local draft</button>
+            <small>The server hard-codes <b>OUTCOME_TRAFFIC</b> and <b>PAUSED</b>; this phase creates a campaign shell only.</small>
+          </div>
+        </section>
+
+        <section className="dashboardPanel metaDraftList">
+          <div className="panelHeader"><div><h2>Campaign drafts</h2><p>Review is separate from the Meta write. Created campaigns remain paused in Ads Manager.</p></div><span>{metaDrafts.length}</span></div>
+          <div className="metaDraftCards">
+            {metaDrafts.map((draft) => <article key={draft.id}>
+              <div className="metaDraftCardHeader"><div><strong>{draft.name}</strong><small>{draft.status.replaceAll("_", " ")}</small></div><span>€{(Number(draft.daily_budget_minor || 0) / 100).toFixed(2)}/day</span></div>
+              <p>{draft.primary_text}</p>
+              <dl><div><dt>Target</dt><dd>{(draft.countries || []).join(", ")} · {draft.age_min}–{draft.age_max}</dd></div><div><dt>Destination</dt><dd>{draft.destination_url}</dd></div>{draft.meta_campaign_id ? <div><dt>Meta campaign</dt><dd>{draft.meta_campaign_id}</dd></div> : null}</dl>
+              {draft.last_error ? <div className="metaWarnings"><p>{draft.last_error}</p></div> : null}
+              <div className="metaDraftActions">
+                <button disabled={busy || draft.status !== "draft"} onClick={() => reviewMetaDraft(draft.id)}>{draft.status === "draft" ? "Approve review" : "Reviewed"}</button>
+                <button className="dangerButton" disabled={busy || draft.status !== "review_ready"} onClick={() => createPausedMetaCampaign(draft.id)}>Create PAUSED in Meta</button>
+              </div>
+            </article>)}
+            {!metaDrafts.length ? <p>No campaign drafts yet.</p> : null}
+          </div>
+        </section>
+
+        <div className={`metaPublishLock ${metaWorkspace?.readiness?.publishing_ready ? "ready" : ""}`}><Lock aria-hidden="true" /><div><strong>{metaWorkspace?.readiness?.publishing_ready ? "Paused campaign workflow unlocked" : "Campaign publishing is locked"}</strong><p>{metaWorkspace?.readiness?.publishing_ready ? "Save a local draft, approve its review, then explicitly create a PAUSED campaign shell in Meta. Active publishing is not available." : `Still required: ${(metaWorkspace?.readiness?.missing || ["successful audit and three selected assets"]).join(", ")}.`}</p></div></div>
       </section>
       ) : view === "admin" && isAdmin ? (
       <section className="adminPanel">
@@ -5949,6 +6036,65 @@ export default function PlaylistManager() {
           padding: 5px 9px;
           font-size: 11px;
         }
+        .metaDraftComposer,
+        .metaDraftList {
+          margin-top: 16px;
+        }
+        .metaDraftGrid {
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 12px;
+          margin-top: 16px;
+        }
+        .metaDraftGrid label {
+          display: grid;
+          gap: 6px;
+          color: #a6adba;
+          font-size: 12px;
+          font-weight: 800;
+        }
+        .metaDraftGrid input,
+        .metaDraftGrid textarea {
+          width: 100%;
+          border: 1px solid #303744;
+          border-radius: 7px;
+          background: #11151b;
+          color: #f4f6f8;
+          padding: 10px 11px;
+          font: inherit;
+          resize: vertical;
+        }
+        .metaDraftWide { grid-column: span 2; }
+        .metaDraftCards {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 12px;
+          margin-top: 16px;
+        }
+        .metaDraftCards > article {
+          display: grid;
+          gap: 12px;
+          padding: 14px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #151920;
+        }
+        .metaDraftCards > p { color: #7f8998; }
+        .metaDraftCardHeader,
+        .metaDraftActions {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 10px;
+        }
+        .metaDraftCardHeader div { display: grid; gap: 3px; }
+        .metaDraftCardHeader small { color: #18e06f; text-transform: uppercase; font-weight: 900; }
+        .metaDraftCards article > p { margin: 0; color: #c1c7d0; font-size: 13px; }
+        .metaDraftCards dl { display: grid; gap: 7px; margin: 0; }
+        .metaDraftCards dl div { display: grid; grid-template-columns: 90px 1fr; gap: 8px; }
+        .metaDraftCards dt { color: #7f8998; font-size: 11px; }
+        .metaDraftCards dd { margin: 0; overflow: hidden; color: #c1c7d0; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+        .metaDraftActions { justify-content: flex-end; }
         .metaPublishLock {
           display: flex;
           align-items: center;
@@ -7901,6 +8047,8 @@ export default function PlaylistManager() {
           .metaSetupGrid,
           .metaAssetColumns,
           .metaFormGrid,
+          .metaDraftGrid,
+          .metaDraftCards,
           .performanceHeroRow,
           .adControlGrid,
           .adPlaylistGrid,
@@ -7910,6 +8058,7 @@ export default function PlaylistManager() {
           .metaFormWide {
             grid-column: auto;
           }
+          .metaDraftWide { grid-column: auto; }
           .metaFormActions {
             align-items: stretch;
             flex-direction: column;
