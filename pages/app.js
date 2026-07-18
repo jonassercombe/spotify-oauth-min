@@ -3672,6 +3672,8 @@ export default function PlaylistManager() {
                       const defaultQuery = concept.visual_search_terms?.[0] || concept.visual_direction || "people listening music";
                       const assignedAssets = assets.filter((asset) => asset.concept_id === concept.id && asset.asset_type === "video");
                       const editorDraft = creativeEditorDrafts[concept.id] || concept.render_spec?.editor || {};
+                      const editorHookText = editorDraft.hook_text || concept.hook || "";
+                      const editorHookDensity = editorHookText.length > 88 ? "isDense" : editorHookText.length > 56 ? "isCompact" : "";
                       const editorAsset = assignedAssets.find((asset) => asset.id === editorDraft.asset_id) || assignedAssets[0];
                       const conceptRenderJobs = renders.filter((job) => job.concept_id === concept.id).sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
                       const latestRenderJob = conceptRenderJobs[0];
@@ -3681,7 +3683,7 @@ export default function PlaylistManager() {
                           <div className={`creativeEditorPreview creativeEditorPreview--${project.format.replace(":", "x")} creativeEditorPreview--${editorDraft.template_id || "bold_center"}`} style={{ "--editor-overlay": editorDraft.overlay_color || "#000000", "--editor-opacity": editorDraft.overlay_opacity ?? 0.28, "--editor-text": editorDraft.text_color || "#FFFFFF", "--editor-accent": editorDraft.accent_color || "#1ED760" }}>
                             <video src={editorAsset.source_url} poster={editorAsset.metadata?.image || ""} muted autoPlay loop playsInline />
                             <div className="creativeEditorShade" />
-                            <div className={`creativeEditorHook creativeEditorHook--${editorDraft.hook_position || "center"}`} style={{ textAlign: editorDraft.text_align || "center" }}><strong>{editorDraft.hook_text || concept.hook}</strong></div>
+                            <div className={`creativeEditorHook creativeEditorHook--${editorDraft.hook_position || "center"} ${editorHookDensity}`} style={{ textAlign: editorDraft.text_align || "center" }}><strong>{editorHookText}</strong></div>
                             {editorDraft.show_cover !== false ? <div className={`creativeEditorBrand creativeEditorBrand--${editorDraft.cover_position || "bottom"}`}><Artwork src={project.playlists?.image || project.brief?.cover_image} alt="" size="md" /><span>{project.playlists?.name || project.brief?.playlist_name}</span></div> : null}
                             {editorDraft.show_cta !== false ? <div className="creativeEditorCta">{editorDraft.cta_text || "Listen on Spotify"}</div> : null}
                           </div>
@@ -6652,24 +6654,28 @@ export default function PlaylistManager() {
         .creativeEditorPreview { position: relative; width: 100%; max-width: 320px; aspect-ratio: 9 / 16; justify-self: center; overflow: hidden; border-radius: 12px; background: #050608; box-shadow: 0 18px 48px rgba(0,0,0,.38); }
         .creativeEditorPreview--4x5 { aspect-ratio: 4 / 5; }
         .creativeEditorPreview--1x1 { aspect-ratio: 1; }
+        .creativeEditorPreview--editorial_top .creativeEditorHook { top: 10%; bottom: 51%; }
         .creativeEditorPreview--editorial_top .creativeEditorHook strong { font-size: clamp(17px, 2.6vw, 28px); line-height: 1.04; }
+        .creativeEditorPreview--minimal_bottom .creativeEditorHook { top: 58%; bottom: 16%; }
         .creativeEditorPreview--minimal_bottom .creativeEditorHook strong { font-size: clamp(15px, 2.2vw, 24px); line-height: 1.08; }
         .creativeEditorPreview--minimal_bottom .creativeEditorHook strong::after { width: 28px; height: 3px; }
         .creativeEditorPreview > video { width: 100%; height: 100%; object-fit: cover; }
         .creativeEditorShade { position: absolute; inset: 0; background: var(--editor-overlay); opacity: var(--editor-opacity); pointer-events: none; }
-        .creativeEditorHook { position: absolute; z-index: 2; left: 7%; right: 7%; display: flex; align-items: center; color: var(--editor-text); }
-        .creativeEditorHook strong { width: 100%; font-size: clamp(20px, 3.1vw, 34px); line-height: .98; letter-spacing: -0.04em; text-shadow: 0 2px 16px rgba(0,0,0,.55); }
+        .creativeEditorHook { position: absolute; z-index: 2; left: 7%; right: 7%; display: flex; align-items: flex-start; color: var(--editor-text); }
+        .creativeEditorHook strong { width: 100%; font-size: clamp(20px, 3.1vw, 34px); line-height: .98; letter-spacing: -0.04em; overflow-wrap: anywhere; text-wrap: balance; text-shadow: 0 2px 16px rgba(0,0,0,.55); }
+        .creativeEditorHook.isCompact strong { font-size: clamp(16px, 2.5vw, 27px); line-height: 1.02; }
+        .creativeEditorHook.isDense strong { font-size: clamp(13px, 2vw, 22px); line-height: 1.06; letter-spacing: -0.025em; }
         .creativeEditorHook strong::after { content: ""; display: block; width: 42px; height: 4px; margin: 10px auto 0; border-radius: 999px; background: var(--editor-accent); }
         .creativeEditorHook[style*="left"] strong::after { margin-left: 0; }
         .creativeEditorHook[style*="right"] strong::after { margin-right: 0; }
-        .creativeEditorHook--top { top: 10%; }
-        .creativeEditorHook--center { top: 39%; }
-        .creativeEditorHook--bottom { bottom: 20%; }
+        .creativeEditorHook--top { top: 10%; bottom: 57%; }
+        .creativeEditorHook--center { top: 18%; bottom: 28%; align-items: center; }
+        .creativeEditorHook--bottom { top: 57%; bottom: 16%; }
         .creativeEditorBrand { position: absolute; z-index: 3; left: 7%; right: 7%; display: flex; align-items: center; gap: 8px; color: #fff; font-size: 10px; font-weight: 800; text-shadow: 0 2px 10px #000; }
         .creativeEditorBrand--top { top: 4%; }
         .creativeEditorBrand--center { top: 52%; }
         .creativeEditorBrand--bottom { bottom: 8%; }
-        .creativeEditorCta { position: absolute; z-index: 4; right: 7%; bottom: 3%; padding: 7px 10px; border-radius: 999px; color: #07140c; background: var(--editor-accent); font-size: 9px; font-weight: 900; }
+        .creativeEditorCta { position: absolute; z-index: 4; left: 8%; right: 8%; bottom: 3%; color: #fff; font-size: clamp(8px, 1.4vw, 12px); line-height: 1.15; font-weight: 900; text-align: center; overflow-wrap: anywhere; text-shadow: 0 2px 10px #000; }
         .creativeEditorControls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; align-content: start; }
         .creativeEditorControls label { display: grid; gap: 5px; }
         .creativeEditorControls label > span { color: #7f8998; font-size: 9px; font-weight: 800; text-transform: uppercase; }

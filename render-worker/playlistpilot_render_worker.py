@@ -9,7 +9,6 @@ import os
 import socket
 import subprocess
 import tempfile
-import textwrap
 import time
 import urllib.error
 import urllib.request
@@ -66,6 +65,66 @@ def dimensions(fmt: str) -> tuple[int, int]:
     return {"4:5": (720, 900), "1:1": (720, 720)}.get(fmt, (720, 1280))
 
 
+def text_units(value: str) -> float:
+    """Approximate DejaVu Sans Bold glyph widths in font-size units."""
+    units = 0.0
+    for character in value:
+        if character.isspace():
+            units += 0.32
+        elif character in "ilI1.,:;!'|`":
+            units += 0.30
+        elif character in "MW@#%&mw":
+            units += 0.88
+        elif character.isupper():
+            units += 0.70
+        elif character.isdigit():
+            units += 0.60
+        else:
+            units += 0.57
+    return units
+
+
+def wrap_visual(value: str, max_units: float) -> list[str]:
+    """Wrap on visual width and split a single oversized token without truncating it."""
+    lines: list[str] = []
+    for paragraph in value.replace("\r", "").split("\n"):
+        words = paragraph.split()
+        if not words:
+            lines.append("")
+            continue
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if current and text_units(candidate) > max_units:
+                lines.append(current)
+                current = ""
+            while text_units(word) > max_units:
+                split_at = max(1, len(word) - 1)
+                while split_at > 1 and text_units(word[:split_at]) > max_units:
+                    split_at -= 1
+                lines.append(word[:split_at])
+                word = word[split_at:]
+            current = f"{current} {word}".strip()
+        if current:
+            lines.append(current)
+    return lines or [""]
+
+
+def fit_text(value: str, safe_width: int, safe_height: int, preferred_size: int, minimum_size: int) -> tuple[str, int, int]:
+    """Fit all text inside a rectangular safe area by wrapping, then scaling down."""
+    for font_size in range(preferred_size, minimum_size - 1, -2):
+        line_spacing = max(4, int(font_size * 0.16))
+        lines = wrap_visual(value, safe_width / font_size)
+        rendered_height = len(lines) * font_size + max(0, len(lines) - 1) * line_spacing
+        rendered_width = max(text_units(line) for line in lines) * font_size
+        if rendered_width <= safe_width and rendered_height <= safe_height:
+            return "\n".join(lines), font_size, line_spacing
+    font_size = minimum_size
+    line_spacing = max(3, int(font_size * 0.12))
+    lines = wrap_visual(value, safe_width / font_size)
+    return "\n".join(lines), font_size, line_spacing
+
+
 def probe_duration(path: Path) -> float:
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
@@ -82,18 +141,27 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     width, height = dimensions(str(job.get("format") or editor.get("format") or "9:16"))
     template_id = str(editor.get("template_id") or "bold_center")
     template = {
-        "bold_center": {"font_ratio": 0.078, "wrap": 20, "hook_y": "(h-text_h)/2", "hook_x": "(w-text_w)/2", "cover_ratio": 0.42},
-        "editorial_top": {"font_ratio": 0.064, "wrap": 25, "hook_y": "h*0.13", "hook_x": "w*0.07", "cover_ratio": 0.34},
-        "minimal_bottom": {"font_ratio": 0.052, "wrap": 30, "hook_y": "h*0.68", "hook_x": "w*0.07", "cover_ratio": 0.30},
-    }.get(template_id, {"font_ratio": 0.078, "wrap": 20, "hook_y": "(h-text_h)/2", "hook_x": "(w-text_w)/2", "cover_ratio": 0.42})
+        "bold_center": {"font_ratio": 0.078, "safe_x": 0.08, "safe_top": 0.18, "safe_bottom": 0.72, "vertical": "center", "cover_ratio": 0.42},
+        "editorial_top": {"font_ratio": 0.064, "safe_x": 0.07, "safe_top": 0.10, "safe_bottom": 0.49, "vertical": "top", "cover_ratio": 0.34},
+        "minimal_bottom": {"font_ratio": 0.052, "safe_x": 0.07, "safe_top": 0.58, "safe_bottom": 0.84, "vertical": "top", "cover_ratio": 0.30},
+    }.get(template_id, {"font_ratio": 0.078, "safe_x": 0.08, "safe_top": 0.18, "safe_bottom": 0.72, "vertical": "center", "cover_ratio": 0.42})
     clip_start = max(0.0, float(editor.get("trim_start", editor.get("clip_start", 0)) or 0))
     clip_end = max(clip_start + 0.2, float(editor.get("trim_end", editor.get("clip_end", clip_start + 15)) or clip_start + 15))
     duration = min(30.0, clip_end - clip_start)
     hook_start = max(0.0, float(editor.get("hook_start") or 0))
     hook_end = min(duration, max(hook_start + 0.2, float(editor.get("hook_end") or 4)))
     hook_position = str(editor.get("hook_position") or "center")
-    hook_y = template["hook_y"] if template_id in {"editorial_top", "minimal_bottom"} else {"top": "h*0.13", "bottom": "h*0.72"}.get(hook_position, template["hook_y"])
-    hook_x = template["hook_x"]
+    if template_id == "bold_center":
+        position_zones = {"top": (0.10, 0.43, "top"), "center": (0.18, 0.72, "center"), "bottom": (0.57, 0.84, "top")}
+        safe_top, safe_bottom, vertical = position_zones.get(hook_position, position_zones["center"])
+    else:
+        safe_top, safe_bottom, vertical = template["safe_top"], template["safe_bottom"], template["vertical"]
+    safe_x = int(width * template["safe_x"])
+    safe_width = width - (safe_x * 2)
+    safe_top_px = int(height * safe_top)
+    safe_height = int(height * (safe_bottom - safe_top))
+    text_align = str(editor.get("text_align") or "center")
+    hook_x = {"left": str(safe_x), "right": f"w-text_w-{safe_x}"}.get(text_align, "(w-text_w)/2")
     text_color = str(editor.get("text_color") or "#ffffff").replace("#", "0x")
     overlay = min(0.85, max(0.0, float(editor.get("overlay_opacity", editor.get("overlay_strength", 0.28)) or 0.0)))
     hook = str(editor.get("hook_text") or job.get("hook_text") or "").strip()
@@ -106,8 +174,15 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     hook_file = workdir / "hook.txt"
     cta_file = workdir / "cta.txt"
     download(str(job["video_url"]), source)
-    hook_file.write_text("\n".join(textwrap.wrap(hook, width=template["wrap"], break_long_words=False, break_on_hyphens=False)), encoding="utf-8")
-    cta_file.write_text("\n".join(textwrap.wrap(cta, width=36, break_long_words=False, break_on_hyphens=False)), encoding="utf-8")
+    fitted_hook, hook_font_size, hook_line_spacing = fit_text(
+        hook, safe_width, safe_height, max(34, int(width * template["font_ratio"])), max(24, int(width * 0.038))
+    )
+    fitted_cta, cta_font_size, cta_line_spacing = fit_text(
+        cta, int(width * 0.84), int(height * 0.11), max(24, int(width * 0.043)), max(18, int(width * 0.027))
+    )
+    hook_y = str(safe_top_px) if vertical == "top" else f"{safe_top_px}+({safe_height}-text_h)/2"
+    hook_file.write_text(fitted_hook, encoding="utf-8")
+    cta_file.write_text(fitted_cta, encoding="utf-8")
 
     command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{clip_start:.3f}", "-i", str(source)]
     cover = workdir / "cover.jpg"
@@ -127,15 +202,15 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     if hook:
         text_filters.append(
             "drawtext="
-            f"fontfile='{FONT_FILE}':textfile='{hook_file}':fontcolor={text_color}:fontsize={max(34, int(width * template['font_ratio']))}:"
-            f"line_spacing={max(4, int(width * 0.012))}:x={hook_x}:y={hook_y}:shadowcolor=black@0.82:shadowx=3:shadowy=3:"
+            f"fontfile='{FONT_FILE}':textfile='{hook_file}':fontcolor={text_color}:fontsize={hook_font_size}:"
+            f"line_spacing={hook_line_spacing}:x={hook_x}:y={hook_y}:fix_bounds=1:shadowcolor=black@0.82:shadowx=3:shadowy=3:"
             f"enable='between(t,{hook_start:.3f},{hook_end:.3f})'"
         )
     if show_cta:
         text_filters.append(
             "drawtext="
-            f"fontfile='{FONT_FILE}':textfile='{cta_file}':fontcolor=white:fontsize={max(24, int(width * 0.043))}:"
-            f"x=(w-text_w)/2:y=h-text_h-{max(38, int(height * 0.035))}:shadowcolor=black@0.75:shadowx=2:shadowy=2:"
+            f"fontfile='{FONT_FILE}':textfile='{cta_file}':fontcolor=white:fontsize={cta_font_size}:line_spacing={cta_line_spacing}:"
+            f"x=(w-text_w)/2:y=h-text_h-{max(38, int(height * 0.035))}:fix_bounds=1:shadowcolor=black@0.75:shadowx=2:shadowy=2:"
             f"enable='between(t,{max(0.0, duration - 4):.3f},{duration:.3f})'"
         )
     tail = ",".join(text_filters + ["format=yuv420p"])
