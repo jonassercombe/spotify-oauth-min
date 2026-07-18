@@ -3695,7 +3695,6 @@ export default function PlaylistManager() {
                             <label><span>Hook position</span><select value={editorDraft.hook_position || "center"} onChange={(event) => updateCreativeEditor(concept.id, { hook_position: event.target.value })}><option value="top">Top</option><option value="center">Center</option><option value="bottom">Bottom</option></select></label>
                             <label><span>Text alignment</span><select value={editorDraft.text_align || "center"} onChange={(event) => updateCreativeEditor(concept.id, { text_align: event.target.value })}><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></label>
                             <label><span>Text color</span><input type="color" value={editorDraft.text_color || "#FFFFFF"} onChange={(event) => updateCreativeEditor(concept.id, { text_color: event.target.value })} /></label>
-                            <label><span>Accent</span><input type="color" value={editorDraft.accent_color || "#1ED760"} onChange={(event) => updateCreativeEditor(concept.id, { accent_color: event.target.value })} /></label>
                             <label><span>Clip starts</span><input type="number" min="0" max={Math.max(0, Number(editorAsset.duration_seconds || 1) - 0.5)} step="0.1" value={editorDraft.trim_start ?? 0} onChange={(event) => updateCreativeEditor(concept.id, { trim_start: Number(event.target.value) })} /></label>
                             <label><span>Clip ends</span><input type="number" min="0.5" max={Number(editorAsset.duration_seconds || 15)} step="0.1" value={editorDraft.trim_end ?? Math.min(Number(editorAsset.duration_seconds || 15), 15)} onChange={(event) => updateCreativeEditor(concept.id, { trim_end: Number(event.target.value) })} /></label>
                             <label><span>Hook starts</span><input type="number" min="0" step="0.1" value={editorDraft.hook_start ?? 0} onChange={(event) => updateCreativeEditor(concept.id, { hook_start: Number(event.target.value) })} /></label>
@@ -6656,28 +6655,27 @@ export default function PlaylistManager() {
         .creativeEditorPreview--1x1 { aspect-ratio: 1; }
         .creativeEditorPreview--bold_center .creativeEditorHook { left: 11%; right: 11%; top: 20%; bottom: 43%; align-items: center; }
         .creativeEditorPreview--bold_center .creativeEditorHook strong { font-size: clamp(21px, 3.4vw, 36px); line-height: .94; text-align: center !important; }
-        .creativeEditorPreview--editorial_top .creativeEditorHook { left: 11%; right: 11%; top: 17%; bottom: 52%; padding-left: 5%; border-left: 3px solid var(--editor-accent); }
+        .creativeEditorPreview--editorial_top .creativeEditorHook { left: 11%; right: 11%; top: 17%; bottom: 52%; padding-left: 5%; }
         .creativeEditorPreview--editorial_top .creativeEditorHook strong { font-size: clamp(18px, 2.75vw, 29px); line-height: 1.02; }
-        .creativeEditorPreview--minimal_bottom .creativeEditorHook { left: 11%; right: 11%; top: 54%; bottom: 25%; padding: 5%; align-items: center; background: rgba(0,0,0,.42); }
+        .creativeEditorPreview--minimal_bottom .creativeEditorHook { left: 11%; right: 11%; top: 54%; bottom: 25%; align-items: center; }
         .creativeEditorPreview--minimal_bottom .creativeEditorHook strong { font-size: clamp(16px, 2.35vw, 25px); line-height: 1.05; }
         .creativeEditorPreview--minimal_bottom .creativeEditorHook strong::after { display: none; }
         .creativeEditorPreview > video { width: 100%; height: 100%; object-fit: cover; }
         .creativeEditorShade { position: absolute; inset: 0; background: var(--editor-overlay); opacity: var(--editor-opacity); pointer-events: none; }
         .creativeEditorHook { position: absolute; z-index: 2; display: flex; align-items: flex-start; color: var(--editor-text); }
-        .creativeEditorHook::before { content: "CURATED PLAYLIST"; position: absolute; top: -25px; left: 0; color: var(--editor-accent); font-family: Lato, Inter, ui-sans-serif, system-ui, sans-serif; font-size: 8px; font-weight: 600; letter-spacing: .11em; }
-        .creativeEditorPreview--bold_center .creativeEditorHook::before { left: 50%; transform: translateX(-50%); white-space: nowrap; }
+        .creativeEditorPreview--editorial_top .creativeEditorHook::before { content: "CURATED PLAYLIST"; position: absolute; top: -25px; left: 0; color: #fff; font-family: Lato, Inter, ui-sans-serif, system-ui, sans-serif; font-size: 8px; font-weight: 600; letter-spacing: .11em; white-space: nowrap; }
         .creativeEditorHook strong { width: 100%; font-family: Lato, Inter, ui-sans-serif, system-ui, sans-serif; font-size: clamp(20px, 3.1vw, 34px); font-weight: 900; line-height: .98; letter-spacing: -0.035em; overflow-wrap: anywhere; text-wrap: balance; text-shadow: 0 2px 16px rgba(0,0,0,.55); }
         .creativeEditorHook.isCompact strong { font-size: clamp(16px, 2.5vw, 27px); line-height: 1.02; }
         .creativeEditorHook.isDense strong { font-size: clamp(13px, 2vw, 22px); line-height: 1.06; letter-spacing: -0.025em; }
-        .creativeEditorHook strong::after { content: ""; display: block; width: 36px; height: 3px; margin: 12px auto 0; border-radius: 999px; background: var(--editor-accent); }
+        .creativeEditorHook strong::after { display: none; }
         .creativeEditorHook[style*="left"] strong::after { margin-left: 0; }
         .creativeEditorHook[style*="right"] strong::after { margin-right: 0; }
         .creativeEditorHook--top, .creativeEditorHook--center, .creativeEditorHook--bottom { }
         .creativeEditorBrand { position: absolute; z-index: 3; color: #fff; font-family: Lato, Inter, ui-sans-serif, system-ui, sans-serif; font-size: 12px; font-weight: 900; line-height: 1.05; text-shadow: 0 2px 10px #000; }
         .creativeEditorBrand :global(.artwork), .creativeEditorBrand :global(.coverFallback) { width: 100% !important; height: auto !important; aspect-ratio: 1; border-radius: 2px; box-shadow: 0 10px 30px rgba(0,0,0,.45); }
-        .creativeEditorPreview--bold_center .creativeEditorBrand { left: 18%; right: 18%; top: 62%; display: grid; grid-template-columns: 34% 1fr; gap: 12px; align-items: start; text-align: left; }
-        .creativeEditorPreview--editorial_top .creativeEditorBrand { left: 11%; right: 11%; top: 31%; display: grid; grid-template-columns: 29% 1fr; gap: 12px; align-items: start; }
-        .creativeEditorPreview--minimal_bottom .creativeEditorBrand { left: 11%; right: 11%; top: 20%; display: grid; grid-template-columns: 25% 1fr; gap: 12px; align-items: start; }
+        .creativeEditorPreview--bold_center .creativeEditorBrand { left: 15%; right: 15%; top: 60%; display: grid; grid-template-columns: 42% 1fr; gap: 13px; align-items: start; text-align: left; }
+        .creativeEditorPreview--editorial_top .creativeEditorBrand { left: 11%; right: 11%; top: 29%; display: grid; grid-template-columns: 36% 1fr; gap: 13px; align-items: start; }
+        .creativeEditorPreview--minimal_bottom .creativeEditorBrand { left: 11%; right: 11%; top: 18%; display: grid; grid-template-columns: 32% 1fr; gap: 13px; align-items: start; }
         .creativeEditorBrand--top, .creativeEditorBrand--center, .creativeEditorBrand--bottom { }
         .creativeEditorCta { position: absolute; z-index: 4; left: 14%; right: 14%; bottom: 20%; color: #fff; font-family: Lato, Inter, ui-sans-serif, system-ui, sans-serif; font-size: clamp(8px, 1.15vw, 11px); line-height: 1.15; font-weight: 500; letter-spacing: .08em; text-transform: uppercase; text-align: center; overflow-wrap: anywhere; text-shadow: 0 2px 10px #000; }
         .creativeEditorPreview--4x5 .creativeEditorCta, .creativeEditorPreview--1x1 .creativeEditorCta { bottom: 12%; }
