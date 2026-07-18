@@ -2533,6 +2533,7 @@ const routes = {
           age_max: draft.age_max,
           geo_locations: { countries: draft.countries },
           publisher_platforms: ["facebook", "instagram"],
+          targeting_automation: { advantage_audience: 0 },
         };
         if (draft.placement_mode === "feeds") {
           targeting.facebook_positions = ["feed"];
