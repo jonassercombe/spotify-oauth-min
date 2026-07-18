@@ -626,6 +626,7 @@ export default function PlaylistManager() {
   const [creativeProjects, setCreativeProjects] = useState([]);
   const [creativeProjectForm, setCreativeProjectForm] = useState({ playlist_id: "", name: "", language: "en", format: "9:16" });
   const [openCreativeProjectId, setOpenCreativeProjectId] = useState("");
+  const [creativeMediaSearches, setCreativeMediaSearches] = useState({});
   const [adsSection, setAdsSection] = useState("overview");
   const [adsWizardStep, setAdsWizardStep] = useState(1);
   const [metaDraftForm, setMetaDraftForm] = useState({
@@ -2105,6 +2106,51 @@ export default function PlaylistManager() {
     });
   }
 
+  function setCreativeMediaQuery(conceptId, query) {
+    setCreativeMediaSearches((current) => ({ ...current, [conceptId]: { ...(current[conceptId] || {}), query } }));
+  }
+
+  async function searchCreativeMedia(concept) {
+    const fallback = concept.visual_search_terms?.[0] || concept.visual_direction || "people listening music";
+    const query = creativeMediaSearches[concept.id]?.query || fallback;
+    setCreativeMediaSearches((current) => ({ ...current, [concept.id]: { ...(current[concept.id] || {}), query, loading: true } }));
+    try {
+      const data = await api("/api/meta/creative-media/search", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { concept_id: concept.id, query },
+      });
+      setCreativeMediaSearches((current) => ({ ...current, [concept.id]: { query: data.query, videos: data.videos || [], total: data.total_results || 0, loading: false } }));
+    } catch (e) {
+      setCreativeMediaSearches((current) => ({ ...current, [concept.id]: { ...(current[concept.id] || {}), loading: false } }));
+      setError(e.message || "Pexels search failed.");
+    }
+  }
+
+  async function selectCreativeMedia(concept, video) {
+    await run("Video assigned to concept", async () => {
+      await api("/api/meta/creative-media/select", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: {
+          concept_id: concept.id,
+          provider_id: video.id,
+          source_url: video.source_url,
+          width: video.source_width,
+          height: video.source_height,
+          duration: video.duration,
+          image: video.image,
+          pexels_url: video.url,
+          creator_name: video.user?.name,
+          creator_url: video.user?.url,
+          query: creativeMediaSearches[concept.id]?.query || "",
+        },
+      });
+      setCreativeMediaSearches((current) => ({ ...current, [concept.id]: { ...(current[concept.id] || {}), videos: [] } }));
+      return loadCreativeProjects();
+    });
+  }
+
   async function saveMetaDraft() {
     await run("Campaign draft saved", async () => {
       await api("/api/meta/campaign-drafts", { method: "POST", accessToken: accessToken(), body: metaDraftForm });
@@ -3342,6 +3388,7 @@ export default function PlaylistManager() {
             <div className="creativeProjectCards">
               {creativeProjects.map((project) => {
                 const concepts = [...(project.meta_creative_concepts || [])].sort((a, b) => Number(a.position || 0) - Number(b.position || 0));
+                const assets = project.meta_creative_assets || [];
                 const renders = project.meta_creative_render_jobs || [];
                 const completedRenders = renders.filter((job) => job.status === "completed").length;
                 const isOpen = openCreativeProjectId === project.id;
@@ -3354,7 +3401,15 @@ export default function PlaylistManager() {
                   </div>
                   {isOpen ? <div className="creativeProjectDetail">
                     {hasBrief ? <div className="creativeBriefPanel"><span>Creative brief</span><h3>{project.brief.title || project.name}</h3><p>{project.brief.mood_summary}</p><p>{project.brief.audience_summary}</p><div>{(project.brief.core_angles || []).map((angle) => <b key={angle}>{angle}</b>)}</div></div> : <div className="creativeEmptyState"><strong>Ready to analyze</strong><p>PlaylistPilot will read the local playlist snapshot and create a brief plus eight testable concepts.</p><button disabled={busy} onClick={() => generateCreativeProject(project.id)}>{project.status === "error" ? "Retry generation" : "Generate brief & concepts"}</button>{project.last_error ? <small>{project.last_error}</small> : null}</div>}
-                    {concepts.length ? <div className="creativeConceptGrid">{concepts.map((concept) => <article key={concept.id}><span>Concept {concept.position}</span><h3>{concept.title}</h3><strong>{concept.hook}</strong><p>{concept.story}</p><dl><div><dt>Angle</dt><dd>{concept.angle}</dd></div><div><dt>Visual</dt><dd>{concept.visual_direction}</dd></div><div><dt>Hypothesis</dt><dd>{concept.hypothesis}</dd></div></dl><div className="creativeConceptTerms">{(concept.visual_search_terms || []).map((term) => <b key={term}>{term}</b>)}</div></article>)}</div> : null}
+                    {concepts.length ? <div className="creativeConceptGrid">{concepts.map((concept) => {
+                      const mediaState = creativeMediaSearches[concept.id] || {};
+                      const defaultQuery = concept.visual_search_terms?.[0] || concept.visual_direction || "people listening music";
+                      const assignedAssets = assets.filter((asset) => asset.concept_id === concept.id && asset.asset_type === "video");
+                      return <article key={concept.id} className={assignedAssets.length ? "hasMedia" : ""}><span>Concept {concept.position} · {concept.status.replaceAll("_", " ")}</span><h3>{concept.title}</h3><strong>{concept.hook}</strong><p>{concept.story}</p><dl><div><dt>Angle</dt><dd>{concept.angle}</dd></div><div><dt>Visual</dt><dd>{concept.visual_direction}</dd></div><div><dt>Hypothesis</dt><dd>{concept.hypothesis}</dd></div></dl><div className="creativeConceptTerms">{(concept.visual_search_terms || []).map((term) => <button key={term} onClick={() => setCreativeMediaQuery(concept.id, term)}>{term}</button>)}</div>
+                        {assignedAssets.map((asset) => <div className="creativeAssignedMedia" key={asset.id}><video src={asset.source_url} poster={asset.metadata?.image || ""} muted controls playsInline preload="metadata" /><div><strong>Selected Pexels clip</strong><small>{asset.width}×{asset.height} · {Number(asset.duration_seconds || 0).toFixed(1)}s</small>{asset.metadata?.pexels_url ? <a href={asset.metadata.pexels_url} target="_blank" rel="noreferrer">Video by {asset.metadata?.creator_name || "creator"} on Pexels</a> : null}</div></div>)}
+                        <div className="creativeMediaSearch"><div><input aria-label={`Pexels query for ${concept.title}`} value={mediaState.query ?? defaultQuery} onChange={(event) => setCreativeMediaQuery(concept.id, event.target.value)} /><button disabled={mediaState.loading} onClick={() => searchCreativeMedia(concept)}>{mediaState.loading ? "Searching…" : assignedAssets.length ? "Find another" : "Find videos"}</button></div>{mediaState.videos?.length ? <><small>{mediaState.total} Pexels results · select one to attach it</small><div className="creativeMediaResults">{mediaState.videos.map((video) => <div key={video.id}><video src={video.source_url} poster={video.image} muted controls playsInline preload="metadata" /><div><span>{video.duration}s · {video.source_width}×{video.source_height}</span><button disabled={busy} onClick={() => selectCreativeMedia(concept, video)}>Use clip</button><a href={video.url} target="_blank" rel="noreferrer">{video.user?.name || "Pexels"}</a></div></div>)}</div><a className="pexelsAttribution" href="https://www.pexels.com" target="_blank" rel="noreferrer">Videos provided by Pexels</a></> : null}</div>
+                      </article>;
+                    })}</div> : null}
                   </div> : null}
                 </article>;
               })}
@@ -6219,15 +6274,31 @@ export default function PlaylistManager() {
         .creativeBriefPanel h3, .creativeConceptGrid h3 { margin: 0; }
         .creativeBriefPanel p { margin: 0; color: #a5aebb; line-height: 1.55; }
         .creativeBriefPanel > div, .creativeConceptTerms { display: flex; flex-wrap: wrap; gap: 6px; }
-        .creativeBriefPanel b, .creativeConceptTerms b { padding: 5px 8px; border: 1px solid #343d49; border-radius: 999px; color: #aeb7c3; font-size: 9px; }
+        .creativeBriefPanel b, .creativeConceptTerms b, .creativeConceptTerms button { padding: 5px 8px; border: 1px solid #343d49; border-radius: 999px; color: #aeb7c3; background: transparent; font-size: 9px; }
         .creativeConceptGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
         .creativeConceptGrid article { display: grid; align-content: start; gap: 9px; padding: 14px; border: 1px solid #303744; border-radius: 10px; background: #131820; }
+        .creativeConceptGrid article.hasMedia { border-color: rgba(24, 224, 111, 0.38); }
         .creativeConceptGrid article > strong { color: #f4f7fa; font-size: 18px; line-height: 1.25; }
         .creativeConceptGrid article > p { margin: 0; color: #929daa; line-height: 1.5; }
         .creativeConceptGrid dl { display: grid; gap: 7px; margin: 2px 0; }
         .creativeConceptGrid dl div { display: grid; gap: 2px; }
         .creativeConceptGrid dt { color: #677282; font-size: 9px; font-weight: 800; text-transform: uppercase; }
         .creativeConceptGrid dd { margin: 0; color: #b8c0cb; font-size: 11px; line-height: 1.45; }
+        .creativeMediaSearch { display: grid; gap: 8px; margin-top: 4px; padding-top: 12px; border-top: 1px solid #2b333e; }
+        .creativeMediaSearch > div:first-child { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
+        .creativeMediaSearch input { min-width: 0; }
+        .creativeMediaSearch > small { color: #788391; font-size: 10px; }
+        .creativeMediaResults { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+        .creativeMediaResults > div { display: grid; overflow: hidden; border: 1px solid #323b47; border-radius: 8px; background: #0c1015; }
+        .creativeMediaResults video, .creativeAssignedMedia video { width: 100%; aspect-ratio: 9 / 16; max-height: 270px; object-fit: cover; background: #080a0d; }
+        .creativeMediaResults > div > div { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px; align-items: center; padding: 7px; }
+        .creativeMediaResults span, .creativeMediaResults a { color: #7f8998; font-size: 9px; }
+        .creativeMediaResults a { grid-column: 1 / -1; }
+        .pexelsAttribution { color: #929daa; font-size: 10px; }
+        .creativeAssignedMedia { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 10px; align-items: center; padding: 9px; border: 1px solid rgba(24, 224, 111, 0.3); border-radius: 8px; background: rgba(24, 224, 111, 0.035); }
+        .creativeAssignedMedia video { max-height: 150px; border-radius: 6px; }
+        .creativeAssignedMedia > div { display: grid; gap: 4px; }
+        .creativeAssignedMedia small, .creativeAssignedMedia a { color: #85909d; font-size: 10px; }
         .creativeEmptyState, .creativeLibraryEmpty > div { display: grid; justify-items: start; gap: 8px; padding: 24px; border: 1px dashed #3a4351; border-radius: 10px; color: #8d96a4; }
         .creativeEmptyState p, .creativeLibraryEmpty p { margin: 0; color: #8d96a4; }
         .creativeLibraryEmpty { display: grid; gap: 14px; }
@@ -8534,6 +8605,7 @@ export default function PlaylistManager() {
           .creativeProjectSummary { grid-template-columns: auto minmax(0, 1fr); }
           .creativeProjectSummary > button { grid-column: 1 / -1; }
           .creativeConceptGrid { grid-template-columns: 1fr; }
+          .creativeMediaResults { grid-template-columns: 1fr 1fr; }
           .adsWizardSteps { grid-template-columns: 1fr; }
           .adsPlacementChoices { grid-template-columns: 1fr; }
           .adsDeliverySummary { grid-template-columns: 1fr; }

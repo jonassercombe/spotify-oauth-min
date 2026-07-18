@@ -945,6 +945,51 @@ async function generateCreativeBriefWithOpenAI({ project, playlist, tracks }) {
   }
 }
 
+function pexelsOrientation(format) {
+  if (format === "1:1") return "square";
+  if (format === "4:5" || format === "9:16") return "portrait";
+  return "portrait";
+}
+
+function normalizePexelsVideo(video) {
+  const files = (video?.video_files || []).filter((file) => file?.link && file?.file_type === "video/mp4");
+  const scored = files.map((file) => {
+    const width = Number(file.width || 0);
+    const height = Number(file.height || 0);
+    const portraitBonus = height > width ? 10000000 : 0;
+    const sensibleSize = width <= 1080 && height <= 1920 ? 5000000 : 0;
+    return { ...file, _score: portraitBonus + sensibleSize + width * height };
+  }).sort((a, b) => b._score - a._score);
+  const source = scored[0] || files[0];
+  if (!source) return null;
+  return {
+    id: String(video.id),
+    width: Number(video.width || source.width || 0),
+    height: Number(video.height || source.height || 0),
+    duration: Number(video.duration || 0),
+    image: video.image || video.video_pictures?.[0]?.picture || "",
+    url: video.url || "",
+    user: { name: video.user?.name || "Pexels creator", url: video.user?.url || "" },
+    source_url: source.link,
+    source_width: Number(source.width || 0),
+    source_height: Number(source.height || 0),
+    source_quality: source.quality || "",
+    source_file_type: source.file_type || "video/mp4",
+  };
+}
+
+async function loadOwnedCreativeConcept(conceptId, connectionId, bubbleUserId) {
+  const conceptResponse = await sb(`/rest/v1/meta_creative_concepts?select=*&limit=1&id=eq.${encodeURIComponent(conceptId)}`);
+  const concept = conceptResponse.ok ? (await conceptResponse.json().catch(() => []))[0] : null;
+  if (!concept) return null;
+  const projectResponse = await sb(
+    `/rest/v1/meta_creative_projects?select=*&limit=1&id=eq.${encodeURIComponent(concept.project_id)}` +
+    `&connection_id=eq.${encodeURIComponent(connectionId)}&bubble_user_id=eq.${encodeURIComponent(bubbleUserId)}`
+  );
+  const project = projectResponse.ok ? (await projectResponse.json().catch(() => []))[0] : null;
+  return project ? { concept, project } : null;
+}
+
 function fallbackSpotifyCredentials({ requireRedirect = false } = {}) {
   const client_id = process.env.SPOTIFY_CLIENT_ID || "";
   const client_secret = process.env.SPOTIFY_CLIENT_SECRET || "";
@@ -2524,7 +2569,7 @@ const routes = {
     if (!connection) return bad(res, 400, "meta_connection_not_configured");
     if (req.method === "GET") {
       const response = await sb(
-        `/rest/v1/meta_creative_projects?select=*,playlists(name,image,playlist_id,followers,tracks_total),meta_creative_concepts(*),meta_creative_render_jobs(id,status)` +
+        `/rest/v1/meta_creative_projects?select=*,playlists(name,image,playlist_id,followers,tracks_total),meta_creative_concepts(*),meta_creative_assets(*),meta_creative_render_jobs(id,status)` +
         `&connection_id=eq.${encodeURIComponent(connection.id)}&order=created_at.desc&limit=50`
       );
       if (!response.ok) return bad(res, 500, `meta_creative_projects_load_failed: ${(await response.text()).slice(0, 1000)}`);
@@ -2665,6 +2710,111 @@ const routes = {
       }).catch(() => null);
       return bad(res, 502, message);
     }
+  },
+
+  /* ---------- meta/creative-media/search (POST) ---------- */
+  "meta/creative-media/search": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+    const body = await readBody(req);
+    const conceptId = String(body.concept_id || "").trim();
+    if (!/^[0-9a-f-]{36}$/i.test(conceptId)) return bad(res, 400, "creative_concept_required");
+    const owned = await loadOwnedCreativeConcept(conceptId, connection.id, ctx.bubble_user_id);
+    if (!owned) return bad(res, 404, "creative_concept_not_found");
+    const fallbackQuery = owned.concept.visual_search_terms?.[0] || owned.concept.visual_direction || owned.concept.angle;
+    const query = String(body.query || fallbackQuery || "people listening music").replace(/\s+/g, " ").trim().slice(0, 120);
+    const page = Math.max(1, Math.min(20, Number.parseInt(body.page, 10) || 1));
+    if (query.length < 2) return bad(res, 400, "creative_media_query_required");
+    const params = new URLSearchParams({
+      query,
+      orientation: pexelsOrientation(owned.project.format),
+      size: "medium",
+      locale: owned.project.language === "de" ? "de-DE" : "en-US",
+      per_page: "8",
+      page: String(page),
+    });
+    const response = await fetch(`https://api.pexels.com/v1/videos/search?${params}`, {
+      headers: { Authorization: need("PEXELS_API_KEY"), Accept: "application/json" },
+    });
+    const parsed = await parseJsonSafe(response);
+    if (!response.ok) return bad(res, response.status === 429 ? 429 : 502, `pexels_${response.status}: ${parsed.json?.error || parsed.text.slice(0, 500)}`);
+    const videos = (parsed.json?.videos || []).map(normalizePexelsVideo).filter(Boolean);
+    return json(res, 200, {
+      query,
+      page,
+      total_results: Number(parsed.json?.total_results || videos.length),
+      rate_limit: {
+        remaining: response.headers.get("x-ratelimit-remaining"),
+        reset: response.headers.get("x-ratelimit-reset"),
+      },
+      videos,
+    });
+  },
+
+  /* ---------- meta/creative-media/select (POST) ---------- */
+  "meta/creative-media/select": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+    const body = await readBody(req);
+    const conceptId = String(body.concept_id || "").trim();
+    const providerId = String(body.provider_id || "").trim();
+    const sourceUrl = String(body.source_url || "").trim();
+    if (!/^[0-9a-f-]{36}$/i.test(conceptId)) return bad(res, 400, "creative_concept_required");
+    if (!/^\d+$/.test(providerId)) return bad(res, 400, "invalid_pexels_video_id");
+    let source;
+    try { source = new URL(sourceUrl); } catch { return bad(res, 400, "invalid_pexels_source_url"); }
+    if (source.protocol !== "https:" || !/(^|\.)pexels\.com$/i.test(source.hostname)) return bad(res, 400, "invalid_pexels_source_host");
+    const owned = await loadOwnedCreativeConcept(conceptId, connection.id, ctx.bubble_user_id);
+    if (!owned) return bad(res, 404, "creative_concept_not_found");
+
+    const existingResponse = await sb(
+      `/rest/v1/meta_creative_assets?select=*&limit=1&concept_id=eq.${encodeURIComponent(conceptId)}` +
+      `&source=eq.pexels&provider_id=eq.${encodeURIComponent(providerId)}`
+    );
+    const existing = existingResponse.ok ? (await existingResponse.json().catch(() => []))[0] : null;
+    if (existing) return json(res, 200, { asset: existing, reused: true });
+    const width = Math.max(0, Math.min(10000, Number.parseInt(body.width, 10) || 0));
+    const height = Math.max(0, Math.min(10000, Number.parseInt(body.height, 10) || 0));
+    const duration = Math.max(0, Math.min(3600, Number(body.duration) || 0));
+    const payload = {
+      project_id: owned.project.id,
+      concept_id: conceptId,
+      asset_type: "video",
+      source: "pexels",
+      provider_id: providerId,
+      source_url: sourceUrl,
+      mime_type: "video/mp4",
+      duration_seconds: duration || null,
+      width: width || null,
+      height: height || null,
+      metadata: {
+        query: String(body.query || "").slice(0, 120),
+        image: String(body.image || "").slice(0, 1000),
+        pexels_url: String(body.pexels_url || "").slice(0, 1000),
+        creator_name: String(body.creator_name || "").slice(0, 200),
+        creator_url: String(body.creator_url || "").slice(0, 1000),
+      },
+      updated_at: new Date().toISOString(),
+    };
+    const insertResponse = await sb(`/rest/v1/meta_creative_assets`, {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify([payload]),
+    });
+    const insertText = await insertResponse.text();
+    if (!insertResponse.ok) return bad(res, 500, `creative_asset_save_failed: ${insertText.slice(0, 500)}`);
+    await sb(`/rest/v1/meta_creative_concepts?id=eq.${encodeURIComponent(conceptId)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ status: "media_ready", updated_at: new Date().toISOString() }),
+    });
+    return json(res, 201, { asset: JSON.parse(insertText || "[]")[0], reused: false });
   },
 
   /* ---------- meta/campaign-drafts (GET/POST) ---------- */
