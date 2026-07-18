@@ -623,6 +623,8 @@ export default function PlaylistManager() {
     dsa_payor: "",
   });
   const [metaDrafts, setMetaDrafts] = useState([]);
+  const [creativeProjects, setCreativeProjects] = useState([]);
+  const [creativeProjectForm, setCreativeProjectForm] = useState({ playlist_id: "", name: "", language: "en", format: "9:16" });
   const [adsSection, setAdsSection] = useState("overview");
   const [adsWizardStep, setAdsWizardStep] = useState(1);
   const [metaDraftForm, setMetaDraftForm] = useState({
@@ -658,7 +660,7 @@ export default function PlaylistManager() {
   useEffect(() => {
     if (typeof window === "undefined") return undefined;
     const syncAdsHash = () => {
-      const match = window.location.hash.match(/^#ads\/(overview|campaigns|new|settings)$/);
+      const match = window.location.hash.match(/^#ads\/(overview|campaigns|creatives|library|new|settings)$/);
       if (match) {
         setView("ads");
         setAdsSection(match[1]);
@@ -910,6 +912,7 @@ export default function PlaylistManager() {
     if (!userContext?.linked || !isAdmin || view !== "ads") return;
     loadMetaWorkspace();
     loadMetaDrafts();
+    loadCreativeProjects();
   }, [userContext?.linked, isAdmin, view]);
 
   useEffect(() => {
@@ -2056,6 +2059,37 @@ export default function PlaylistManager() {
     });
     if (data) setMetaDrafts(data.drafts || []);
     return data;
+  }
+
+  async function loadCreativeProjects() {
+    if (!session?.access_token || !isAdmin) return null;
+    const data = await api("/api/meta/creative-projects", { accessToken: accessToken() }).catch((e) => {
+      if (!String(e.message || "").includes("not_configured")) setError(e.message || "Creative projects failed.");
+      return null;
+    });
+    if (data) setCreativeProjects(data.projects || []);
+    return data;
+  }
+
+  function selectCreativePlaylist(selectedId) {
+    const selected = playlists.find((item) => item.id === selectedId);
+    setCreativeProjectForm((current) => ({
+      ...current,
+      playlist_id: selectedId,
+      name: selected ? `${selected.name} — Creative exploration`.slice(0, 120) : current.name,
+    }));
+  }
+
+  async function createCreativeProject() {
+    await run("Creative project created", async () => {
+      await api("/api/meta/creative-projects", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: creativeProjectForm,
+      });
+      setCreativeProjectForm({ playlist_id: "", name: "", language: "en", format: "9:16" });
+      return loadCreativeProjects();
+    });
   }
 
   async function saveMetaDraft() {
@@ -3220,7 +3254,7 @@ export default function PlaylistManager() {
         </div>
 
         <nav className="adsWorkspaceNav" aria-label="Ads Manager sections">
-          {[{ id: "overview", label: "Overview" }, { id: "campaigns", label: "Campaigns" }, { id: "new", label: "New campaign" }, { id: "settings", label: "Settings" }].map((item) => (
+          {[{ id: "overview", label: "Overview" }, { id: "campaigns", label: "Campaigns" }, { id: "creatives", label: "Creative Studio" }, { id: "library", label: "Creative Library" }, { id: "new", label: "New campaign" }, { id: "settings", label: "Settings" }].map((item) => (
             <button key={item.id} className={adsSection === item.id ? "active" : ""} onClick={() => openAdsSection(item.id)}>{item.label}</button>
           ))}
         </nav>
@@ -3264,6 +3298,57 @@ export default function PlaylistManager() {
         </div>
         <div className={`metaPublishLock ${metaWorkspace?.readiness?.publishing_ready ? "ready" : ""}`}><Lock aria-hidden="true" /><div><strong>{metaWorkspace?.readiness?.publishing_ready ? "Paused campaign workflow unlocked" : "Campaign publishing is locked"}</strong><p>{metaWorkspace?.readiness?.publishing_ready ? "Create and review complete PAUSED campaign packages. Active publishing remains unavailable." : `Still required: ${(metaWorkspace?.readiness?.missing || ["successful audit and three selected assets"]).join(", ")}.`}</p></div></div>
         </> : null}
+
+        {adsSection === "creatives" ? <>
+        <section className="dashboardPanel creativeStudioHero">
+          <div>
+            <span className="metaReadOnlyBadge">Creative pipeline</span>
+            <h2>Turn playlist identity into testable video concepts</h2>
+            <p>Start with a PlaylistPilot playlist. The next stages will generate the brief and hooks, source footage, assemble variants, and send selected concepts to the render queue.</p>
+          </div>
+          <ol className="creativePipeline" aria-label="Creative pipeline stages">
+            {["Playlist", "Brief & hooks", "Media", "Editor", "Batch render", "Review"].map((label, index) => <li key={label}><b>{index + 1}</b><span>{label}</span></li>)}
+          </ol>
+        </section>
+
+        <div className="creativeStudioGrid">
+          <section className="dashboardPanel creativeProjectComposer">
+            <div className="panelHeader"><div><h2>New creative project</h2><p>Create the persistent workspace before generating concepts.</p></div></div>
+            <div className="metaFormGrid">
+              <label className="metaFormWide"><span>Playlist</span><select value={creativeProjectForm.playlist_id} onChange={(event) => selectCreativePlaylist(event.target.value)}><option value="">Select a playlist</option>{playlists.map((item) => <option key={item.id} value={item.id}>{item.name} · {formatNumber(item.followers)} followers</option>)}</select></label>
+              <label className="metaFormWide"><span>Project name</span><input value={creativeProjectForm.name} onChange={(event) => setCreativeProjectForm({ ...creativeProjectForm, name: event.target.value })} placeholder="Playlist — Creative exploration" /></label>
+              <label><span>Copy language</span><select value={creativeProjectForm.language} onChange={(event) => setCreativeProjectForm({ ...creativeProjectForm, language: event.target.value })}><option value="en">English</option><option value="de">German</option></select></label>
+              <label><span>Primary format</span><select value={creativeProjectForm.format} onChange={(event) => setCreativeProjectForm({ ...creativeProjectForm, format: event.target.value })}><option value="9:16">9:16 · Stories & Reels</option><option value="4:5">4:5 · Feed portrait</option><option value="1:1">1:1 · Square</option></select></label>
+            </div>
+            {creativeProjectForm.playlist_id ? <article className="creativePlaylistSeed"><Artwork src={playlists.find((item) => item.id === creativeProjectForm.playlist_id)?.image} alt="" size="lg" /><div><span>Source playlist</span><strong>{playlists.find((item) => item.id === creativeProjectForm.playlist_id)?.name}</strong><small>{formatNumber(playlists.find((item) => item.id === creativeProjectForm.playlist_id)?.tracks_total)} tracks available for the creative brief</small></div></article> : null}
+            <div className="metaFormActions"><button disabled={busy || !creativeProjectForm.playlist_id || creativeProjectForm.name.trim().length < 3} onClick={createCreativeProject}>Create creative project</button><small>No LLM or render costs are triggered yet.</small></div>
+          </section>
+
+          <section className="dashboardPanel creativeProjectList">
+            <div className="panelHeader"><div><h2>Creative projects</h2><p>Persistent workspaces shared by concept generation, media, and rendering.</p></div><span className="jobStatus jobStatus--pending">{creativeProjects.length}</span></div>
+            <div className="creativeProjectCards">
+              {creativeProjects.map((project) => {
+                const concepts = project.meta_creative_concepts || [];
+                const renders = project.meta_creative_render_jobs || [];
+                const completedRenders = renders.filter((job) => job.status === "completed").length;
+                return <article key={project.id}>
+                  <Artwork src={project.playlists?.image || project.brief?.cover_image} alt="" size="lg" />
+                  <div className="creativeProjectCopy"><div><span>{project.status.replaceAll("_", " ")}</span><strong>{project.name}</strong></div><small>{project.playlists?.name || project.brief?.playlist_name || "Playlist"} · {project.format} · {project.language.toUpperCase()}</small><div className="creativeProjectMetrics"><b>{concepts.length}<small>concepts</small></b><b>{renders.length}<small>render jobs</small></b><b>{completedRenders}<small>finished</small></b></div></div>
+                  <button disabled title="Brief generation is the next integration step">Open project</button>
+                </article>;
+              })}
+              {!creativeProjects.length ? <div className="creativeEmptyState"><strong>No creative projects yet</strong><p>Select a playlist to establish the first workspace.</p></div> : null}
+            </div>
+          </section>
+        </div>
+        </> : null}
+
+        {adsSection === "library" ? <section className="dashboardPanel creativeLibraryEmpty">
+          <span className="metaReadOnlyBadge">Rendered assets</span>
+          <h2>Creative Library</h2>
+          <p>Approved renders will live here independently from campaigns, so one winning video can be reused without rendering it again.</p>
+          <div><strong>No rendered creatives yet</strong><small>Create a project in Creative Studio. Rendering will be connected in the next integration stage.</small><button onClick={() => openAdsSection("creatives")}>Open Creative Studio</button></div>
+        </section> : null}
 
         {adsSection === "settings" ? <>
         <div className="metaSetupGrid">
@@ -6078,6 +6163,37 @@ export default function PlaylistManager() {
           color: #07140c;
           background: #18e06f;
         }
+        .creativeStudioHero {
+          display: grid;
+          grid-template-columns: minmax(0, 1.15fr) minmax(460px, 0.85fr);
+          gap: 28px;
+          align-items: center;
+          overflow: hidden;
+          background: radial-gradient(circle at 90% 0%, rgba(24, 224, 111, 0.14), transparent 36%), #171b22;
+        }
+        .creativeStudioHero h2 { max-width: 720px; margin: 16px 0 8px; font-size: clamp(26px, 3vw, 42px); }
+        .creativeStudioHero p { max-width: 760px; margin: 0; color: #9aa3b1; line-height: 1.65; }
+        .creativePipeline { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 0; padding: 0; list-style: none; }
+        .creativePipeline li { display: grid; grid-template-columns: 26px minmax(0, 1fr); align-items: center; gap: 8px; padding: 10px; border: 1px solid #303744; border-radius: 8px; background: rgba(10, 13, 18, 0.55); }
+        .creativePipeline b { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; color: #07140c; background: #18e06f; font-size: 11px; }
+        .creativePipeline span { color: #c7cdd6; font-size: 11px; font-weight: 800; }
+        .creativeStudioGrid { display: grid; grid-template-columns: minmax(340px, 0.78fr) minmax(0, 1.22fr); gap: 16px; margin-top: 16px; align-items: start; }
+        .creativePlaylistSeed { display: flex; align-items: center; gap: 12px; margin-top: 14px; padding: 12px; border: 1px solid rgba(24, 224, 111, 0.3); border-radius: 9px; background: rgba(24, 224, 111, 0.04); }
+        .creativePlaylistSeed div { display: grid; gap: 3px; min-width: 0; }
+        .creativePlaylistSeed span, .creativePlaylistSeed small { color: #7f8998; font-size: 11px; }
+        .creativeProjectCards { display: grid; gap: 10px; }
+        .creativeProjectCards > article { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 13px; border: 1px solid #303744; border-radius: 10px; background: #11151b; }
+        .creativeProjectCopy { display: grid; gap: 7px; min-width: 0; }
+        .creativeProjectCopy > div:first-child { display: grid; gap: 3px; }
+        .creativeProjectCopy > div:first-child span { color: #18e06f; font-size: 9px; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; }
+        .creativeProjectCopy > small { color: #7f8998; }
+        .creativeProjectMetrics { display: flex; gap: 16px; }
+        .creativeProjectMetrics b { display: grid; color: #f2f5f8; font-size: 14px; }
+        .creativeProjectMetrics small { color: #707987; font-size: 9px; font-weight: 700; text-transform: uppercase; }
+        .creativeEmptyState, .creativeLibraryEmpty > div { display: grid; justify-items: start; gap: 8px; padding: 24px; border: 1px dashed #3a4351; border-radius: 10px; color: #8d96a4; }
+        .creativeEmptyState p, .creativeLibraryEmpty p { margin: 0; color: #8d96a4; }
+        .creativeLibraryEmpty { display: grid; gap: 14px; }
+        .creativeLibraryEmpty > div small { color: #7f8998; }
         .adsOverviewGrid {
           display: grid;
           grid-template-columns: 1.35fr 1fr;
@@ -8356,6 +8472,8 @@ export default function PlaylistManager() {
           .metaDraftGrid,
           .metaDraftCards,
           .adsOverviewGrid,
+          .creativeStudioHero,
+          .creativeStudioGrid,
           .performanceHeroRow,
           .adControlGrid,
           .adPlaylistGrid,
@@ -8374,6 +8492,9 @@ export default function PlaylistManager() {
           }
           .adsWorkspaceNav { overflow-x: auto; }
           .adsWorkspaceNav button { flex: 1 0 135px; }
+          .creativePipeline { grid-template-columns: 1fr 1fr; }
+          .creativeProjectCards > article { grid-template-columns: auto minmax(0, 1fr); }
+          .creativeProjectCards > article > button { grid-column: 1 / -1; }
           .adsWizardSteps { grid-template-columns: 1fr; }
           .adsPlacementChoices { grid-template-columns: 1fr; }
           .adsDeliverySummary { grid-template-columns: 1fr; }

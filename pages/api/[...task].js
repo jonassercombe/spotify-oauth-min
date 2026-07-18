@@ -838,6 +838,18 @@ function normalizeMetaDraftInput(body = {}) {
   };
 }
 
+function normalizeMetaCreativeProjectInput(body = {}) {
+  const playlistId = String(body.playlist_id || "").trim();
+  const name = String(body.name || "").trim().slice(0, 120);
+  const language = String(body.language || "en").trim().toLowerCase();
+  const format = String(body.format || "9:16").trim();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(playlistId)) throw new Error("creative_playlist_required");
+  if (name.length < 3) throw new Error("creative_project_name_required");
+  if (!["en", "de"].includes(language)) throw new Error("invalid_creative_language");
+  if (!["9:16", "1:1", "4:5"].includes(format)) throw new Error("invalid_creative_format");
+  return { playlist_id: playlistId, name, language, format };
+}
+
 function fallbackSpotifyCredentials({ requireRedirect = false } = {}) {
   const client_id = process.env.SPOTIFY_CLIENT_ID || "";
   const client_secret = process.env.SPOTIFY_CLIENT_SECRET || "";
@@ -2407,6 +2419,55 @@ const routes = {
     if (!upload.ok) return bad(res, 502, `creative_upload_failed: ${uploadText.slice(0, 500)}`);
     const publicUrl = `${need("SUPABASE_URL")}/storage/v1/object/public/meta-ad-creatives/${objectPath.split("/").map(encodeURIComponent).join("/")}`;
     return json(res, 201, { url: publicUrl, content_type: contentType, size: bytes.length });
+  },
+
+  /* ---------- meta/creative-projects (GET/POST) ---------- */
+  "meta/creative-projects": async (req, res) => {
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+    if (req.method === "GET") {
+      const response = await sb(
+        `/rest/v1/meta_creative_projects?select=*,playlists(name,image,playlist_id,followers,tracks_total),meta_creative_concepts(id,status),meta_creative_render_jobs(id,status)` +
+        `&connection_id=eq.${encodeURIComponent(connection.id)}&order=created_at.desc&limit=50`
+      );
+      if (!response.ok) return bad(res, 500, `meta_creative_projects_load_failed: ${(await response.text()).slice(0, 1000)}`);
+      return json(res, 200, { projects: await response.json().catch(() => []) });
+    }
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    let input;
+    try { input = normalizeMetaCreativeProjectInput(await readBody(req)); }
+    catch (error) { return bad(res, 400, String(error?.message || "invalid_creative_project")); }
+    const playlistResponse = await sb(
+      `/rest/v1/playlists?select=id,name,image,playlist_id,followers,tracks_total&limit=1&id=eq.${encodeURIComponent(input.playlist_id)}` +
+      `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}`
+    );
+    const playlist = playlistResponse.ok ? (await playlistResponse.json().catch(() => []))[0] : null;
+    if (!playlist) return bad(res, 404, "creative_playlist_not_found");
+    const payload = {
+      connection_id: connection.id,
+      bubble_user_id: ctx.bubble_user_id,
+      ...input,
+      status: "brief_pending",
+      current_step: 1,
+      brief: {
+        playlist_name: playlist.name || "",
+        spotify_playlist_id: playlist.playlist_id || "",
+        cover_image: playlist.image || "",
+        followers: Number(playlist.followers || 0),
+        tracks_total: Number(playlist.tracks_total || 0),
+      },
+      updated_at: new Date().toISOString(),
+    };
+    const response = await sb(`/rest/v1/meta_creative_projects`, {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify([payload]),
+    });
+    const text = await response.text();
+    if (!response.ok) return bad(res, 500, `meta_creative_project_save_failed: ${text.slice(0, 1000)}`);
+    return json(res, 201, { project: JSON.parse(text || "[]")[0] });
   },
 
   /* ---------- meta/campaign-drafts (GET/POST) ---------- */
