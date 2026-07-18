@@ -2114,12 +2114,16 @@ export default function PlaylistManager() {
 
   async function createPausedMetaCampaign(draftId) {
     await run("Paused Meta campaign package created", async () => {
-      await api("/api/meta/campaign-drafts/create-paused", {
-        method: "POST",
-        accessToken: accessToken(),
-        body: { draft_id: draftId, confirmation: "CREATE PAUSED" },
-      });
-      return loadMetaDrafts();
+      try {
+        await api("/api/meta/campaign-drafts/create-paused", {
+          method: "POST",
+          accessToken: accessToken(),
+          body: { draft_id: draftId, confirmation: "CREATE PAUSED" },
+        });
+      } finally {
+        await loadMetaDrafts();
+      }
+      return null;
     });
   }
 
