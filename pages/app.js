@@ -3038,8 +3038,14 @@ export default function PlaylistManager() {
           rights_status: campaignAudioUpload.rights_status,
         },
       });
-      const uploadResponse = await fetch(prepared.upload_url, { method: "PUT", headers: { "Content-Type": inferredType, "x-upsert": "false" }, body: file });
-      if (!uploadResponse.ok) throw new Error(`Direct audio upload failed (${uploadResponse.status}).`);
+      const { error: uploadError } = await getSupabaseBrowserClient()
+        .storage
+        .from("meta-ad-creatives")
+        .uploadToSignedUrl(prepared.master.storage_path, prepared.token, file, {
+          contentType: inferredType,
+          upsert: false,
+        });
+      if (uploadError) throw new Error(`Direct audio upload failed: ${uploadError.message}`);
       await api("/api/meta/audio-masters/finalize", {
         method: "POST",
         accessToken: accessToken(),
