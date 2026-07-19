@@ -352,7 +352,7 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
       </article>;
     })}</div></section> : null}
     <style jsx>{`
-      .campaignAudioTrimmer { display: grid; gap: 20px; padding: 22px; border: 1px solid #343d49; border-radius: 16px; background: linear-gradient(145deg, rgba(142,167,255,.045), transparent 35%), #0e1319; box-shadow: 0 20px 52px rgba(0,0,0,.18); }
+      .campaignAudioTrimmer { display: grid; gap: 20px; padding: 22px; border: 1px solid #343d49; border-radius: 16px; background: linear-gradient(145deg, rgba(142,167,255,.045), transparent 35%), #0e1319; box-shadow: 0 20px 52px rgba(0,0,0,.18); touch-action: pan-y; }
       audio { display: none; }
       .campaignTrimmerHeader { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 13px; }
       .campaignTrimmerTrackIcon { display: grid; place-items: center; width: 40px; height: 40px; border: 1px solid rgba(142,167,255,.26); border-radius: 11px; color: #9fb1ff; background: rgba(142,167,255,.09); }
@@ -368,7 +368,7 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
       .campaignWaveformTopline { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
       .campaignWaveformTopline span { color: #dce2ea; font-size: 11px; font-weight: 800; }
       .campaignWaveformTopline small { color: #717c8b; }
-      .campaignWaveform { position: relative; height: 190px; overflow: hidden; border: 1px solid #2d3642; border-radius: 12px; cursor: crosshair; background: #090f15; box-shadow: inset 0 1px 10px rgba(0,0,0,.2); }
+      .campaignWaveform { position: relative; height: 190px; overflow: hidden; border: 1px solid #2d3642; border-radius: 12px; cursor: crosshair; background: #090f15; box-shadow: inset 0 1px 10px rgba(0,0,0,.2); touch-action: pan-y; }
       .campaignWaveform::before { content: ""; position: absolute; z-index: 1; inset: 0; background: repeating-linear-gradient(90deg, transparent 0, transparent calc(12.5% - 1px), rgba(255,255,255,.045) 12.5%); pointer-events: none; }
       .campaignWaveform canvas { display: block; width: 100%; height: 158px; margin-top: 5px; opacity: .92; }
       .campaignWaveform > span { position: absolute; inset: 0; display: grid; place-items: center; color: #8290a3; font-size: 11px; }
@@ -5761,7 +5761,8 @@ export default function PlaylistManager() {
         main {
           min-height: 100vh;
           width: 100%;
-          overflow-x: hidden;
+          overflow-x: clip;
+          overflow-y: visible;
           display: grid;
           grid-template-rows: auto 1fr auto;
         }
