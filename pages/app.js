@@ -4729,7 +4729,7 @@ export default function PlaylistManager() {
           {creativeProjects.some((project) => (project.meta_creative_assets || []).some((asset) => asset.asset_type === "render")) ? <div className="creativeLibraryGrid">{creativeProjects.flatMap((project) => {
             const conceptsById = new Map((project.meta_creative_concepts || []).map((concept) => [concept.id, concept]));
             return (project.meta_creative_assets || []).filter((asset) => asset.asset_type === "render").map((asset) => ({ asset, project, concept: conceptsById.get(asset.concept_id) }));
-          }).map(({ asset, project, concept }) => <article key={asset.id}><video src={asset.source_url} controls muted playsInline preload="metadata" /><div><span>{asset.metadata?.template_name || "Custom"} · {project.format} · {Number(asset.duration_seconds || 0).toFixed(1)}s</span><h3>{concept?.title || project.name}</h3><strong>{concept?.hook || project.brief?.title}</strong><small>{project.playlists?.name || project.brief?.playlist_name}</small><a href={asset.source_url} target="_blank" rel="noreferrer">Open MP4</a></div></article>)}</div> : <div className="creativeEmptyState"><strong>No rendered creatives yet</strong><p>Save an editor specification and start the first render in Creative Studio.</p><button onClick={() => openAdsSection("creatives")}>Open Creative Studio</button></div>}
+          }).map(({ asset, project, concept }) => <article key={asset.id}><div className="creativeLibraryPreview"><video src={asset.source_url} controls muted playsInline preload="metadata" /></div><div><span>{asset.metadata?.template_name || "Custom"} · {project.format} · {Number(asset.duration_seconds || 0).toFixed(1)}s</span><h3>{concept?.title || project.name}</h3><strong>{concept?.hook || project.brief?.title}</strong><small>{project.playlists?.name || project.brief?.playlist_name}</small><a href={asset.source_url} target="_blank" rel="noreferrer">Open MP4</a></div></article>)}</div> : <div className="creativeEmptyState"><strong>No rendered creatives yet</strong><p>Save an editor specification and start the first render in Creative Studio.</p><button onClick={() => openAdsSection("creatives")}>Open Creative Studio</button></div>}
         </section> : null}
 
         {adsSection === "settings" ? <>
@@ -7793,10 +7793,11 @@ export default function PlaylistManager() {
         .creativeLibrary { display: grid; gap: 16px; }
         .creativeLibrary .panelHeader h2 { margin-top: 14px; }
         .creativeLibrary .panelHeader p { margin: 4px 0 0; color: #8993a0; }
-        .creativeLibraryGrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+        .creativeLibraryGrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; }
         .creativeLibraryGrid article { display: grid; overflow: hidden; border: 1px solid #303844; border-radius: 11px; background: #10151b; }
-        .creativeLibraryGrid video { width: 100%; aspect-ratio: 9 / 16; max-height: 520px; object-fit: cover; background: #07090c; }
-        .creativeLibraryGrid article > div { display: grid; gap: 6px; padding: 13px; }
+        .creativeLibraryPreview { display: grid; place-items: center; width: 100%; aspect-ratio: 9 / 16; overflow: hidden; background: #07090c; }
+        .creativeLibraryGrid video { display: block; width: 100%; height: 100%; object-fit: contain; background: #07090c; }
+        .creativeLibraryGrid article > div:not(.creativeLibraryPreview) { display: grid; gap: 6px; padding: 13px; }
         .creativeLibraryGrid span { color: #18e06f; font-size: 9px; font-weight: 900; text-transform: uppercase; }
         .creativeLibraryGrid h3 { margin: 0; }
         .creativeLibraryGrid small { color: #7f8998; }
