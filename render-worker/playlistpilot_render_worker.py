@@ -229,7 +229,7 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     fitted_cta, cta_font_size, cta_line_spacing = fit_text(
         cta.upper(), int(width * 0.76), int(height * 0.09), max(32, int(width * 0.047)), max(26, int(width * 0.038))
     )
-    playlist_width = int(width * (0.72 if reveal_style == "center_stack" else 0.45))
+    playlist_width = int(width * (0.76 if reveal_style == "center_stack" else 0.47 if reveal_style == "side_lockup" else 0.58))
     fitted_playlist, playlist_font_size, playlist_line_spacing = fit_text(
         playlist_name, playlist_width, int(height * 0.11), max(30, int(width * 0.052)), max(22, int(width * 0.034))
     )
@@ -254,23 +254,23 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     safe_bottom_ratio = 0.72 if height / width > 1.5 else 0.80
     cta_bottom = int(height * (1.0 - safe_bottom_ratio))
     if reveal_style == "center_stack":
-        cover_size = max(150, int(width * 0.44))
+        cover_size = max(150, int(width * 0.48))
         cover_x = int((width - cover_size) / 2)
-        cover_y = int(height * 0.27)
+        cover_y = int(height * 0.19)
         playlist_x = "(w-text_w)/2"
-        playlist_y = cover_y + cover_size + max(20, int(height * 0.022))
+        playlist_y = cover_y + cover_size + max(28, int(height * 0.027))
     elif reveal_style == "compact_corner":
-        cover_size = max(150, int(width * 0.30))
-        cover_x = safe_x
-        cover_y = int(height * 0.18)
-        playlist_x = str(cover_x + cover_size + max(22, int(width * 0.035)))
-        playlist_y = cover_y + max(4, int(height * 0.008))
+        cover_size = max(150, int(width * 0.27))
+        cover_x = width - safe_x - cover_size
+        cover_y = int(height * 0.13)
+        playlist_x = f"w-text_w-{safe_x}"
+        playlist_y = cover_y + cover_size + max(18, int(height * 0.018))
     else:
-        cover_size = max(150, int(width * 0.36))
+        cover_size = max(150, int(width * 0.39))
         cover_x = safe_x
-        cover_y = int(height * 0.24)
+        cover_y = int(height * 0.25)
         playlist_x = str(cover_x + cover_size + max(22, int(width * 0.035)))
-        playlist_y = cover_y + max(4, int(height * 0.008))
+        playlist_y = cover_y + int(cover_size * 0.18)
     if show_cover:
         cover_fade_out = max(reveal_start + 0.5, duration - 0.45)
         filters.append(
@@ -309,13 +309,14 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
             f"enable='between(t,{reveal_start:.3f},{duration:.3f})'"
         )
     if show_cta:
-        cta_start = max(0.0, duration - 4)
-        cta_alpha = fade_alpha(cta_start, duration, 0.45)
+        cta_start = max(0.0, duration - 4.5)
+        cta_end = max(cta_start + 0.5, duration - 0.18)
+        cta_alpha = fade_alpha(cta_start, cta_end, 0.28)
         text_filters.append(
             "drawtext="
             f"fontfile='{FONT_FILE}':textfile='{cta_file}':fontcolor=white:fontsize={cta_font_size}:line_spacing={cta_line_spacing}:"
             f"x=(w-text_w)/2:y=h-text_h-{cta_bottom}:alpha='{cta_alpha}':fix_bounds=1:shadowcolor=black@0.65:shadowx=2:shadowy=2:"
-            f"enable='between(t,{cta_start:.3f},{duration:.3f})'"
+            f"enable='between(t,{cta_start:.3f},{cta_end:.3f})'"
         )
     tail = ",".join(text_filters + ["format=yuv420p"])
     filters.append(f"[{current}]{tail}[out]")

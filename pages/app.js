@@ -3174,6 +3174,7 @@ export default function PlaylistManager() {
         setCampaignGeneration({ batch_id: created.batch.id, stage: "media", completed: 0, total: 8, failed: 0 });
         const usedVideoIds = new Set();
         const usedVisualSignatures = new Set();
+        const usedHookMechanisms = new Set();
         const prepared = [];
         let cursor = 0;
         const mediaWorker = async () => {
@@ -3188,12 +3189,17 @@ export default function PlaylistManager() {
             });
             const recommendations = media.recommendations || [];
             const signature = (item) => String(item?.ai?.visual_signature || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+            const mechanism = (item) => String(item?.ai?.hook_mechanism || "").trim();
             const isDistinct = (item) => {
               const value = signature(item);
               if (!value) return true;
               return ![...usedVisualSignatures].some((used) => used === value || used.includes(value) || value.includes(used));
             };
-            const video = recommendations.find((item) => item.ai?.production_ready && !usedVideoIds.has(item.id) && isDistinct(item))
+            const isFootageFirst = concept.render_spec?.creative_deck?.workflow === "footage_first";
+            const hasFreshMechanism = (item) => !isFootageFirst || !mechanism(item) || !usedHookMechanisms.has(mechanism(item));
+            const video = recommendations.find((item) => item.ai?.production_ready && !usedVideoIds.has(item.id) && isDistinct(item) && hasFreshMechanism(item))
+              || recommendations.find((item) => !usedVideoIds.has(item.id) && isDistinct(item) && hasFreshMechanism(item))
+              || recommendations.find((item) => item.ai?.production_ready && !usedVideoIds.has(item.id) && isDistinct(item))
               || recommendations.find((item) => !usedVideoIds.has(item.id) && isDistinct(item))
               || recommendations.find((item) => item.ai?.production_ready && !usedVideoIds.has(item.id))
               || recommendations.find((item) => !usedVideoIds.has(item.id))
@@ -3201,6 +3207,7 @@ export default function PlaylistManager() {
             if (!video) throw new Error(`No usable footage found for ${concept.title}.`);
             usedVideoIds.add(video.id);
             if (signature(video)) usedVisualSignatures.add(signature(video));
+            if (isFootageFirst && mechanism(video)) usedHookMechanisms.add(mechanism(video));
             const selected = await api("/api/meta/creative-media/select", {
               method: "POST",
               accessToken: accessToken(),

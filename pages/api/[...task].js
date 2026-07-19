@@ -1129,6 +1129,8 @@ Creative range is a primary quality criterion, not an optional embellishment. Fi
 
 Across the eight concepts, seek genuine range. A person wearing headphones is allowed but must not be the default visual answer. Prefer metaphor, visual tension, odd specificity, pattern interruption and surprising but defensible pairings over generic “night city / person listening to music” footage. Search queries should expose the distinct visual idea, while leaving room for lateral discoveries.
 
+The eight selected hooks must also have visibly different sentence shapes. Use at least five of these structures across the portfolio: direct observation, question, quoted dialogue, imperative, POV, compact list, contrast, confession, mini plot twist, object label, or deadpan documentary caption. Do not use the same grammatical gimmick more than twice. In particular, avoid a run of anthropomorphic “the [object/place] has/chose/wants/sent…” lines. creative_dna.hook_type must name the actual structure, not merely the tone. A hook may use a number only when that exact count is an intentional, visibly verifiable part of the planned shot; never invent a count for rhythm.
+
 For stock_simple, one continuous stock clip must be sufficient. For stock_montage, describe 2–4 independently searchable shots that can be cut together. For experimental_wildcard, allow an emotionally defensible contrast or pattern interrupt, but keep the stock treatment findable. The story field explains the ad idea, but must not imply that every beat will appear in the selected footage. Avoid generic playlist clichés and duplicate angles. Never use follower counts, track counts, positions, or other playlist metadata numbers as hooks or turn them into metaphors. Each concept needs a concrete human, sensory or visual moment and a testable hypothesis.`;
   const user = cachedBrief
     ? `Use the cached playlist analysis below and create only a fresh concept portfolio. Do not repeat the playlist analysis. The primary ad format is ${project.format}. Treat creative_notes as optional campaign direction. creative_memory contains recent concepts that must not be paraphrased or recreated. In explore mode, maximize distance from their hooks, angles, human moments, settings, visible actions, and search terms.\n\n${JSON.stringify({ cached_playlist_analysis: cachedBrief, ...source })}`
@@ -1328,7 +1330,7 @@ function creativeMediaRecommendationSchema(candidateIds) {
         items: {
           type: "object",
           additionalProperties: false,
-          required: ["video_id", "creative_mode", "match_type", "overall_score", "concept_match", "scroll_stop", "originality", "hook_space", "visual_quality", "vertical_suitability", "brand_safety", "production_ready", "rejection_reason", "best_template", "visual_signature", "adapted_hook", "adapted_title", "adapted_treatment", "summary"],
+          required: ["video_id", "creative_mode", "match_type", "overall_score", "concept_match", "scroll_stop", "originality", "hook_space", "visual_quality", "vertical_suitability", "brand_safety", "production_ready", "rejection_reason", "best_template", "visual_signature", "visible_subjects", "visible_count_facts", "hook_mechanism", "adapted_hook", "adapted_title", "adapted_treatment", "summary"],
           properties: {
             video_id: { type: "string", enum: candidateIds },
             creative_mode: { type: "string", enum: ["safe", "creative", "wildcard"] },
@@ -1345,6 +1347,9 @@ function creativeMediaRecommendationSchema(candidateIds) {
             rejection_reason: { type: "string", maxLength: 180 },
             best_template: { type: "string", enum: ["bold_center", "editorial_top", "minimal_bottom"] },
             visual_signature: { type: "string", maxLength: 100 },
+            visible_subjects: { type: "array", maxItems: 8, items: { type: "string", maxLength: 50 } },
+            visible_count_facts: { type: "array", maxItems: 5, items: { type: "string", maxLength: 60 } },
+            hook_mechanism: { type: "string", enum: ["observation", "question", "dialogue", "imperative", "pov", "list", "contrast", "confession", "plot_twist", "object_label", "documentary_caption"] },
             adapted_hook: { type: "string", maxLength: 44 },
             adapted_title: { type: "string", maxLength: 120 },
             adapted_treatment: { type: "string", maxLength: 240 },
@@ -1370,7 +1375,9 @@ The production type is ${productionType}. For stock_simple, one continuous clip 
 
 For every recommendation, return visual_signature as a compact generic description of the dominant visible setting and subject, such as "supermarket shopper", "night street reflections" or "office headset worker". This is used only to avoid near-duplicate footage inside one batch.
 
-When the creative recipe has workflow=footage_first, let the visible clip lead. Return an adapted_hook of at most 6 words and 44 characters, an adapted_title, and one-sentence adapted_treatment that make a witty, playlist-relevant idea from what is actually visible. Do not force the provisional concept onto the clip. For workflow=concept_first, return empty strings for all three adapted fields.
+List the dominant visible_subjects using literal, ordinary nouns supported by the frames (for example "claw machine", not "snack rack"). List visible_count_facts only when an exact count is unambiguous across the supplied frames; otherwise return an empty array.
+
+When the creative recipe has workflow=footage_first, let the visible clip lead. Return an adapted_hook of at most 6 words and 44 characters, an adapted_title, and one-sentence adapted_treatment that make a witty, playlist-relevant idea from what is actually visible. The hook's concrete nouns must agree with visible_subjects. Never rename an object to force a joke. Never use a numeral or number word unless visible_count_facts explicitly supports it. Choose hook_mechanism to describe the sentence structure, and prefer a mechanism unlike the provisional hook. Do not default to anthropomorphising the visible object. Do not force the provisional concept onto the clip. For workflow=concept_first, return empty strings for all three adapted fields, but still return visible subjects, count facts, and the best-fitting hook mechanism.
 
 Use the visible footage criteria as the primary matching rubric. Only award a criterion when it is actually visible in the supplied frames. The optional North-Star story is inspiration and MUST NOT be treated as a list of required events. SAFE candidates communicate the premise immediately; CREATIVE candidates match the emotion or idea; WILDCARD candidates introduce a memorable but defensible contrast. Classify match_type as literal, emotional or contrast. Score scroll-stop potential and originality separately from concept fit, plus usable text space, visual quality, portrait suitability and commercial brand safety. Recommend the layout that preserves the subject. A clip does not need to depict every story beat. Set production_ready=false only for a material blocker: unusable quality/crop, brand-safety risk, accidental contradiction, or no defensible relationship to the hook and criteria. Use rejection_reason only for a material blocker; otherwise return an empty string.
 
@@ -4719,6 +4726,9 @@ const routes = {
           match_type: ["literal", "emotional", "contrast"].includes(body.ai.match_type) ? body.ai.match_type : "literal",
           best_template: ["bold_center", "editorial_top", "minimal_bottom"].includes(body.ai.best_template) ? body.ai.best_template : "bold_center",
           visual_signature: String(body.ai.visual_signature || "").replace(/\s+/g, " ").trim().slice(0, 100),
+          visible_subjects: Array.isArray(body.ai.visible_subjects) ? body.ai.visible_subjects.map((item) => String(item || "").replace(/\s+/g, " ").trim().slice(0, 50)).filter(Boolean).slice(0, 8) : [],
+          visible_count_facts: Array.isArray(body.ai.visible_count_facts) ? body.ai.visible_count_facts.map((item) => String(item || "").replace(/\s+/g, " ").trim().slice(0, 60)).filter(Boolean).slice(0, 5) : [],
+          hook_mechanism: ["observation", "question", "dialogue", "imperative", "pov", "list", "contrast", "confession", "plot_twist", "object_label", "documentary_caption"].includes(body.ai.hook_mechanism) ? body.ai.hook_mechanism : "observation",
           adapted_hook: normalizeOverlayHook(body.ai.adapted_hook),
           adapted_title: String(body.ai.adapted_title || "").replace(/\s+/g, " ").trim().slice(0, 120),
           adapted_treatment: String(body.ai.adapted_treatment || "").replace(/\s+/g, " ").trim().slice(0, 240),
