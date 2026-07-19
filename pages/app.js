@@ -760,6 +760,8 @@ export default function PlaylistManager() {
   const [campaignAudioMasters, setCampaignAudioMasters] = useState([]);
   const [campaignAudioMasterId, setCampaignAudioMasterId] = useState("");
   const [campaignAudioUpload, setCampaignAudioUpload] = useState({ title: "", artist: "", rights_status: "test_only", file: null });
+  const [campaignCreativeBatches, setCampaignCreativeBatches] = useState([]);
+  const [campaignGeneration, setCampaignGeneration] = useState(null);
   const [creativeExperimentForm, setCreativeExperimentForm] = useState({ project_id: "", name: "" });
   const [creativeAudioForm, setCreativeAudioForm] = useState({ project_id: "", title: "", artist: "", rights_status: "test_only", default_start_seconds: "0", file: null });
   const [creativeMatrixSelections, setCreativeMatrixSelections] = useState({});
@@ -1065,6 +1067,7 @@ export default function PlaylistManager() {
     loadMetaDrafts();
     loadCreativeProjects();
     loadCreativeExperiments();
+    loadCampaignCreativeBatches();
   }, [userContext?.linked, isAdmin, view]);
 
   useEffect(() => {
@@ -2751,6 +2754,183 @@ export default function PlaylistManager() {
     });
   }
 
+  async function loadCampaignCreativeBatches(playlistId = "") {
+    if (!session?.access_token || !isAdmin) return null;
+    const suffix = playlistId ? `?playlist_id=${encodeURIComponent(playlistId)}` : "";
+    const data = await api(`/api/meta/campaign-creative-batches${suffix}`, { accessToken: accessToken() }).catch((e) => {
+      if (!String(e.message || "").includes("not_configured")) setError(e.message || "Creative batches failed.");
+      return null;
+    });
+    if (data) setCampaignCreativeBatches(data.batches || []);
+    return data;
+  }
+
+  async function setCampaignBatchStatus(batchId, status, progress, lastError = "") {
+    return api("/api/meta/campaign-creative-batches/status", {
+      method: "POST",
+      accessToken: accessToken(),
+      body: { batch_id: batchId, status, progress, last_error: lastError },
+    });
+  }
+
+  async function pollCampaignCreativeBatch(batchId) {
+    for (let attempt = 0; attempt < 90; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+      const data = await loadCampaignCreativeBatches(metaDraftForm.playlist_id);
+      const batch = (data?.batches || []).find((item) => item.id === batchId);
+      if (!batch) continue;
+      const jobs = batch?.meta_creative_projects?.meta_creative_render_jobs || [];
+      const concepts = batch?.meta_creative_projects?.meta_creative_concepts || [];
+      const latestJobs = concepts.map((concept) => jobs
+        .filter((job) => job.concept_id === concept.id)
+        .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0]
+      ).filter(Boolean);
+      const total = Math.max(8, concepts.length);
+      const completed = latestJobs.filter((job) => job.status === "completed").length;
+      const failed = latestJobs.filter((job) => ["failed", "cancelled"].includes(job.status)).length;
+      setCampaignGeneration({ batch_id: batchId, stage: "rendering", completed, total, failed });
+      if (latestJobs.length === concepts.length && completed + failed >= concepts.length) {
+        await setCampaignBatchStatus(batchId, "review", { stage: "review", completed, total, failed });
+        await loadCampaignCreativeBatches(metaDraftForm.playlist_id);
+        setCampaignGeneration({ batch_id: batchId, stage: "review", completed, total, failed });
+        return;
+      }
+    }
+  }
+
+  async function generateEightCampaignCreatives() {
+    if (!metaDraftForm.playlist_id) return;
+    let createdBatch = null;
+    await run("8 creatives queued", async () => {
+      try {
+        const created = await api("/api/meta/campaign-creative-batches", {
+          method: "POST",
+          accessToken: accessToken(),
+          body: {
+            playlist_id: metaDraftForm.playlist_id,
+            name: metaDraftForm.name,
+            language: "en",
+            creative_notes: metaDraftForm.creative_notes,
+            audio_snippet_ids: metaDraftForm.audio_snippet_ids,
+          },
+        });
+        createdBatch = created.batch;
+        setCampaignGeneration({ batch_id: created.batch.id, stage: "concepts", completed: 0, total: 8, failed: 0 });
+        await setCampaignBatchStatus(created.batch.id, "concepts", { stage: "concepts", completed: 0, total: 8 });
+        const generated = await api("/api/meta/creative-projects/generate", {
+          method: "POST",
+          accessToken: accessToken(),
+          body: { project_id: created.project.id },
+        });
+        const concepts = [...(generated.concepts || [])].sort((a, b) => Number(a.position || 0) - Number(b.position || 0));
+        if (concepts.length !== 8) throw new Error("The creative batch did not return eight concepts.");
+        await setCampaignBatchStatus(created.batch.id, "media", { stage: "media", completed: 0, total: 8 });
+        setCampaignGeneration({ batch_id: created.batch.id, stage: "media", completed: 0, total: 8, failed: 0 });
+        const usedVideoIds = new Set();
+        const prepared = [];
+        let cursor = 0;
+        const mediaWorker = async () => {
+          while (cursor < concepts.length) {
+            const concept = concepts[cursor];
+            cursor += 1;
+            const query = concept.visual_search_terms?.[0] || concept.visual_direction || "people listening music";
+            const media = await api("/api/meta/creative-media/recommend", {
+              method: "POST",
+              accessToken: accessToken(),
+              body: { concept_id: concept.id, query },
+            });
+            const recommendations = media.recommendations || [];
+            const video = recommendations.find((item) => item.ai?.production_ready && !usedVideoIds.has(item.id))
+              || recommendations.find((item) => !usedVideoIds.has(item.id))
+              || recommendations[0];
+            if (!video) throw new Error(`No usable footage found for ${concept.title}.`);
+            usedVideoIds.add(video.id);
+            const selected = await api("/api/meta/creative-media/select", {
+              method: "POST",
+              accessToken: accessToken(),
+              body: { concept_id: concept.id, provider_id: video.id, source_url: video.source_url, width: video.source_width, height: video.source_height, duration: video.duration, image: video.image, pexels_url: video.url, creator_name: video.user?.name, creator_url: video.user?.url, query, ai: video.ai || null },
+            });
+            prepared.push({ concept, video, asset: selected.asset });
+            setCampaignGeneration((current) => ({ ...(current || {}), batch_id: created.batch.id, stage: "media", completed: prepared.length, total: 8, failed: 0 }));
+            await setCampaignBatchStatus(created.batch.id, "media", { stage: "media", completed: prepared.length, total: 8 });
+          }
+        };
+        await Promise.all([mediaWorker(), mediaWorker()]);
+        const snippets = campaignAudioMasters.flatMap((master) => master.meta_audio_snippets || []).filter((snippet) => (metaDraftForm.audio_snippet_ids || []).includes(snippet.id));
+        for (let index = 0; index < prepared.length; index += 1) {
+          const { concept, video, asset } = prepared[index];
+          const snippet = snippets.length ? snippets[index % snippets.length] : null;
+          const templateId = concept.production_type === "stock_montage" ? "editorial_top" : concept.production_type === "experimental_wildcard" ? "bold_center" : CREATIVE_RENDER_TEMPLATES[index % CREATIVE_RENDER_TEMPLATES.length].id;
+          const template = CREATIVE_RENDER_TEMPLATES.find((item) => item.id === templateId) || CREATIVE_RENDER_TEMPLATES[0];
+          const videoDuration = Math.min(15, Number(video.duration || asset.duration_seconds || 15));
+          await api("/api/meta/creative-editor/save", {
+            method: "POST",
+            accessToken: accessToken(),
+            body: {
+              concept_id: concept.id,
+              asset_id: asset.id,
+              template_id: template.id,
+              hook_text: concept.hook,
+              cta_text: concept.cta || "Listen on Spotify",
+              hook_position: template.hook_position,
+              text_align: template.text_align,
+              trim_start: 0,
+              trim_end: videoDuration,
+              hook_start: 0,
+              hook_end: Math.min(4, videoDuration),
+              overlay_opacity: 0.28,
+              show_cover: true,
+              show_cta: true,
+              audio_snippet_id: snippet?.id || null,
+            },
+          });
+        }
+        const renderJobs = await Promise.all(concepts.map((concept) => api("/api/meta/creative-renders/queue", {
+          method: "POST",
+          accessToken: accessToken(),
+          body: { concept_id: concept.id },
+        })));
+        await setCampaignBatchStatus(created.batch.id, "rendering", { stage: "rendering", completed: 0, total: renderJobs.length });
+        setCampaignGeneration({ batch_id: created.batch.id, stage: "rendering", completed: 0, total: renderJobs.length, failed: 0 });
+        await loadCampaignCreativeBatches(metaDraftForm.playlist_id);
+        pollCampaignCreativeBatch(created.batch.id);
+        return created;
+      } catch (generationError) {
+        if (createdBatch?.id) await setCampaignBatchStatus(createdBatch.id, "failed", { stage: "failed", completed: 0, total: 8 }, generationError.message).catch(() => null);
+        setCampaignGeneration((current) => ({ ...(current || {}), stage: "failed", error: generationError.message }));
+        throw generationError;
+      }
+    });
+  }
+
+  async function reviewCampaignCreative(batchId, conceptId, decision) {
+    await run(decision === "approved" ? "Creative approved" : "Creative rejected", async () => {
+      await api("/api/meta/campaign-creative-reviews", { method: "POST", accessToken: accessToken(), body: { batch_id: batchId, concept_id: conceptId, decision } });
+      return loadCampaignCreativeBatches(metaDraftForm.playlist_id);
+    });
+  }
+
+  async function regenerateCampaignCreative(batch, concept) {
+    await run("Creative regeneration queued", async () => {
+      const query = concept.visual_search_terms?.[1] || concept.visual_search_terms?.[0] || concept.visual_direction;
+      const media = await api("/api/meta/creative-media/recommend", { method: "POST", accessToken: accessToken(), body: { concept_id: concept.id, query } });
+      const video = (media.recommendations || []).find((item) => item.ai?.production_ready) || media.recommendations?.[0];
+      if (!video) throw new Error("No replacement footage found.");
+      const selected = await api("/api/meta/creative-media/select", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { concept_id: concept.id, provider_id: video.id, source_url: video.source_url, width: video.source_width, height: video.source_height, duration: video.duration, image: video.image, pexels_url: video.url, creator_name: video.user?.name, creator_url: video.user?.url, query, ai: video.ai || null },
+      });
+      const currentEditor = concept.render_spec?.editor || {};
+      await api("/api/meta/creative-editor/save", { method: "POST", accessToken: accessToken(), body: { ...currentEditor, concept_id: concept.id, asset_id: selected.asset.id, trim_start: 0, trim_end: Math.min(15, Number(video.duration || 15)) } });
+      await api("/api/meta/creative-renders/queue", { method: "POST", accessToken: accessToken(), body: { concept_id: concept.id } });
+      await api("/api/meta/campaign-creative-reviews", { method: "POST", accessToken: accessToken(), body: { batch_id: batch.id, concept_id: concept.id, decision: "pending" } });
+      await setCampaignBatchStatus(batch.id, "rendering", { stage: "rendering", completed: 0, total: 1 });
+      pollCampaignCreativeBatch(batch.id);
+      return loadCampaignCreativeBatches(metaDraftForm.playlist_id);
+    });
+  }
+
   function selectMetaCampaignPlaylist(selectedId) {
     const selected = playlists.find((item) => item.id === selectedId);
     setMetaDraftForm((current) => ({
@@ -2765,6 +2945,7 @@ export default function PlaylistManager() {
     setCampaignAudioMasters([]);
     setCampaignAudioMasterId("");
     if (selectedId) loadCampaignAudioLibrary(selectedId);
+    if (selectedId) loadCampaignCreativeBatches(selectedId);
   }
 
   async function uploadMetaCreative(event) {
@@ -3907,9 +4088,17 @@ export default function PlaylistManager() {
         </div>
 
         <nav className="adsWorkspaceNav" aria-label="Ads Manager sections">
-          {[{ id: "overview", label: "Overview" }, { id: "campaigns", label: "Campaigns" }, { id: "creatives", label: "Creative Studio" }, { id: "experiments", label: "Experiments" }, { id: "library", label: "Creative Library" }, { id: "new", label: "New campaign" }, { id: "settings", label: "Settings" }].map((item) => (
+          {[{ id: "overview", label: "Overview" }, { id: "campaigns", label: "Campaigns" }, { id: "new", label: "New campaign" }, { id: "library", label: "Creative Library" }, { id: "settings", label: "Settings" }].map((item) => (
             <button key={item.id} className={adsSection === item.id ? "active" : ""} onClick={() => openAdsSection(item.id)}>{item.label}</button>
           ))}
+          <details className="adsAdvancedNav" open={["creatives", "experiments"].includes(adsSection)}>
+            <summary>Advanced</summary>
+            <div>
+              {[{ id: "creatives", label: "Creative Studio" }, { id: "experiments", label: "Experiments" }].map((item) => (
+                <button key={item.id} className={adsSection === item.id ? "active" : ""} onClick={() => openAdsSection(item.id)}>{item.label}</button>
+              ))}
+            </div>
+          </details>
         </nav>
 
         {adsSection === "overview" ? <>
@@ -4234,11 +4423,11 @@ export default function PlaylistManager() {
         {adsSection === "new" ?
         <section className="dashboardPanel metaDraftComposer">
           <div className="panelHeader">
-            <div><h2>New campaign</h2><p>Choose the playlist, prepare reusable audio snippets, and build a paused campaign package.</p></div>
+            <div><h2>New campaign</h2><p>Add the essentials, prepare audio, then generate eight ready-to-review playlist ads.</p></div>
             <span className="metaReadOnlyBadge">Always PAUSED</span>
           </div>
           <div className="adsWizardSteps" aria-label="Campaign creation progress">
-            {["Campaign", "Audio", "Audience", "Creative", "Delivery"].map((label, index) => <button key={label} className={adsWizardStep === index + 1 ? "active" : adsWizardStep > index + 1 ? "complete" : ""} onClick={() => setAdsWizardStep(index + 1)}><span>{index + 1}</span>{label}</button>)}
+            {["Campaign", "Audio & snippets", "Generate & review"].map((label, index) => <button key={label} className={adsWizardStep === index + 1 ? "active" : adsWizardStep > index + 1 ? "complete" : ""} onClick={() => setAdsWizardStep(index + 1)}><span>{index + 1}</span>{label}</button>)}
           </div>
           <div className="metaDraftGrid">
             {adsWizardStep === 1 ? <>
@@ -4263,31 +4452,53 @@ export default function PlaylistManager() {
               </section>
             </> : null}
             {adsWizardStep === 3 ? <>
-              <label><span>Daily budget (EUR)</span><input type="number" min="1" step="1" value={metaDraftForm.daily_budget_eur} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, daily_budget_eur: e.target.value })} /></label>
-              <label><span>Countries</span><input value={metaDraftForm.countries} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, countries: e.target.value })} placeholder="DE, AT, CH" /></label>
-              <label><span>Minimum age</span><input type="number" min="13" max="65" value={metaDraftForm.age_min} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, age_min: e.target.value })} /></label>
-              <label><span>Maximum age</span><input type="number" min="13" max="65" value={metaDraftForm.age_max} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, age_max: e.target.value })} /></label>
-            </> : null}
-            {adsWizardStep === 4 ? <>
-              <label className="metaDraftWide"><span>Creative image URL</span><input type="url" value={metaDraftForm.image_url} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, image_url: e.target.value })} placeholder="https://.../cover.jpg" /></label>
-              <label className="adsCreativeUpload metaDraftWide"><span>Or upload a custom image</span><input type="file" accept="image/jpeg,image/png,image/webp" disabled={busy} onChange={uploadMetaCreative} /><small>JPEG, PNG or WebP · maximum 3 MB · square images work best</small></label>
-              <label className="metaDraftWide"><span>Headline</span><input value={metaDraftForm.headline} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, headline: e.target.value })} /></label>
-              <label className="metaDraftWide"><span>Primary text</span><textarea rows="4" value={metaDraftForm.primary_text} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, primary_text: e.target.value })} /></label>
-              <div className="adsCreativePreviewGrid">
-                {[{ platform: "Instagram", identity: (metaWorkspace?.assets || []).find((asset) => asset.asset_type === "instagram_account" && asset.is_selected)?.name || "Instagram" }, { platform: "Facebook", identity: (metaWorkspace?.assets || []).find((asset) => asset.asset_type === "page" && asset.is_selected)?.name || "Facebook Page" }].map((preview) => <aside className="adsCreativePreview" key={preview.platform}><div className="adsPreviewIdentity"><span>{preview.platform} feed</span><strong>{preview.identity}</strong></div><p>{metaDraftForm.primary_text || "Your primary text"}</p>{metaDraftForm.image_url ? <img src={metaDraftForm.image_url} alt={`${preview.platform} campaign preview`} /> : <div className="adsCreativePlaceholder">Image preview</div>}<div className="adsPreviewLink"><div><small>OPEN.SPOTIFY.COM</small><strong>{metaDraftForm.headline || "Your headline"}</strong></div><b>Learn more</b></div></aside>)}
-              </div>
-            </> : null}
-            {adsWizardStep === 5 ? <>
-              <label><span>Start date</span><input type="date" min={new Date().toISOString().slice(0, 10)} value={metaDraftForm.start_date} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, start_date: e.target.value })} /></label>
-              <label><span>End date</span><input type="date" min={metaDraftForm.start_date || new Date().toISOString().slice(0, 10)} value={metaDraftForm.end_date} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, end_date: e.target.value })} /></label>
-              <fieldset className="adsPlacementChoices"><legend>Placements</legend>{[{ id: "automatic", title: "Advantage+ placements", text: "Meta distributes across Facebook and Instagram." }, { id: "feeds", title: "Feeds", text: "Facebook Feed and Instagram Feed only." }, { id: "stories_reels", title: "Stories & Reels", text: "Vertical placements on both platforms." }].map((option) => <label className={metaDraftForm.placement_mode === option.id ? "selected" : ""} key={option.id}><input type="radio" name="placement_mode" value={option.id} checked={metaDraftForm.placement_mode === option.id} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, placement_mode: e.target.value })} /><span><strong>{option.title}</strong><small>{option.text}</small></span></label>)}</fieldset>
-              <aside className="adsDeliverySummary"><span>Delivery summary</span><strong>€{metaDraftForm.daily_budget_eur || "0"} per day</strong><p>{metaDraftForm.start_date || "Start date"} → {metaDraftForm.end_date || "End date"}</p><small>{metaDraftForm.placement_mode === "automatic" ? "Advantage+ placements" : metaDraftForm.placement_mode === "feeds" ? "Facebook + Instagram Feeds" : "Facebook + Instagram Stories & Reels"}</small><b>Created PAUSED</b></aside>
+              <section className="campaignGenerateStep metaDraftWide">
+                <div className="campaignGenerateHero">
+                  <div><span>One-click creative batch</span><h3>Generate 8 playlist ads</h3><p>PlaylistPilot creates hooks, finds distinct footage, applies your selected audio snippets and renders eight vertical videos. Run it again whenever you want a fresh batch.</p></div>
+                  <button className="campaignGenerateButton" disabled={busy || !metaDraftForm.playlist_id} onClick={generateEightCampaignCreatives}>{campaignGeneration && !["review", "failed"].includes(campaignGeneration.stage) ? "Generating…" : "Generate 8 creatives"}</button>
+                </div>
+                {campaignGeneration ? <div className={`campaignGenerationProgress campaignGenerationProgress--${campaignGeneration.stage}`}>
+                  <div><span style={{ width: `${Math.round((Number(campaignGeneration.completed || 0) / Math.max(1, Number(campaignGeneration.total || 8))) * 100)}%` }} /></div>
+                  <strong>{campaignGeneration.stage === "concepts" ? "Writing concepts" : campaignGeneration.stage === "media" ? "Directing footage" : campaignGeneration.stage === "rendering" ? "Rendering videos" : campaignGeneration.stage === "review" ? "Ready for review" : "Generation needs attention"}</strong>
+                  <small>{campaignGeneration.error || `${campaignGeneration.completed || 0} of ${campaignGeneration.total || 8} complete${campaignGeneration.failed ? ` · ${campaignGeneration.failed} failed` : ""}`}</small>
+                </div> : null}
+                <div className="campaignBatchList">
+                  {campaignCreativeBatches.map((batch) => {
+                    const project = batch.meta_creative_projects || {};
+                    const concepts = [...(project.meta_creative_concepts || [])].sort((a, b) => Number(a.position || 0) - Number(b.position || 0));
+                    const renders = project.meta_creative_render_jobs || [];
+                    const assets = project.meta_creative_assets || [];
+                    const reviews = batch.meta_campaign_creative_reviews || [];
+                    return <article className="campaignBatch" key={batch.id}>
+                      <div className="campaignBatchHeader"><div><span>{new Date(batch.created_at).toLocaleDateString()} · {batch.status}</span><h3>{batch.name}</h3></div><b>{concepts.length} creatives</b></div>
+                      <div className="campaignReviewGrid">
+                        {concepts.map((concept) => {
+                          const render = renders.filter((item) => item.concept_id === concept.id && item.status === "completed").sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0];
+                          const outputAsset = assets.find((item) => item.id === render?.output_asset_id);
+                          const decision = reviews.find((item) => item.concept_id === concept.id)?.decision || "pending";
+                          return <article className={`campaignReviewCard campaignReviewCard--${decision}`} key={concept.id}>
+                            {outputAsset?.source_url ? <video src={outputAsset.source_url} controls muted playsInline preload="metadata" /> : <div className="campaignReviewPlaceholder"><span>{render?.status || batch.status}</span></div>}
+                            <div><span>Concept {concept.position} · {decision}</span><h4>{concept.hook || concept.title}</h4><small>{concept.title}</small></div>
+                            <div className="campaignReviewActions">
+                              <button className={decision === "approved" ? "active" : ""} disabled={busy || !outputAsset?.source_url} onClick={() => reviewCampaignCreative(batch.id, concept.id, "approved")}>Approve</button>
+                              <button className={decision === "rejected" ? "active" : "secondary"} disabled={busy} onClick={() => reviewCampaignCreative(batch.id, concept.id, "rejected")}>Reject</button>
+                              <button className="secondary" disabled={busy} onClick={() => regenerateCampaignCreative(batch, concept)}>Regenerate</button>
+                              <button className="secondary" onClick={() => { setOpenCreativeProjectId(project.id); openAdsSection("creatives"); }}>Edit</button>
+                            </div>
+                          </article>;
+                        })}
+                      </div>
+                    </article>;
+                  })}
+                  {!campaignCreativeBatches.length ? <div className="creativeEmptyState"><strong>No creative batches yet</strong><p>Your first set of eight videos will appear here for approval, rejection, regeneration or detailed editing.</p></div> : null}
+                </div>
+              </section>
             </> : null}
           </div>
           <div className="metaFormActions adsWizardActions">
             <button disabled={busy || adsWizardStep === 1} onClick={() => setAdsWizardStep((step) => Math.max(1, step - 1))}>Back</button>
-            {adsWizardStep < 5 ? <button disabled={busy || (adsWizardStep === 1 && (!metaDraftForm.playlist_id || !metaDraftForm.destination_url)) || (adsWizardStep === 4 && !metaDraftForm.image_url)} onClick={() => setAdsWizardStep((step) => Math.min(5, step + 1))}>Continue</button> : <button disabled={busy || !metaWorkspace?.readiness?.publishing_ready || !metaDraftForm.start_date || !metaDraftForm.end_date || metaDraftForm.end_date <= metaDraftForm.start_date} onClick={saveMetaDraft}>Save campaign draft</button>}
-            <small>Objective and delivery status are locked to <b>Traffic</b> and <b>PAUSED</b>.</small>
+            {adsWizardStep < 3 ? <button disabled={busy || (adsWizardStep === 1 && (!metaDraftForm.playlist_id || !metaDraftForm.destination_url))} onClick={() => setAdsWizardStep((step) => Math.min(3, step + 1))}>{adsWizardStep === 1 ? "Continue to audio" : "Review & generate"}</button> : null}
+            <small>Advanced editing, media direction and experiment controls remain available under <b>Advanced</b>.</small>
           </div>
         </section>
         : null}
@@ -6994,6 +7205,12 @@ export default function PlaylistManager() {
           color: #07140c;
           background: #18e06f;
         }
+        .adsAdvancedNav { position: relative; margin-left: auto; }
+        .adsAdvancedNav summary { padding: 10px 14px; color: #7f8998; font-size: 11px; font-weight: 800; cursor: pointer; list-style: none; }
+        .adsAdvancedNav summary::-webkit-details-marker { display: none; }
+        .adsAdvancedNav summary::after { content: " ···"; }
+        .adsAdvancedNav > div { position: absolute; z-index: 20; top: calc(100% + 7px); right: 0; display: grid; gap: 5px; width: 190px; padding: 7px; border: 1px solid #303744; border-radius: 9px; background: #151a21; box-shadow: 0 18px 40px rgba(0,0,0,.35); }
+        .adsAdvancedNav > div button { width: 100%; text-align: left; }
         .creativeStudioHero {
           display: grid;
           grid-template-columns: minmax(0, 1.15fr) minmax(460px, 0.85fr);
@@ -7191,7 +7408,7 @@ export default function PlaylistManager() {
         .adsConnectionSummary dd { margin: 0; text-align: right; }
         .adsWizardSteps {
           display: grid;
-          grid-template-columns: repeat(5, 1fr);
+          grid-template-columns: repeat(3, 1fr);
           gap: 8px;
           margin: 20px 0 6px;
         }
@@ -7259,6 +7476,38 @@ export default function PlaylistManager() {
         .campaignSnippetList label.selected { border-color: #8ea7ff; background: rgba(91, 132, 255, .12); }
         .campaignSnippetList span { display: grid; gap: 3px; min-width: 0; }
         .campaignSnippetList small { color: #7f8998; font-size: 9px; }
+        .campaignGenerateStep { display: grid; gap: 18px; }
+        .campaignGenerateHero { display: flex; align-items: center; justify-content: space-between; gap: 28px; padding: 26px; border: 1px solid rgba(142, 167, 255, .34); border-radius: 14px; background: radial-gradient(circle at 92% 10%, rgba(91,132,255,.22), transparent 42%), #11161d; }
+        .campaignGenerateHero > div { max-width: 720px; }
+        .campaignGenerateHero span { color: #8ea7ff; font-size: 10px; font-weight: 900; letter-spacing: .1em; text-transform: uppercase; }
+        .campaignGenerateHero h3 { margin: 7px 0; font-size: clamp(24px, 3vw, 38px); }
+        .campaignGenerateHero p { margin: 0; color: #929dab; line-height: 1.55; }
+        .campaignGenerateButton { min-width: 190px; min-height: 52px; color: #08120d; background: #fff; }
+        .campaignGenerationProgress { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px 14px; padding: 14px; border: 1px solid #303744; border-radius: 10px; }
+        .campaignGenerationProgress > div { grid-column: 1 / -1; height: 5px; overflow: hidden; border-radius: 999px; background: #252c36; }
+        .campaignGenerationProgress > div span { display: block; height: 100%; background: #8ea7ff; transition: width .25s ease; }
+        .campaignGenerationProgress small { color: #7f8998; }
+        .campaignGenerationProgress--failed { border-color: rgba(255,104,104,.5); }
+        .campaignBatchList { display: grid; gap: 18px; }
+        .campaignBatch { display: grid; gap: 14px; padding: 16px; border: 1px solid #303744; border-radius: 12px; background: #10151b; }
+        .campaignBatchHeader { display: flex; justify-content: space-between; gap: 16px; align-items: end; }
+        .campaignBatchHeader div { display: grid; gap: 4px; }
+        .campaignBatchHeader span { color: #7f8998; font-size: 10px; text-transform: uppercase; }
+        .campaignBatchHeader h3 { margin: 0; }
+        .campaignBatchHeader > b { color: #8ea7ff; font-size: 11px; }
+        .campaignReviewGrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+        .campaignReviewCard { display: grid; align-content: start; gap: 10px; overflow: hidden; padding: 9px; border: 1px solid #303744; border-radius: 10px; background: #151a21; }
+        .campaignReviewCard--approved { border-color: rgba(24,224,111,.5); }
+        .campaignReviewCard--rejected { opacity: .62; }
+        .campaignReviewCard video, .campaignReviewPlaceholder { width: 100%; aspect-ratio: 9 / 16; border-radius: 7px; object-fit: cover; background: #0a0e13; }
+        .campaignReviewPlaceholder { display: grid; place-items: center; color: #687383; font-size: 10px; text-transform: uppercase; }
+        .campaignReviewCard > div:nth-of-type(1) { display: grid; gap: 4px; }
+        .campaignReviewCard > div span { color: #7f8998; font-size: 9px; text-transform: uppercase; }
+        .campaignReviewCard h4 { margin: 0; font-size: 13px; line-height: 1.3; }
+        .campaignReviewCard small { color: #7f8998; font-size: 9px; }
+        .campaignReviewActions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
+        .campaignReviewActions button { min-width: 0; padding: 7px 5px; font-size: 9px; }
+        .campaignReviewActions button.active { color: #06120b; background: #18e06f; }
         .adsCreativePreviewGrid {
           grid-column: 1 / -1;
           display: grid;
@@ -9505,6 +9754,9 @@ export default function PlaylistManager() {
           .creativeEditorWide, .creativeEditorActions { grid-column: auto; }
           .creativeLibraryGrid { grid-template-columns: 1fr; }
           .adsWizardSteps { grid-template-columns: 1fr; }
+          .campaignGenerateHero { align-items: stretch; flex-direction: column; }
+          .campaignGenerateButton { width: 100%; }
+          .campaignReviewGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
           .adsPlacementChoices { grid-template-columns: 1fr; }
           .adsDeliverySummary { grid-template-columns: 1fr; }
           .adsDeliverySummary b { grid-column: auto; grid-row: auto; justify-self: start; }

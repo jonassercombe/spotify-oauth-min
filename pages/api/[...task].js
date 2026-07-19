@@ -954,6 +954,7 @@ async function generateCreativeBriefWithOpenAI({ project, playlist, tracks }) {
       artists: Array.isArray(track.artist_names) ? track.artist_names : [],
       album: track.album_name || "",
     })),
+    creative_notes: String(project.brief?.creative_notes || "").slice(0, 2000),
   };
   const system = `You are a performance creative strategist for paid social ads promoting Spotify playlists. Create one evidence-based playlist brief and exactly eight materially different short-form concepts in this exact production portfolio and order: concepts 1–6 production_type=stock_simple, concept 7 production_type=stock_montage, concept 8 production_type=experimental_wildcard.
 
@@ -966,7 +967,7 @@ All user-facing copy must be in ${languageName}. Every concept must contain:
 - north_star_story as an optional ambitious idea. Use an empty string when it adds no value. This is inspiration only and must never be required for the stock clip to succeed.
 
 For stock_simple, one continuous stock clip must be sufficient. For stock_montage, describe 2–4 independently searchable shots that can be cut together. For experimental_wildcard, allow an emotionally defensible contrast or pattern interrupt, but keep the stock treatment findable. The story field explains the ad idea, but must not imply that every beat will appear in the selected footage. Avoid generic playlist clichés and duplicate angles. Each concept needs a concrete human moment and a testable hypothesis.`;
-  const user = `Analyze this playlist snapshot and create the creative brief and concept portfolio. The primary ad format is ${project.format}.\n\n${JSON.stringify(source)}`;
+  const user = `Analyze this playlist snapshot and create the creative brief and concept portfolio. The primary ad format is ${project.format}. Treat creative_notes as optional campaign direction, never as factual playlist metadata.\n\n${JSON.stringify(source)}`;
   try {
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -1223,6 +1224,12 @@ function normalizeCreativeRenderSpec(body = {}, asset) {
     show_cover: body.show_cover !== false,
     cover_position: coverPosition,
     show_cta: body.show_cta !== false,
+    audio_snippet_id: /^[0-9a-f-]{36}$/i.test(String(body.audio_snippet_id || "")) ? String(body.audio_snippet_id) : null,
+    song_start_seconds: Math.max(0, Number(body.song_start_seconds || 0)),
+    song_end_seconds: Math.max(0, Number(body.song_end_seconds || 0)) || null,
+    fade_in_seconds: Math.max(0, Math.min(3, Number(body.fade_in_seconds || 0))),
+    fade_out_seconds: Math.max(0, Math.min(3, Number(body.fade_out_seconds || 0))),
+    audio_gain_db: Math.max(-24, Math.min(12, Number(body.audio_gain_db || 0))),
     updated_at: new Date().toISOString(),
   };
 }
@@ -3154,6 +3161,166 @@ const routes = {
     return json(res, 201, { snippet: JSON.parse(text || "[]")[0] });
   },
 
+  /* ---------- meta/campaign-creative-batches (GET/POST) ---------- */
+  "meta/campaign-creative-batches": async (req, res) => {
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+    if (req.method === "GET") {
+      const playlistId = String(req.query.playlist_id || "");
+      const playlistFilter = /^[0-9a-f-]{36}$/i.test(playlistId) ? `&playlist_id=eq.${encodeURIComponent(playlistId)}` : "";
+      const response = await sb(
+        `/rest/v1/meta_campaign_creative_batches?select=*,meta_campaign_creative_reviews(*),` +
+        `meta_creative_projects(*,playlists(name,image),meta_creative_concepts(*),meta_creative_assets(*),meta_creative_render_jobs(*))` +
+        `&connection_id=eq.${encodeURIComponent(connection.id)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}` +
+        `${playlistFilter}&order=created_at.desc&limit=30`
+      );
+      const text = await response.text();
+      if (!response.ok) return bad(res, 500, `campaign_creative_batches_load_failed: ${text.slice(0, 700)}`);
+      return json(res, 200, { batches: JSON.parse(text || "[]") });
+    }
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const body = await readBody(req);
+    const playlistId = String(body.playlist_id || "");
+    const campaignDraftId = String(body.campaign_draft_id || "");
+    if (!/^[0-9a-f-]{36}$/i.test(playlistId)) return bad(res, 400, "campaign_playlist_required");
+    if (campaignDraftId && !/^[0-9a-f-]{36}$/i.test(campaignDraftId)) return bad(res, 400, "campaign_draft_invalid");
+    const playlistResponse = await sb(
+      `/rest/v1/playlists?select=id,name,image,playlist_id,followers,tracks_total&id=eq.${encodeURIComponent(playlistId)}` +
+      `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&limit=1`
+    );
+    const playlist = playlistResponse.ok ? (await playlistResponse.json().catch(() => []))[0] : null;
+    if (!playlist) return bad(res, 404, "campaign_playlist_not_found");
+    let campaignDraft = null;
+    if (campaignDraftId) {
+      const draftResponse = await sb(
+        `/rest/v1/meta_ads_campaign_drafts?select=id,playlist_id,creative_notes,audio_snippet_ids&id=eq.${encodeURIComponent(campaignDraftId)}` +
+        `&connection_id=eq.${encodeURIComponent(connection.id)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&limit=1`
+      );
+      campaignDraft = draftResponse.ok ? (await draftResponse.json().catch(() => []))[0] : null;
+      if (!campaignDraft) return bad(res, 404, "campaign_draft_not_found");
+      if (campaignDraft.playlist_id !== playlist.id) return bad(res, 409, "campaign_draft_playlist_mismatch");
+    }
+    const requestedSnippetIds = Array.isArray(body.audio_snippet_ids)
+      ? body.audio_snippet_ids
+      : campaignDraft?.audio_snippet_ids || [];
+    const audioSnippetIds = [...new Set(requestedSnippetIds.map(String).filter((id) => /^[0-9a-f-]{36}$/i.test(id)))].slice(0, 8);
+    const creativeNotes = String(body.creative_notes ?? campaignDraft?.creative_notes ?? "").trim().slice(0, 2000);
+    if (audioSnippetIds.length) {
+      const snippetsResponse = await sb(
+        `/rest/v1/meta_audio_snippets?select=id&playlist_id=eq.${encodeURIComponent(playlist.id)}` +
+        `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&id=in.(${audioSnippetIds.join(",")})`
+      );
+      const snippets = snippetsResponse.ok ? await snippetsResponse.json().catch(() => []) : [];
+      if (snippets.length !== audioSnippetIds.length) return bad(res, 400, "campaign_audio_snippet_not_found");
+    }
+    const now = new Date().toISOString();
+    const batchLabel = new Intl.DateTimeFormat("en-GB", { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", timeZone: "Europe/Berlin" }).format(new Date());
+    const projectName = `${String(body.name || playlist.name || "Playlist").slice(0, 90)} · Batch ${batchLabel}`.slice(0, 120);
+    const projectResponse = await sb(`/rest/v1/meta_creative_projects`, {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify([{
+        connection_id: connection.id,
+        bubble_user_id: ctx.bubble_user_id,
+        playlist_id: playlist.id,
+        name: projectName,
+        language: ["en", "de"].includes(body.language) ? body.language : "en",
+        format: "9:16",
+        status: "brief_pending",
+        current_step: 1,
+        brief: {
+          playlist_name: playlist.name || "",
+          spotify_playlist_id: playlist.playlist_id || "",
+          cover_image: playlist.image || "",
+          followers: Number(playlist.followers || 0),
+          tracks_total: Number(playlist.tracks_total || 0),
+          creative_notes: creativeNotes,
+          campaign_batch: true,
+          campaign_draft_id: campaignDraft?.id || null,
+        },
+        updated_at: now,
+      }]),
+    });
+    const projectText = await projectResponse.text();
+    if (!projectResponse.ok) return bad(res, 500, `campaign_creative_project_failed: ${projectText.slice(0, 500)}`);
+    const project = JSON.parse(projectText || "[]")[0];
+    const batchResponse = await sb(`/rest/v1/meta_campaign_creative_batches`, {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify([{
+        playlist_id: playlist.id,
+        project_id: project.id,
+        campaign_draft_id: campaignDraft?.id || null,
+        connection_id: connection.id,
+        bubble_user_id: ctx.bubble_user_id,
+        name: projectName,
+        creative_notes: creativeNotes,
+        audio_snippet_ids: audioSnippetIds,
+        status: "created",
+        progress: { stage: "created", completed: 0, total: 8 },
+        updated_at: now,
+      }]),
+    });
+    const batchText = await batchResponse.text();
+    if (!batchResponse.ok) return bad(res, 500, `campaign_creative_batch_failed: ${batchText.slice(0, 500)}`);
+    return json(res, 201, { batch: JSON.parse(batchText || "[]")[0], project });
+  },
+
+  /* ---------- meta/campaign-creative-batches/status (POST) ---------- */
+  "meta/campaign-creative-batches/status": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const body = await readBody(req);
+    const batchId = String(body.batch_id || "");
+    const status = String(body.status || "");
+    if (!/^[0-9a-f-]{36}$/i.test(batchId) || !["created", "concepts", "media", "rendering", "review", "failed"].includes(status)) return bad(res, 400, "campaign_creative_batch_status_invalid");
+    const existingResponse = await sb(`/rest/v1/meta_campaign_creative_batches?select=*&id=eq.${encodeURIComponent(batchId)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&limit=1`);
+    const existing = existingResponse.ok ? (await existingResponse.json().catch(() => []))[0] : null;
+    if (!existing) return bad(res, 404, "campaign_creative_batch_not_found");
+    const update = await sb(`/rest/v1/meta_campaign_creative_batches?id=eq.${encodeURIComponent(existing.id)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({
+        status,
+        progress: body.progress && typeof body.progress === "object" ? body.progress : existing.progress,
+        last_error: status === "failed" ? String(body.last_error || "Generation failed").slice(0, 1000) : null,
+        updated_at: new Date().toISOString(),
+      }),
+    });
+    const text = await update.text();
+    if (!update.ok) return bad(res, 500, `campaign_creative_batch_update_failed: ${text.slice(0, 500)}`);
+    return json(res, 200, { batch: JSON.parse(text || "[]")[0] });
+  },
+
+  /* ---------- meta/campaign-creative-reviews (POST) ---------- */
+  "meta/campaign-creative-reviews": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const body = await readBody(req);
+    const batchId = String(body.batch_id || "");
+    const conceptId = String(body.concept_id || "");
+    const decision = String(body.decision || "");
+    if (!/^[0-9a-f-]{36}$/i.test(batchId) || !/^[0-9a-f-]{36}$/i.test(conceptId) || !["pending", "approved", "rejected"].includes(decision)) return bad(res, 400, "campaign_creative_review_invalid");
+    const batchResponse = await sb(`/rest/v1/meta_campaign_creative_batches?select=*&id=eq.${encodeURIComponent(batchId)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&limit=1`);
+    const batch = batchResponse.ok ? (await batchResponse.json().catch(() => []))[0] : null;
+    if (!batch) return bad(res, 404, "campaign_creative_batch_not_found");
+    const conceptResponse = await sb(`/rest/v1/meta_creative_concepts?select=id&project_id=eq.${encodeURIComponent(batch.project_id)}&id=eq.${encodeURIComponent(conceptId)}&limit=1`);
+    const concept = conceptResponse.ok ? (await conceptResponse.json().catch(() => []))[0] : null;
+    if (!concept) return bad(res, 404, "campaign_creative_concept_not_found");
+    const response = await sb(`/rest/v1/meta_campaign_creative_reviews?on_conflict=batch_id,concept_id`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+      body: JSON.stringify([{ batch_id: batch.id, concept_id: concept.id, decision, note: String(body.note || "").slice(0, 1000), updated_at: new Date().toISOString() }]),
+    });
+    const text = await response.text();
+    if (!response.ok) return bad(res, 500, `campaign_creative_review_failed: ${text.slice(0, 500)}`);
+    return json(res, 200, { review: JSON.parse(text || "[]")[0] });
+  },
+
   /* ---------- meta/creative-audio/upload (POST) ---------- */
   "meta/creative-audio/upload": async (req, res) => {
     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
@@ -4101,6 +4268,19 @@ const routes = {
     );
     const asset = assetResponse.ok ? (await assetResponse.json().catch(() => []))[0] : null;
     if (!asset) return bad(res, 404, "creative_video_asset_not_found");
+    if (body.audio_snippet_id) {
+      const snippetResponse = await sb(
+        `/rest/v1/meta_audio_snippets?select=*&id=eq.${encodeURIComponent(String(body.audio_snippet_id))}` +
+        `&playlist_id=eq.${encodeURIComponent(owned.project.playlist_id)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&limit=1`
+      );
+      const snippet = snippetResponse.ok ? (await snippetResponse.json().catch(() => []))[0] : null;
+      if (!snippet) return bad(res, 404, "creative_audio_snippet_not_found");
+      body.song_start_seconds = Number(snippet.start_seconds);
+      body.song_end_seconds = Number(snippet.end_seconds);
+      body.fade_in_seconds = Number(snippet.fade_in_seconds);
+      body.fade_out_seconds = Number(snippet.fade_out_seconds);
+      body.audio_gain_db = Number(snippet.gain_db);
+    }
     const editor = normalizeCreativeRenderSpec({ ...body, format: owned.project.format }, asset);
     if (!editor.hook_text) return bad(res, 400, "creative_hook_required");
     const renderSpec = { ...(owned.concept.render_spec || {}), editor };
