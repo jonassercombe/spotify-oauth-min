@@ -10009,9 +10009,7 @@ export default function PlaylistManager() {
           .creativeMediaSearch > div:first-child { grid-template-columns: 1fr 1fr; }
           .creativeMediaSearch > div:first-child input { grid-column: 1 / -1; }
           .creativeEditor { grid-template-columns: 1fr; }
-          .campaignAudioUploader,
           .campaignAudioWorkbench { grid-template-columns: 1fr; }
-          .campaignAudioDropzone { min-height: 180px; border-right: 0; border-bottom: 1px dashed #384352; }
           .campaignAudioMetadata > div:nth-child(2) { grid-template-columns: 1fr 1fr; }
           .campaignAudioMetadata > div:nth-child(2) label:last-child { grid-column: 1 / -1; }
           .campaignAudioPresets { flex-wrap: wrap; }
@@ -10022,7 +10020,7 @@ export default function PlaylistManager() {
           .creativeEditorControls { grid-template-columns: 1fr; }
           .creativeEditorWide, .creativeEditorActions { grid-column: auto; }
           .creativeLibraryGrid { grid-template-columns: 1fr; }
-          .adsWizardSteps { grid-template-columns: 1fr; }
+          .adsWizardSteps { grid-template-columns: repeat(3, minmax(0, 1fr)); }
           .campaignGenerateHero { align-items: stretch; flex-direction: column; }
           .campaignGenerateButton { width: 100%; }
           .campaignReviewGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -10153,6 +10151,15 @@ export default function PlaylistManager() {
           }
           .dashboardPanel {
             padding: 14px;
+          }
+          .adsWizardSteps,
+          .campaignAudioUploader {
+            grid-template-columns: 1fr;
+          }
+          .campaignAudioDropzone {
+            min-height: 180px;
+            border-right: 0;
+            border-bottom: 1px dashed #384352;
           }
           .campaignAudioIntro,
           .campaignTrimmerHeader,
