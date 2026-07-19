@@ -1040,7 +1040,7 @@ function normalizeGeneratedHookCandidates(concept = {}) {
     ]));
     const rawText = String(candidate?.text || "").replace(/\s+/g, " ").trim();
     const words = rawText.split(" ").filter(Boolean);
-    while (words.join(" ").length > 44 && words.length > 1) words.pop();
+    while (words.join(" ").length > 58 && words.length > 1) words.pop();
     return {
       text: words.join(" "),
       ...scores,
@@ -1060,8 +1060,8 @@ function normalizeGeneratedHookCandidates(concept = {}) {
 }
 
 function normalizeOverlayHook(value) {
-  const words = String(value || "").replace(/\s+/g, " ").trim().split(" ").filter(Boolean).slice(0, 6);
-  while (words.join(" ").length > 44 && words.length > 1) words.pop();
+  const words = String(value || "").replace(/\s+/g, " ").trim().split(" ").filter(Boolean).slice(0, 9);
+  while (words.join(" ").length > 58 && words.length > 1) words.pop();
   return words.join(" ");
 }
 
@@ -1120,7 +1120,7 @@ The planned portfolio contains four accessible, three creative and one wildcard 
 
 All user-facing copy must be in ${languageName}. Every concept must contain:
 - a strategic angle;
-- 4–6 materially different overlay-ready hook_candidates, each at most 6 words and 44 characters;
+- 4–6 materially different overlay-ready hook_candidates, each at most 9 words and 58 characters;
 - integer scores from 1–10 for every hook candidate on clarity, scroll_stop, playlist_fit, originality, and visual_fit; total must equal the sum of those five scores;
 - hook as the selected candidate text. Choose it using minimum gates of clarity >= 7, playlist_fit >= 7, and visual_fit >= 7, then rank eligible candidates by total. Use hook_choice_rationale to explain the decision briefly;
 - visual_direction as ONE executable sentence describing footage that can realistically be found on Pexels;
@@ -1135,10 +1135,12 @@ Across the eight concepts, seek genuine range. A person wearing headphones is al
 
 The selected hook for each slot must follow its assigned creative_deck.hook_structure. Across the portfolio, do not use the same grammatical gimmick more than twice. In particular, avoid a run of anthropomorphic “the [object/place] has/chose/wants/sent…” lines. At least two accessible hooks must clearly communicate a playlist benefit, listening use-case, mood or invitation without a metaphor. creative_dna.hook_type must repeat the assigned structural label, not merely the tone. A hook may use a number only when that exact count is an intentional, visibly verifiable part of the planned shot; never invent a count for rhythm.
 
+Treat creative_notes as the campaign's authored CORE STORY, not as optional flavor. First infer its central emotional promise in one sentence internally. Two or three concepts must express that core story directly and recognizably in their hooks; these should usually be accessible or creative slots. The remaining concepts may interpret it through mood, humor, imagery or contrast, while the wildcard may depart from it. Preserve distinctive user-written language when it is concise and strong. For example, notes about feeling alien or born on the wrong planet should be allowed to yield lines such as “For those born on the wrong planet” or “For those who feel alien on Earth.” Do not replace every emotional story with an object joke.
+
 For stock_simple, one continuous stock clip must be sufficient. For stock_montage, describe 2–4 independently searchable shots that can be cut together. For experimental_wildcard, allow an emotionally defensible contrast or pattern interrupt, but keep the stock treatment findable. The story field explains the ad idea, but must not imply that every beat will appear in the selected footage. Avoid generic playlist clichés and duplicate angles. Never use follower counts, track counts, positions, or other playlist metadata numbers as hooks or turn them into metaphors. Each concept needs a concrete human, sensory or visual moment and a testable hypothesis.`;
   const user = cachedBrief
-    ? `Use the cached playlist analysis below and create only a fresh concept portfolio. Do not repeat the playlist analysis. The primary ad format is ${project.format}. Treat creative_notes as optional campaign direction. creative_memory contains recent concepts that must not be paraphrased or recreated. In explore mode, maximize distance from their hooks, angles, human moments, settings, visible actions, and search terms.\n\n${JSON.stringify({ cached_playlist_analysis: cachedBrief, ...source })}`
-    : `Analyze this playlist snapshot and create the creative brief and concept portfolio. The primary ad format is ${project.format}. Treat creative_notes as optional campaign direction, never as factual playlist metadata.\n\n${JSON.stringify(source)}`;
+    ? `Use the cached playlist analysis below and create only a fresh concept portfolio. Do not repeat the playlist analysis. The primary ad format is ${project.format}. Treat creative_notes as the authored campaign core story while keeping them separate from factual playlist metadata. creative_memory contains recent concepts that must not be paraphrased or recreated. In explore mode, maximize distance from their hooks, angles, human moments, settings, visible actions, and search terms without losing the core story.\n\n${JSON.stringify({ cached_playlist_analysis: cachedBrief, ...source })}`
+    : `Analyze this playlist snapshot and create the creative brief and concept portfolio. The primary ad format is ${project.format}. Treat creative_notes as the authored campaign core story, never as factual playlist metadata.\n\n${JSON.stringify(source)}`;
   try {
     const model = cachedBrief
       ? process.env.OPENAI_CONCEPT_MODEL || process.env.OPENAI_VISION_MODEL || "gpt-5.4-mini"
@@ -1189,7 +1191,7 @@ async function generateCreativeReplacementsWithOpenAI({ project, playlist, prior
       reasoning: { effort: "low" },
       input: [{
         role: "system",
-        content: `You replace duplicate paid-social concepts for a Spotify playlist. Return exactly ${slots.length} complete concepts in the supplied slot order. Preserve each required production_type. Every replacement must be materially different from creative_memory and accepted_concepts in strategic angle, hook mechanism, human moment, visible action, setting and search terms. A synonym or paraphrase is not novel. Hooks must be at most 6 words and 44 characters and must not use playlist metadata numbers. Treat creative_world as a usable creative universe: favor a fresh visual joke, uncanny object, abstract texture, environment or surprising contrast when it fits. Do not default to a person wearing headphones.`,
+        content: `You replace duplicate paid-social concepts for a Spotify playlist. Return exactly ${slots.length} complete concepts in the supplied slot order. Preserve each required production_type. Every replacement must be materially different from creative_memory and accepted_concepts in strategic angle, hook mechanism, human moment, visible action, setting and search terms. A synonym or paraphrase is not novel. Hooks must be at most 9 words and 58 characters and must not use playlist metadata numbers. Treat creative_notes as the authored campaign core story and preserve it in at least one replacement when slots permit. Treat creative_world as a usable creative universe: favor a fresh emotional line, visual joke, uncanny object, abstract texture, environment or surprising contrast when it fits. Do not default to a person wearing headphones.`,
       }, {
         role: "user",
         content: JSON.stringify({
@@ -1354,7 +1356,7 @@ function creativeMediaRecommendationSchema(candidateIds) {
             visible_subjects: { type: "array", maxItems: 8, items: { type: "string", maxLength: 50 } },
             visible_count_facts: { type: "array", maxItems: 5, items: { type: "string", maxLength: 60 } },
             hook_mechanism: { type: "string", enum: ["observation", "question", "dialogue", "imperative", "pov", "list", "contrast", "confession", "plot_twist", "object_label", "documentary_caption"] },
-            adapted_hook: { type: "string", maxLength: 44 },
+            adapted_hook: { type: "string", maxLength: 58 },
             adapted_title: { type: "string", maxLength: 120 },
             adapted_treatment: { type: "string", maxLength: 240 },
             summary: { type: "string", maxLength: 240 },
@@ -1381,7 +1383,7 @@ For every recommendation, return visual_signature as a compact generic descripti
 
 List the dominant visible_subjects using literal, ordinary nouns supported by the frames (for example "claw machine", not "snack rack"). List visible_count_facts only when an exact count is unambiguous across the supplied frames; otherwise return an empty array.
 
-When the creative recipe has workflow=footage_first, let the visible clip lead. Return an adapted_hook of at most 6 words and 44 characters, an adapted_title, and one-sentence adapted_treatment that make a playlist-relevant idea from what is actually visible. Preserve the recipe's risk_level: accessible must stay simple and instantly legible, creative may make one lateral connection, and wildcard may be strange. Follow its assigned hook_structure when adapting. The hook's concrete nouns must agree with visible_subjects. Never rename an object to force a joke. Never use a numeral or number word unless visible_count_facts explicitly supports it. Choose hook_mechanism to describe the resulting sentence structure. Do not default to anthropomorphising the visible object. Do not force the provisional concept onto the clip. For workflow=concept_first, return empty strings for all three adapted fields, but still return visible subjects, count facts, and the best-fitting hook mechanism.
+When the creative recipe has workflow=footage_first, let the visible clip lead. Return an adapted_hook of at most 9 words and 58 characters, an adapted_title, and one-sentence adapted_treatment that make a playlist-relevant idea from what is actually visible. Preserve the recipe's risk_level: accessible must stay simple and instantly legible, creative may make one lateral connection, and wildcard may be strange. Follow its assigned hook_structure when adapting. Preserve the campaign's emotional core story when the provisional concept carries it; footage may support that feeling without illustrating every word literally. The hook's concrete nouns must agree with visible_subjects. Never rename an object to force a joke. Never use a numeral or number word unless visible_count_facts explicitly supports it. Choose hook_mechanism to describe the resulting sentence structure. Do not default to anthropomorphising the visible object. Do not force the provisional concept onto the clip. For workflow=concept_first, return empty strings for all three adapted fields, but still return visible subjects, count facts, and the best-fitting hook mechanism.
 
 Use the visible footage criteria as the primary matching rubric. Only award a criterion when it is actually visible in the supplied frames. The optional North-Star story is inspiration and MUST NOT be treated as a list of required events. SAFE candidates communicate the premise immediately; CREATIVE candidates match the emotion or idea; WILDCARD candidates introduce a memorable but defensible contrast. Classify match_type as literal, emotional or contrast. Score scroll-stop potential and originality separately from concept fit, plus usable text space, visual quality, portrait suitability and commercial brand safety. Recommend the layout that preserves the subject. A clip does not need to depict every story beat. Set production_ready=false only for a material blocker: unusable quality/crop, brand-safety risk, accidental contradiction, or no defensible relationship to the hook and criteria. Use rejection_reason only for a material blocker; otherwise return an empty string.
 
