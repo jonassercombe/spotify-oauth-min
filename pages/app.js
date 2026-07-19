@@ -1016,8 +1016,6 @@ export default function PlaylistManager() {
   const [campaignAudioMasters, setCampaignAudioMasters] = useState([]);
   const [campaignAudioMasterId, setCampaignAudioMasterId] = useState("");
   const [campaignAudioUpload, setCampaignAudioUpload] = useState({ title: "", artist: "", rights_status: "licensed", file: null });
-  const [spotifyPreviewCheck, setSpotifyPreviewCheck] = useState(null);
-  const [spotifyPreviewChecking, setSpotifyPreviewChecking] = useState(false);
   const [campaignCreativeBatches, setCampaignCreativeBatches] = useState([]);
   const [campaignGeneration, setCampaignGeneration] = useState(null);
   const [creativeExperimentForm, setCreativeExperimentForm] = useState({ project_id: "", name: "" });
@@ -3001,23 +2999,6 @@ export default function PlaylistManager() {
     return data;
   }
 
-  async function checkSpotifyPlaylistPreviews() {
-    if (!metaDraftForm.playlist_id) return;
-    setSpotifyPreviewChecking(true);
-    setSpotifyPreviewCheck(null);
-    try {
-      const data = await api(
-        `/api/meta/spotify-preview-check?playlist_id=${encodeURIComponent(metaDraftForm.playlist_id)}`,
-        { accessToken: accessToken() }
-      );
-      setSpotifyPreviewCheck(data);
-    } catch (e) {
-      setSpotifyPreviewCheck({ error: e.message || "Spotify preview check failed.", tracks: [] });
-    } finally {
-      setSpotifyPreviewChecking(false);
-    }
-  }
-
   function audioFileDuration(file) {
     return new Promise((resolve, reject) => {
       const objectUrl = URL.createObjectURL(file);
@@ -3348,7 +3329,6 @@ export default function PlaylistManager() {
     }));
     setCampaignAudioMasters([]);
     setCampaignAudioMasterId("");
-    setSpotifyPreviewCheck(null);
     campaignLibraryPlaylistRef.current = selectedId;
     if (selectedId) loadCampaignAudioLibrary(selectedId);
     if (selectedId) loadCampaignCreativeBatches(selectedId);
@@ -4852,25 +4832,6 @@ export default function PlaylistManager() {
                   <div><span>Campaign soundtrack</span><h3>Build your audio variations</h3><p>Upload a song once, cut several reusable moments, and choose which snippets should enter the creative test.</p></div>
                   <div className="campaignAudioSelectionCount"><strong>{(metaDraftForm.audio_snippet_ids || []).length}</strong><span>of 8 selected</span></div>
                 </div>
-                <section className="spotifyPreviewDiagnostic">
-                  <div>
-                    <span>Spotify API diagnostic</span>
-                    <strong>Do the first eight tracks still expose 30-second previews?</strong>
-                    <small>Live check only. Nothing is downloaded or saved.</small>
-                  </div>
-                  <button className="secondaryOutline" disabled={spotifyPreviewChecking || !metaDraftForm.playlist_id} onClick={checkSpotifyPlaylistPreviews}>{spotifyPreviewChecking ? "Checking…" : spotifyPreviewCheck ? "Check again" : "Check Spotify previews"}</button>
-                  {spotifyPreviewCheck ? <div className={`spotifyPreviewResult ${spotifyPreviewCheck.error ? "error" : ""}`}>
-                    <header>
-                      <strong>{spotifyPreviewCheck.error ? "Check failed" : `${spotifyPreviewCheck.available_count || 0} of ${spotifyPreviewCheck.checked_count || 0} previews available`}</strong>
-                      <small>{spotifyPreviewCheck.error || `Playlist response: ${spotifyPreviewCheck.playlist_items_status} · Track lookup: ${spotifyPreviewCheck.track_lookup_status}`}</small>
-                    </header>
-                    {(spotifyPreviewCheck.tracks || []).length ? <div>{spotifyPreviewCheck.tracks.map((track) => <article key={track.id || track.position}>
-                      <i>{track.position}</i>
-                      <span><strong>{track.title}</strong><small>{track.artist || "Unknown artist"}{track.isrc ? ` · ${track.isrc}` : ""}</small></span>
-                      <b className={track.preview_available ? "available" : "missing"}>{track.preview_available ? "Available" : "No preview"}</b>
-                    </article>)}</div> : null}
-                  </div> : null}
-                </section>
                 <section className="campaignAudioUploader">
                   <label className={campaignAudioUpload.file ? "campaignAudioDropzone hasFile" : "campaignAudioDropzone"}>
                     <input type="file" accept=".mp3,.m4a,.wav,audio/mpeg,audio/mp4,audio/wav" onChange={(event) => setCampaignAudioUpload((current) => ({ ...current, file: event.target.files?.[0] || null }))} />
@@ -7931,25 +7892,6 @@ export default function PlaylistManager() {
         .campaignAudioSelectionCount { display: grid; min-width: 108px; padding: 12px 16px; border: 1px solid #303844; border-radius: 11px; background: #10151b; text-align: right; }
         .campaignAudioSelectionCount strong { color: #f5f7fa; font-size: 23px; line-height: 1; }
         .campaignAudioSelectionCount span { margin-top: 4px; color: #7f8998; font-size: 9px; text-transform: uppercase; }
-        .spotifyPreviewDiagnostic { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px 24px; padding: 17px 19px; border: 1px solid #303844; border-radius: 13px; background: linear-gradient(135deg, rgba(142,167,255,.07), transparent 42%), #10151b; }
-        .spotifyPreviewDiagnostic > div:first-child { display: grid; gap: 3px; }
-        .spotifyPreviewDiagnostic > div:first-child > span { color: #8ea7ff; font-size: 8px; font-weight: 900; letter-spacing: .1em; text-transform: uppercase; }
-        .spotifyPreviewDiagnostic > div:first-child > strong { color: #edf1f6; font-size: 13px; }
-        .spotifyPreviewDiagnostic > div:first-child > small { color: #75808f; }
-        .spotifyPreviewResult { grid-column: 1 / -1; display: grid; gap: 10px; padding-top: 14px; border-top: 1px solid #29313b; }
-        .spotifyPreviewResult header { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
-        .spotifyPreviewResult header strong { color: #edf1f6; }
-        .spotifyPreviewResult header small { color: #75808f; }
-        .spotifyPreviewResult.error header strong, .spotifyPreviewResult.error header small { color: #d69292; }
-        .spotifyPreviewResult > div { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
-        .spotifyPreviewResult article { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 9px 10px; border: 1px solid #2b333e; border-radius: 9px; background: #0d1319; }
-        .spotifyPreviewResult article > i { display: grid; place-items: center; width: 25px; height: 25px; border-radius: 7px; color: #8ea7ff; background: rgba(142,167,255,.1); font-size: 8px; font-style: normal; }
-        .spotifyPreviewResult article > span { display: grid; gap: 2px; min-width: 0; }
-        .spotifyPreviewResult article > span strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .spotifyPreviewResult article > span small { overflow: hidden; color: #75808f; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
-        .spotifyPreviewResult article > b { padding: 5px 7px; border-radius: 7px; font-size: 7px; letter-spacing: .04em; text-transform: uppercase; }
-        .spotifyPreviewResult article > b.available { color: #a9dec0; background: rgba(86,180,126,.11); }
-        .spotifyPreviewResult article > b.missing { color: #a4adb8; background: rgba(255,255,255,.05); }
         .campaignAudioUploader { display: grid; grid-template-columns: minmax(280px, .76fr) minmax(420px, 1.24fr); gap: 0; overflow: hidden; border: 1px solid #303844; border-radius: 14px; background: #10151b; box-shadow: 0 18px 46px rgba(0,0,0,.16); }
         .campaignAudioDropzone { display: grid; align-content: center; justify-items: start; min-height: 224px; padding: 30px; border-right: 1px dashed #384352; cursor: pointer; background: radial-gradient(circle at 10% 0%, rgba(142,167,255,.14), transparent 45%), #0d1218; transition: background .2s, border-color .2s; }
         .campaignAudioDropzone:hover, .campaignAudioDropzone.hasFile { background: radial-gradient(circle at 10% 0%, rgba(142,167,255,.22), transparent 52%), #0f151d; }
@@ -7988,13 +7930,12 @@ export default function PlaylistManager() {
             align-items: start;
           }
           .campaignAudioIntro,
-          .spotifyPreviewDiagnostic,
           .campaignAudioUploader {
             grid-column: 1 / -1;
           }
           .campaignAudioMasterLibrary {
             grid-column: 1;
-            grid-row: 4;
+            grid-row: 3;
             position: sticky;
             top: 20px;
           }
@@ -8014,7 +7955,7 @@ export default function PlaylistManager() {
           }
           .campaignAudioEditorColumn {
             grid-column: 2;
-            grid-row: 4;
+            grid-row: 3;
           }
           .campaignAudioEmpty {
             grid-column: 1 / -1;
