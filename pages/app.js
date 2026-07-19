@@ -635,6 +635,8 @@ export default function PlaylistManager() {
   const [creativeExperimentForm, setCreativeExperimentForm] = useState({ project_id: "", name: "" });
   const [creativeAudioForm, setCreativeAudioForm] = useState({ project_id: "", title: "", artist: "", rights_status: "test_only", default_start_seconds: "0", file: null });
   const [creativeMatrixSelections, setCreativeMatrixSelections] = useState({});
+  const [creativeVariantAdIds, setCreativeVariantAdIds] = useState({});
+  const [creativeEvaluationForms, setCreativeEvaluationForms] = useState({});
   const [creativeProjectForm, setCreativeProjectForm] = useState({ playlist_id: "", name: "", language: "en", format: "9:16" });
   const [openCreativeProjectId, setOpenCreativeProjectId] = useState("");
   const [creativeMediaSearches, setCreativeMediaSearches] = useState({});
@@ -2158,6 +2160,59 @@ export default function PlaylistManager() {
         method: "POST",
         accessToken: accessToken(),
         body: { experiment_id: experiment.id, phase_id: phase?.id, video_asset_ids: selection.videos, audio_track_ids: selection.audio },
+      });
+      await Promise.all([loadCreativeExperiments(), loadCreativeProjects()]);
+      return result;
+    });
+  }
+
+  function creativeEvaluationForm(experimentId) {
+    return creativeEvaluationForms[experimentId] || { minimum_impressions: "1000", minimum_spend_eur: "0", winner_slots: "4" };
+  }
+
+  function updateCreativeEvaluationForm(experimentId, patch) {
+    setCreativeEvaluationForms((current) => ({ ...current, [experimentId]: { minimum_impressions: "1000", minimum_spend_eur: "0", winner_slots: "4", ...(current[experimentId] || {}), ...patch } }));
+  }
+
+  async function linkCreativeVariantAd(variantId) {
+    const metaAdId = String(creativeVariantAdIds[variantId] || "").trim();
+    await run("Meta Ad linked", async () => {
+      await api("/api/meta/creative-variants/link-ad", { method: "POST", accessToken: accessToken(), body: { variant_id: variantId, meta_ad_id: metaAdId } });
+      return loadCreativeExperiments();
+    });
+  }
+
+  async function importCreativeExperimentMetrics(experiment, phase) {
+    await run("Meta metrics imported", async () => {
+      const result = await api("/api/meta/creative-experiments/import-metrics", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { experiment_id: experiment.id, phase_id: phase.id },
+      });
+      await loadCreativeExperiments();
+      return result;
+    });
+  }
+
+  async function evaluateCreativeExperiment(experiment, phase) {
+    const evaluation = creativeEvaluationForm(experiment.id);
+    await run("Experiment evaluated", async () => {
+      const result = await api("/api/meta/creative-experiments/evaluate", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { experiment_id: experiment.id, phase_id: phase.id, ...evaluation },
+      });
+      await loadCreativeExperiments();
+      return result;
+    });
+  }
+
+  async function generateCreativeNextPhase(experiment, phase) {
+    await run("Next creative phase generated", async () => {
+      const result = await api("/api/meta/creative-experiments/next-phase", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { experiment_id: experiment.id, phase_id: phase.id },
       });
       await Promise.all([loadCreativeExperiments(), loadCreativeProjects()]);
       return result;
@@ -3833,6 +3888,9 @@ export default function PlaylistManager() {
               const tracks = creativeAudioTracks.filter((track) => track.project_id === experiment.project_id);
               const selection = creativeMatrixSelections[experiment.id] || { videos: [], audio: [] };
               const matrixSize = selection.videos.length * Math.max(1, selection.audio.length);
+              const evaluation = activePhase?.config?.evaluation;
+              const evaluationForm = creativeEvaluationForm(experiment.id);
+              const linkedAds = variants.filter((variant) => variant.meta_ad_id).length;
               return <article className="dashboardPanel" key={experiment.id}>
                 <div className="panelHeader"><div><span className="metaReadOnlyBadge">Phase {activePhase?.phase_number || 1} · {activePhase?.phase_type || "explore"}</span><h2>{experiment.name}</h2><p>{activePhase?.hypothesis}</p></div><span className={`jobStatus jobStatus--${activePhase?.status === "completed" ? "done" : "pending"}`}>{activePhase?.status || experiment.status}</span></div>
                 <div className="metricGrid metricGrid--primary">
@@ -3849,7 +3907,38 @@ export default function PlaylistManager() {
                   <div><h3>Song snippets</h3><div className="metaPermissionList">{tracks.map((track) => <label key={track.id}><input type="checkbox" checked={selection.audio.includes(track.id)} onChange={() => toggleCreativeMatrix(experiment.id, "audio", track.id)} /> <span>{track.title}{track.artist ? ` — ${track.artist}` : ""}</span></label>)}{!tracks.length ? <p>No song snippets uploaded for this project. Rendering without audio remains possible.</p> : null}</div></div>
                 </div>
                 <div className="metaFormActions"><button disabled={busy || !activePhase || !selection.videos.length || matrixSize > 128} onClick={() => createCreativeMatrix(experiment)}>Queue {matrixSize} renders</button><small>Duplicate DNA is skipped automatically. Maximum 128 combinations per batch.</small></div>
-                {variants.length ? <div className="metaPermissionList">{variants.map((variant) => <span key={variant.id}>{variant.label} · {variant.status}</span>)}</div> : null}
+                {variants.length ? <section>
+                  <div className="panelHeader"><div><h3>Variant attribution</h3><p>Every tested variant must map to its own Meta Ad ID. Published variants can populate this automatically later.</p></div><span className="jobStatus jobStatus--pending">{linkedAds}/{variants.length} linked</span></div>
+                  <div className="creativeVariantAttribution">{variants.map((variant) => {
+                    const totals = (variant.meta_creative_variant_metrics || []).reduce((sum, row) => ({
+                      impressions: sum.impressions + Number(row.impressions || 0),
+                      spend: sum.spend + Number(row.spend_minor || 0),
+                      clicks: sum.clicks + Number(row.outbound_clicks || 0),
+                    }), { impressions: 0, spend: 0, clicks: 0 });
+                    return <div key={variant.id}>
+                      <div><strong>{variant.label}</strong><small>{variant.status} · {totals.impressions} impressions · EUR {(totals.spend / 100).toFixed(2)} · {totals.clicks} outbound</small></div>
+                      {variant.meta_ad_id ? <code>{variant.meta_ad_id}</code> : <><input aria-label={`Meta Ad ID for ${variant.label}`} inputMode="numeric" placeholder="Meta Ad ID" value={creativeVariantAdIds[variant.id] || ""} onChange={(event) => setCreativeVariantAdIds((current) => ({ ...current, [variant.id]: event.target.value }))} /><button disabled={busy || !/^\d{5,40}$/.test(String(creativeVariantAdIds[variant.id] || ""))} onClick={() => linkCreativeVariantAd(variant.id)}>Link</button></>}
+                    </div>;
+                  })}</div>
+                </section> : null}
+                {variants.length ? <section className="creativeEvaluationPanel">
+                  <div className="panelHeader"><div><h3>Performance evaluation</h3><p>Import daily Meta insights, apply minimum-data gates, and promote only eligible winners.</p></div>{evaluation ? <span className="jobStatus jobStatus--done">{evaluation.winner_ids?.length || 0} winners</span> : null}</div>
+                  <div className="metaFormGrid">
+                    <label><span>Minimum impressions</span><input type="number" min="100" step="100" value={evaluationForm.minimum_impressions} onChange={(event) => updateCreativeEvaluationForm(experiment.id, { minimum_impressions: event.target.value })} /></label>
+                    <label><span>Minimum spend (EUR)</span><input type="number" min="0" step="1" value={evaluationForm.minimum_spend_eur} onChange={(event) => updateCreativeEvaluationForm(experiment.id, { minimum_spend_eur: event.target.value })} /></label>
+                    <label><span>Winner slots</span><input type="number" min="1" max="12" value={evaluationForm.winner_slots} onChange={(event) => updateCreativeEvaluationForm(experiment.id, { winner_slots: event.target.value })} /></label>
+                  </div>
+                  <div className="metaFormActions">
+                    <button className="secondary" disabled={busy || !linkedAds} onClick={() => importCreativeExperimentMetrics(experiment, activePhase)}>Import Meta metrics</button>
+                    <button disabled={busy} onClick={() => evaluateCreativeExperiment(experiment, activePhase)}>Evaluate phase</button>
+                    <button disabled={busy || !evaluation?.winner_ids?.length || Number(activePhase?.phase_number || 1) >= Number(experiment.settings?.phases || 3)} onClick={() => generateCreativeNextPhase(experiment, activePhase)}>Generate next phase</button>
+                  </div>
+                  {evaluation ? <div className="creativeEvaluationSummary">
+                    <p><strong>Metric used:</strong> {String(evaluation.metric_used || "").replaceAll("_", " ")}{evaluation.fallback_reason ? ` · ${evaluation.fallback_reason}` : ""}</p>
+                    <div className="metaPermissionList">{(evaluation.ranking || []).slice(0, 8).map((result) => <span key={result.variant_id}>#{result.rank} {result.label} · {result.eligible ? `${Math.round((result.confidence || 0) * 100)}% confidence` : "waiting for data"}</span>)}</div>
+                    <small>{evaluation.eligible_variants || 0} eligible variants · Audio and video effects are aggregated independently in the saved evaluation.</small>
+                  </div> : null}
+                </section> : null}
               </article>;
             })}
             {!creativeExperiments.length ? <section className="dashboardPanel creativeEmptyState"><strong>No experiments yet</strong><p>Create one from a project whose concepts already have selected footage.</p></section> : null}
@@ -6727,6 +6816,16 @@ export default function PlaylistManager() {
         .creativeBatchProgress > div { height: 7px; overflow: hidden; border-radius: 999px; background: #252d37; }
         .creativeBatchProgress > div > span { display: block; height: 100%; border-radius: inherit; background: #18e06f; transition: width .25s ease; }
         .creativeBatchProgress small { color: #8994a2; }
+        .creativeVariantAttribution { display: grid; gap: 7px; margin: 10px 0 18px; }
+        .creativeVariantAttribution > div { display: grid; grid-template-columns: minmax(0, 1fr) minmax(150px, 220px) auto; align-items: center; gap: 8px; padding: 9px 10px; border: 1px solid #303744; border-radius: 8px; background: #10151b; }
+        .creativeVariantAttribution > div > div { display: grid; gap: 3px; min-width: 0; }
+        .creativeVariantAttribution strong { overflow: hidden; color: #e9edf2; text-overflow: ellipsis; white-space: nowrap; }
+        .creativeVariantAttribution small { color: #7f8998; }
+        .creativeVariantAttribution code { color: #9eb4ff; font-size: 11px; }
+        .creativeEvaluationPanel { display: grid; gap: 12px; margin-top: 16px; padding: 15px; border: 1px solid rgba(136, 165, 255, .36); border-radius: 10px; background: rgba(91, 132, 255, .055); }
+        .creativeEvaluationSummary { display: grid; gap: 8px; padding: 12px; border-radius: 8px; background: #10151b; }
+        .creativeEvaluationSummary p { margin: 0; color: #b9c2ce; }
+        .creativeEvaluationSummary > small { color: #7f8998; }
         .creativeMediaAutomation { display: grid; gap: 13px; padding: 16px; border: 1px solid rgba(91, 132, 255, .42); border-radius: 11px; background: linear-gradient(135deg, rgba(91, 132, 255, .09), rgba(10, 14, 18, .96)); }
         .creativeMediaAutomation .creativeBatchHeader > div > span { color: #88a5ff; }
         .creativeMediaAutomation .aiMediaButton { color: #081121; background: #88a5ff; }

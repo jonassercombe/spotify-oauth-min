@@ -1021,6 +1021,49 @@ function normalizePexelsVideo(video) {
   };
 }
 
+function metaInsightActionValue(row, field, acceptedTypes = []) {
+  const entries = Array.isArray(row?.[field]) ? row[field] : [];
+  return entries.reduce((sum, entry) => {
+    const actionType = String(entry?.action_type || "").toLowerCase();
+    return acceptedTypes.some((type) => actionType === type || actionType.includes(type))
+      ? sum + Math.max(0, Number(entry?.value || 0))
+      : sum;
+  }, 0);
+}
+
+function summarizeCreativeVariantMetrics(variant) {
+  const totals = (variant.meta_creative_variant_metrics || []).reduce((sum, row) => ({
+    impressions: sum.impressions + Number(row.impressions || 0),
+    reach: sum.reach + Number(row.reach || 0),
+    spend_minor: sum.spend_minor + Number(row.spend_minor || 0),
+    three_second_views: sum.three_second_views + Number(row.three_second_views || 0),
+    video_completions: sum.video_completions + Number(row.video_completions || 0),
+    outbound_clicks: sum.outbound_clicks + Number(row.outbound_clicks || 0),
+    landing_page_views: sum.landing_page_views + Number(row.landing_page_views || 0),
+    spotify_opens: sum.spotify_opens + Number(row.spotify_opens || 0),
+    playlist_follows: sum.playlist_follows + Number(row.playlist_follows || 0),
+  }), { impressions: 0, reach: 0, spend_minor: 0, three_second_views: 0, video_completions: 0, outbound_clicks: 0, landing_page_views: 0, spotify_opens: 0, playlist_follows: 0 });
+  const safeDivide = (numerator, denominator) => denominator > 0 ? numerator / denominator : null;
+  return {
+    ...totals,
+    hook_rate: safeDivide(totals.three_second_views, totals.impressions),
+    hold_rate: safeDivide(totals.video_completions, totals.three_second_views),
+    outbound_ctr: safeDivide(totals.outbound_clicks, totals.impressions),
+    spotify_open_rate: safeDivide(totals.spotify_opens, totals.outbound_clicks),
+    cost_per_outbound_click_minor: safeDivide(totals.spend_minor, totals.outbound_clicks),
+    cost_per_spotify_open_minor: safeDivide(totals.spend_minor, totals.spotify_opens),
+  };
+}
+
+function rankCreativeVariant(metric, summary) {
+  if (metric === "hook_rate") return summary.hook_rate == null ? null : summary.hook_rate;
+  if (metric === "hold_rate") return summary.hold_rate == null ? null : summary.hold_rate;
+  if (metric === "outbound_ctr") return summary.outbound_ctr == null ? null : summary.outbound_ctr;
+  if (metric === "spotify_open_rate") return summary.spotify_open_rate == null ? null : summary.spotify_open_rate;
+  if (metric === "cost_per_outbound_click") return summary.cost_per_outbound_click_minor == null ? null : -summary.cost_per_outbound_click_minor;
+  return summary.cost_per_spotify_open_minor == null ? null : -summary.cost_per_spotify_open_minor;
+}
+
 async function searchPexelsVideos({ query, format, language, perPage = 8 }) {
   const params = new URLSearchParams({
     query,
@@ -2903,7 +2946,7 @@ const routes = {
       const [experimentsResponse, audioResponse] = await Promise.all([
         sb(
           `/rest/v1/meta_creative_experiments?select=*,meta_creative_projects(name,format,language,playlists(name,image)),` +
-          `meta_creative_experiment_phases(*,meta_creative_variants(*))` +
+          `meta_creative_experiment_phases(*,meta_creative_variants(*,meta_creative_variant_metrics(*)))` +
           `&connection_id=eq.${encodeURIComponent(connection.id)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}` +
           `&order=created_at.desc&meta_creative_experiment_phases.order=phase_number.asc&limit=50`
         ),
@@ -2954,7 +2997,7 @@ const routes = {
         name: "Phase 1 — Explore",
         hypothesis: "Identify strong creative concepts before isolating audio effects.",
         primary_metric: experiment.primary_metric,
-        config: { next_phase: "audio_match", winner_slots: 4 },
+        config: { next_phase: "expand", winner_slots: 4 },
         updated_at: now,
       }]),
     });
@@ -3184,6 +3227,395 @@ const routes = {
       body: JSON.stringify({ status: "rendering", updated_at: now }),
     });
     return json(res, 201, { created: created.length, requested: variants.length, variants: created });
+  },
+
+  /* ---------- meta/creative-variants/link-ad (POST) ---------- */
+  "meta/creative-variants/link-ad": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+    const body = await readBody(req);
+    const variantId = String(body.variant_id || "");
+    const metaAdId = String(body.meta_ad_id || "").trim();
+    if (!/^[0-9a-f-]{36}$/i.test(variantId) || !/^\d{5,40}$/.test(metaAdId)) return bad(res, 400, "creative_variant_and_meta_ad_required");
+    const variantResponse = await sb(
+      `/rest/v1/meta_creative_variants?select=*,meta_creative_experiments!inner(connection_id,bubble_user_id)&id=eq.${encodeURIComponent(variantId)}` +
+      `&meta_creative_experiments.connection_id=eq.${encodeURIComponent(connection.id)}` +
+      `&meta_creative_experiments.bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&limit=1`
+    );
+    const variant = variantResponse.ok ? (await variantResponse.json().catch(() => []))[0] : null;
+    if (!variant) return bad(res, 404, "creative_variant_not_found");
+    const update = await sb(`/rest/v1/meta_creative_variants?id=eq.${encodeURIComponent(variant.id)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ meta_ad_id: metaAdId, status: variant.status === "ready" ? "active" : variant.status, updated_at: new Date().toISOString() }),
+    });
+    const text = await update.text();
+    if (!update.ok) return bad(res, 500, `creative_variant_link_failed: ${text.slice(0, 500)}`);
+    return json(res, 200, { variant: JSON.parse(text || "[]")[0] });
+  },
+
+  /* ---------- meta/creative-experiments/import-metrics (POST) ---------- */
+  "meta/creative-experiments/import-metrics": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+    const body = await readBody(req);
+    const experimentId = String(body.experiment_id || "");
+    const phaseId = String(body.phase_id || "");
+    if (!/^[0-9a-f-]{36}$/i.test(experimentId) || !/^[0-9a-f-]{36}$/i.test(phaseId)) return bad(res, 400, "creative_experiment_phase_required");
+    const experimentResponse = await sb(
+      `/rest/v1/meta_creative_experiments?select=*&id=eq.${encodeURIComponent(experimentId)}&connection_id=eq.${encodeURIComponent(connection.id)}` +
+      `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&limit=1`
+    );
+    const experiment = experimentResponse.ok ? (await experimentResponse.json().catch(() => []))[0] : null;
+    if (!experiment) return bad(res, 404, "creative_experiment_not_found");
+    const variantsResponse = await sb(
+      `/rest/v1/meta_creative_variants?select=*&experiment_id=eq.${encodeURIComponent(experiment.id)}` +
+      `&phase_id=eq.${encodeURIComponent(phaseId)}&meta_ad_id=not.is.null&limit=100`
+    );
+    const variants = variantsResponse.ok ? await variantsResponse.json().catch(() => []) : [];
+    if (!variants.length) return bad(res, 409, "creative_phase_has_no_linked_meta_ads");
+    const until = /^\d{4}-\d{2}-\d{2}$/.test(String(body.until || "")) ? String(body.until) : new Date().toISOString().slice(0, 10);
+    const defaultSince = new Date(Date.now() - 13 * 86400000).toISOString().slice(0, 10);
+    const since = /^\d{4}-\d{2}-\d{2}$/.test(String(body.since || "")) ? String(body.since) : defaultSince;
+    if (since > until) return bad(res, 400, "creative_metric_date_range_invalid");
+    const imported = [];
+    const errors = [];
+    await Promise.all(variants.slice(0, 50).map(async (variant) => {
+      try {
+        const insights = await metaGraphRequest(connection, `${variant.meta_ad_id}/insights`, {
+          fields: "ad_id,date_start,date_stop,spend,impressions,reach,clicks,inline_link_clicks,outbound_clicks,actions,video_3_sec_watched_actions,video_p25_watched_actions,video_p50_watched_actions,video_p75_watched_actions,video_p100_watched_actions",
+          time_range: JSON.stringify({ since, until }),
+          time_increment: 1,
+          limit: 100,
+        });
+        for (const row of insights.data || []) {
+          const outboundClicks = Math.max(
+            metaInsightActionValue(row, "outbound_clicks", ["outbound_click"]),
+            Number(row.inline_link_clicks || 0)
+          );
+          const actions = Array.isArray(row.actions) ? row.actions : [];
+          const spotifyOpens = actions.reduce((sum, action) => {
+            const type = String(action?.action_type || "").toLowerCase();
+            return type.includes("spotify_open") ? sum + Number(action?.value || 0) : sum;
+          }, 0);
+          const playlistFollows = actions.reduce((sum, action) => {
+            const type = String(action?.action_type || "").toLowerCase();
+            return type.includes("playlist_follow") ? sum + Number(action?.value || 0) : sum;
+          }, 0);
+          imported.push({
+            variant_id: variant.id,
+            metric_date: row.date_start,
+            impressions: Math.max(0, Math.round(Number(row.impressions || 0))),
+            reach: Math.max(0, Math.round(Number(row.reach || 0))),
+            spend_minor: Math.max(0, Math.round(Number(row.spend || 0) * 100)),
+            three_second_views: Math.max(0, Math.round(metaInsightActionValue(row, "video_3_sec_watched_actions", ["video_view"]))),
+            video_plays_25: Math.max(0, Math.round(metaInsightActionValue(row, "video_p25_watched_actions", ["video_view"]))),
+            video_plays_50: Math.max(0, Math.round(metaInsightActionValue(row, "video_p50_watched_actions", ["video_view"]))),
+            video_plays_75: Math.max(0, Math.round(metaInsightActionValue(row, "video_p75_watched_actions", ["video_view"]))),
+            video_completions: Math.max(0, Math.round(metaInsightActionValue(row, "video_p100_watched_actions", ["video_view"]))),
+            outbound_clicks: Math.max(0, Math.round(outboundClicks)),
+            landing_page_views: Math.max(0, Math.round(metaInsightActionValue(row, "actions", ["landing_page_view"]))),
+            spotify_opens: Math.max(0, Math.round(spotifyOpens)),
+            playlist_follows: Math.max(0, Math.round(playlistFollows)),
+            raw_metrics: { ad_id: row.ad_id || variant.meta_ad_id, clicks: Number(row.clicks || 0), actions: actions.slice(0, 50) },
+            imported_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          });
+        }
+      } catch (error) {
+        errors.push({ variant_id: variant.id, meta_ad_id: variant.meta_ad_id, error: String(error?.message || error).slice(0, 300) });
+      }
+    }));
+    if (imported.length) {
+      const save = await sb(`/rest/v1/meta_creative_variant_metrics?on_conflict=variant_id,metric_date`, {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify(imported),
+      });
+      const text = await save.text();
+      if (!save.ok) return bad(res, 500, `creative_metrics_save_failed: ${text.slice(0, 500)}`);
+    }
+    return json(res, errors.length && !imported.length ? 502 : 200, { imported_rows: imported.length, linked_ads: variants.length, errors, since, until });
+  },
+
+  /* ---------- meta/creative-experiments/evaluate (POST) ---------- */
+  "meta/creative-experiments/evaluate": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+    const body = await readBody(req);
+    const experimentId = String(body.experiment_id || "");
+    const phaseId = String(body.phase_id || "");
+    const experimentResponse = await sb(
+      `/rest/v1/meta_creative_experiments?select=*&id=eq.${encodeURIComponent(experimentId)}&connection_id=eq.${encodeURIComponent(connection.id)}` +
+      `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&limit=1`
+    );
+    const experiment = experimentResponse.ok ? (await experimentResponse.json().catch(() => []))[0] : null;
+    if (!experiment || !/^[0-9a-f-]{36}$/i.test(phaseId)) return bad(res, 404, "creative_experiment_not_found");
+    const phaseResponse = await sb(`/rest/v1/meta_creative_experiment_phases?select=*&id=eq.${encodeURIComponent(phaseId)}&experiment_id=eq.${encodeURIComponent(experiment.id)}&limit=1`);
+    const phase = phaseResponse.ok ? (await phaseResponse.json().catch(() => []))[0] : null;
+    if (!phase) return bad(res, 404, "creative_experiment_phase_not_found");
+    const variantsResponse = await sb(
+      `/rest/v1/meta_creative_variants?select=*,meta_creative_variant_metrics(*)&phase_id=eq.${encodeURIComponent(phase.id)}&limit=200`
+    );
+    const variants = variantsResponse.ok ? await variantsResponse.json().catch(() => []) : [];
+    const minimumImpressions = Math.max(100, Math.min(10000000, Number.parseInt(body.minimum_impressions, 10) || Number(phase.minimum_impressions || 1000)));
+    const minimumSpendMinor = Math.max(0, Math.min(1000000000, Math.round(Number(body.minimum_spend_eur || 0) * 100) || Number(phase.minimum_spend_minor || 0)));
+    const winnerSlots = Math.max(1, Math.min(12, Number.parseInt(body.winner_slots, 10) || Number(phase.config?.winner_slots || 4)));
+    let metricUsed = phase.primary_metric || experiment.primary_metric;
+    let ranking = variants.map((variant) => ({ variant, summary: summarizeCreativeVariantMetrics(variant) }));
+    const spotifySignalExists = ranking.some(({ summary }) => summary.spotify_opens > 0);
+    if (["spotify_open_rate", "cost_per_spotify_open"].includes(metricUsed) && !spotifySignalExists) metricUsed = "cost_per_outbound_click";
+    ranking = ranking.map(({ variant, summary }) => {
+      const eligible = summary.impressions >= minimumImpressions && summary.spend_minor >= minimumSpendMinor;
+      const rawScore = rankCreativeVariant(metricUsed, summary);
+      const confidence = Math.min(1, summary.impressions / Math.max(minimumImpressions * 2, 1));
+      return { variant, summary, eligible, raw_score: rawScore, confidence, weighted_score: rawScore };
+    }).sort((a, b) => {
+      if (a.eligible !== b.eligible) return a.eligible ? -1 : 1;
+      if (a.weighted_score == null) return 1;
+      if (b.weighted_score == null) return -1;
+      return b.weighted_score - a.weighted_score;
+    });
+    const eligible = ranking.filter((item) => item.eligible && item.weighted_score != null);
+    const winnerIds = new Set(eligible.slice(0, winnerSlots).map((item) => item.variant.id));
+    const now = new Date().toISOString();
+    await Promise.all(ranking.map((item) => sb(`/rest/v1/meta_creative_variants?id=eq.${encodeURIComponent(item.variant.id)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({
+        status: item.eligible && item.weighted_score != null
+          ? (winnerIds.has(item.variant.id) ? "winner" : "rejected")
+          : (item.variant.meta_ad_id ? "active" : item.variant.output_asset_id ? "ready" : item.variant.status),
+        updated_at: now,
+      }),
+    })));
+    const groupRollup = (key) => {
+      const groups = new Map();
+      ranking.forEach(({ variant, summary }) => {
+        const id = variant[key] || "none";
+        const current = groups.get(id) || { id, impressions: 0, spend_minor: 0, outbound_clicks: 0, spotify_opens: 0, variants: 0 };
+        current.impressions += summary.impressions;
+        current.spend_minor += summary.spend_minor;
+        current.outbound_clicks += summary.outbound_clicks;
+        current.spotify_opens += summary.spotify_opens;
+        current.variants += 1;
+        groups.set(id, current);
+      });
+      return [...groups.values()].map((group) => ({
+        ...group,
+        outbound_ctr: group.impressions ? group.outbound_clicks / group.impressions : null,
+        cost_per_outbound_click_minor: group.outbound_clicks ? group.spend_minor / group.outbound_clicks : null,
+      })).sort((a, b) => (b.outbound_ctr || 0) - (a.outbound_ctr || 0));
+    };
+    const evaluation = {
+      evaluated_at: now,
+      requested_metric: phase.primary_metric,
+      metric_used: metricUsed,
+      fallback_reason: metricUsed !== phase.primary_metric ? "No Spotify Open signal is available; using Meta outbound click efficiency." : null,
+      minimum_impressions: minimumImpressions,
+      minimum_spend_minor: minimumSpendMinor,
+      eligible_variants: eligible.length,
+      winner_ids: [...winnerIds],
+      ranking: ranking.map((item, index) => ({ rank: index + 1, variant_id: item.variant.id, label: item.variant.label, eligible: item.eligible, confidence: item.confidence, score: item.raw_score, metrics: item.summary })).slice(0, 100),
+      audio_effects: groupRollup("audio_track_id"),
+      video_effects: groupRollup("video_asset_id"),
+    };
+    const phaseStatus = winnerIds.size ? "completed" : "ready";
+    await sb(`/rest/v1/meta_creative_experiment_phases?id=eq.${encodeURIComponent(phase.id)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({
+        status: phaseStatus,
+        minimum_impressions: minimumImpressions,
+        minimum_spend_minor: minimumSpendMinor,
+        config: { ...(phase.config || {}), winner_slots: winnerSlots, evaluation },
+        completed_at: winnerIds.size ? now : null,
+        updated_at: now,
+      }),
+    });
+    return json(res, 200, { evaluation, winners: winnerIds.size, phase_status: phaseStatus });
+  },
+
+  /* ---------- meta/creative-experiments/next-phase (POST) ---------- */
+  "meta/creative-experiments/next-phase": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const connection = await loadMetaConnection(ctx.bubble_user_id);
+    if (!connection) return bad(res, 400, "meta_connection_not_configured");
+    const body = await readBody(req);
+    const experimentId = String(body.experiment_id || "");
+    const phaseId = String(body.phase_id || "");
+    const experimentResponse = await sb(
+      `/rest/v1/meta_creative_experiments?select=*&id=eq.${encodeURIComponent(experimentId)}&connection_id=eq.${encodeURIComponent(connection.id)}` +
+      `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&limit=1`
+    );
+    const experiment = experimentResponse.ok ? (await experimentResponse.json().catch(() => []))[0] : null;
+    if (!experiment || !/^[0-9a-f-]{36}$/i.test(phaseId)) return bad(res, 404, "creative_experiment_not_found");
+    const phaseResponse = await sb(`/rest/v1/meta_creative_experiment_phases?select=*&id=eq.${encodeURIComponent(phaseId)}&experiment_id=eq.${encodeURIComponent(experiment.id)}&limit=1`);
+    const phase = phaseResponse.ok ? (await phaseResponse.json().catch(() => []))[0] : null;
+    if (!phase) return bad(res, 404, "creative_experiment_phase_not_found");
+    const winnersResponse = await sb(`/rest/v1/meta_creative_variants?select=*&phase_id=eq.${encodeURIComponent(phase.id)}&status=eq.winner&limit=20`);
+    const winners = winnersResponse.ok ? await winnersResponse.json().catch(() => []) : [];
+    if (!winners.length) return bad(res, 409, "creative_phase_has_no_winners");
+    const nextPhaseNumber = Number(phase.phase_number) + 1;
+    if (nextPhaseNumber > Number(experiment.settings?.phases || 4)) return bad(res, 409, "creative_experiment_final_phase_reached");
+    const phaseTypes = { explore: "expand", audio_match: "expand", expand: "optimize", optimize: "optimize" };
+    const nextType = phaseTypes[phase.phase_type] || "expand";
+    const existingPhaseResponse = await sb(`/rest/v1/meta_creative_experiment_phases?select=*&experiment_id=eq.${encodeURIComponent(experiment.id)}&phase_number=eq.${nextPhaseNumber}&limit=1`);
+    const existingPhase = existingPhaseResponse.ok ? (await existingPhaseResponse.json().catch(() => []))[0] : null;
+    if (existingPhase) return json(res, 200, { phase: existingPhase, reused: true });
+    const [audioResponse, conceptsResponse] = await Promise.all([
+      sb(`/rest/v1/meta_creative_audio_tracks?select=*,meta_creative_assets(*)&project_id=eq.${encodeURIComponent(experiment.project_id)}&limit=20`),
+      sb(`/rest/v1/meta_creative_concepts?select=*&project_id=eq.${encodeURIComponent(experiment.project_id)}`),
+    ]);
+    const audioTracks = audioResponse.ok ? await audioResponse.json().catch(() => []) : [];
+    const concepts = conceptsResponse.ok ? await conceptsResponse.json().catch(() => []) : [];
+    const conceptById = new Map(concepts.map((concept) => [concept.id, concept]));
+    const now = new Date().toISOString();
+    const nextPhaseResponse = await sb(`/rest/v1/meta_creative_experiment_phases`, {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify([{
+        experiment_id: experiment.id,
+        phase_number: nextPhaseNumber,
+        phase_type: nextType,
+        name: `Phase ${nextPhaseNumber} — ${nextType === "audio_match" ? "Audio Match" : nextType === "expand" ? "Expand" : "Optimize"}`,
+        status: "rendering",
+        hypothesis: nextType === "audio_match"
+          ? "Isolate which song pairing improves the winning visual concepts."
+          : nextType === "expand"
+            ? "Expand the winning DNA across materially different layouts and openings."
+            : "Improve the strongest pairing through small timing and crop changes.",
+        primary_metric: phase.primary_metric,
+        minimum_impressions: phase.minimum_impressions,
+        minimum_spend_minor: phase.minimum_spend_minor,
+        config: { source_phase_id: phase.id, winner_slots: Math.max(1, Math.min(4, Number(phase.config?.winner_slots || 2))) },
+        updated_at: now,
+      }]),
+    });
+    const nextPhaseText = await nextPhaseResponse.text();
+    if (!nextPhaseResponse.ok) return bad(res, 500, `creative_next_phase_save_failed: ${nextPhaseText.slice(0, 500)}`);
+    const nextPhase = JSON.parse(nextPhaseText || "[]")[0];
+    const children = [];
+    winners.forEach((winner) => {
+      let mutations;
+      if (nextType === "audio_match") {
+        const choices = audioTracks.length ? audioTracks.slice(0, 4) : [null];
+        mutations = choices.map((track) => ({ kind: "audio_pairing", audio_track_id: track?.id || winner.audio_track_id, song_start_seconds: Number(track?.default_start_seconds || winner.song_start_seconds || 0) }));
+      } else if (nextType === "expand") {
+        mutations = [
+          { kind: "layout_bold", template_id: "bold_center", clip_offset: 0 },
+          { kind: "layout_editorial", template_id: "editorial_top", clip_offset: 0.75 },
+          { kind: "layout_minimal", template_id: "minimal_bottom", clip_offset: 1.5 },
+        ];
+      } else {
+        mutations = [
+          { kind: "micro_early", clip_offset: -0.5, hook_end_delta: -0.4 },
+          { kind: "micro_control", clip_offset: 0, hook_end_delta: 0 },
+          { kind: "micro_late", clip_offset: 0.5, hook_end_delta: 0.4 },
+        ];
+      }
+      mutations.forEach((mutation) => {
+        const videoStart = Math.max(0, Number(winner.video_start_seconds || 0) + Number(mutation.clip_offset || 0));
+        const duration = Number(winner.duration_seconds || 15);
+        const dna = {
+          ...(winner.dna || {}),
+          parent_variant_id: winner.id,
+          mutation_kind: mutation.kind,
+          template_id: mutation.template_id || winner.template_id,
+          audio_track_id: mutation.audio_track_id || winner.audio_track_id,
+          video_start_seconds: videoStart,
+          video_end_seconds: videoStart + duration,
+          song_start_seconds: mutation.song_start_seconds ?? Number(winner.song_start_seconds || 0),
+          hook_end_delta: Number(mutation.hook_end_delta || 0),
+        };
+        children.push({
+          experiment_id: experiment.id,
+          phase_id: nextPhase.id,
+          parent_variant_id: winner.id,
+          concept_id: winner.concept_id,
+          video_asset_id: winner.video_asset_id,
+          audio_track_id: dna.audio_track_id || null,
+          generation: nextPhaseNumber,
+          label: `${winner.label} · ${mutation.kind.replaceAll("_", " ")}`.slice(0, 200),
+          status: "draft",
+          template_id: dna.template_id,
+          format: winner.format,
+          hook_text: winner.hook_text,
+          cta_text: winner.cta_text,
+          video_start_seconds: dna.video_start_seconds,
+          video_end_seconds: dna.video_end_seconds,
+          song_start_seconds: dna.song_start_seconds,
+          duration_seconds: duration,
+          dna,
+          dna_hash: createHash("sha256").update(JSON.stringify(dna)).digest("hex"),
+          updated_at: now,
+        });
+      });
+    });
+    const childrenResponse = await sb(`/rest/v1/meta_creative_variants?on_conflict=phase_id,dna_hash`, {
+      method: "POST",
+      headers: { Prefer: "resolution=ignore-duplicates,return=representation" },
+      body: JSON.stringify(children.slice(0, 64)),
+    });
+    const childrenText = await childrenResponse.text();
+    if (!childrenResponse.ok) return bad(res, 500, `creative_next_phase_variants_failed: ${childrenText.slice(0, 500)}`);
+    const savedChildren = JSON.parse(childrenText || "[]");
+    const audioById = new Map(audioTracks.map((track) => [track.id, track]));
+    const jobs = savedChildren.map((variant) => {
+      const concept = conceptById.get(variant.concept_id);
+      const editor = concept?.render_spec?.editor || {};
+      return {
+        project_id: experiment.project_id,
+        concept_id: variant.concept_id,
+        status: "queued",
+        priority: 100,
+        max_attempts: 3,
+        render_spec: {
+          variant_id: variant.id,
+          editor: {
+            ...editor,
+            asset_id: variant.video_asset_id,
+            audio_asset_id: audioById.get(variant.audio_track_id)?.asset_id || null,
+            template_id: variant.template_id,
+            format: variant.format,
+            hook_text: variant.hook_text,
+            cta_text: variant.cta_text,
+            trim_start: Number(variant.video_start_seconds),
+            trim_end: Number(variant.video_end_seconds),
+            song_start_seconds: Number(variant.song_start_seconds),
+            hook_end: Math.max(1, Number(editor.hook_end || 4) + Number(variant.dna?.hook_end_delta || 0)),
+          },
+        },
+        updated_at: now,
+      };
+    });
+    if (jobs.length) {
+      const jobsResponse = await sb(`/rest/v1/meta_creative_render_jobs`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(jobs) });
+      const jobsText = await jobsResponse.text();
+      if (!jobsResponse.ok) return bad(res, 500, `creative_next_phase_render_jobs_failed: ${jobsText.slice(0, 500)}`);
+      const savedJobs = JSON.parse(jobsText || "[]");
+      await Promise.all(savedJobs.map((job) => sb(`/rest/v1/meta_creative_variants?id=eq.${encodeURIComponent(job.render_spec.variant_id)}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({ status: "queued", render_job_id: job.id, updated_at: now }),
+      })));
+    }
+    await Promise.all([
+      sb(`/rest/v1/meta_creative_experiments?id=eq.${encodeURIComponent(experiment.id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "active", current_phase: nextPhaseNumber, updated_at: now }) }),
+      sb(`/rest/v1/meta_creative_experiment_phases?id=eq.${encodeURIComponent(phase.id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "completed", completed_at: phase.completed_at || now, updated_at: now }) }),
+    ]);
+    return json(res, 201, { phase: nextPhase, variants_created: savedChildren.length, render_jobs: jobs.length, reused: false });
   },
 
   /* ---------- meta/creative-projects/generate (POST) ---------- */
