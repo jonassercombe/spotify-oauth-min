@@ -874,7 +874,7 @@ function normalizeMetaCreativeProjectInput(body = {}) {
 }
 
 const CREATIVE_CONCEPT_FIELDS = [
-  "title", "hook", "angle", "story", "primary_emotion", "visual_direction",
+  "title", "production_type", "hook", "angle", "story", "primary_emotion", "visual_direction", "footage_criteria", "north_star_story",
   "visual_search_terms", "text_design_direction", "audio_direction", "cta",
   "hypothesis", "rationale",
 ];
@@ -882,7 +882,16 @@ const CREATIVE_CONCEPT_FIELDS = [
 function creativeBriefSchema() {
   const stringField = { type: "string" };
   const stringArray = { type: "array", items: stringField };
-  const conceptProperties = Object.fromEntries(CREATIVE_CONCEPT_FIELDS.map((field) => [field, field === "visual_search_terms" ? stringArray : stringField]));
+  const conceptProperties = Object.fromEntries(CREATIVE_CONCEPT_FIELDS.map((field) => [
+    field,
+    field === "production_type"
+      ? { type: "string", enum: ["stock_simple", "stock_montage", "experimental_wildcard"] }
+      : field === "visual_search_terms"
+        ? { ...stringArray, minItems: 2, maxItems: 2 }
+        : field === "footage_criteria"
+          ? { ...stringArray, minItems: 5, maxItems: 7 }
+          : stringField,
+  ]));
   return {
     type: "object",
     additionalProperties: false,
@@ -942,7 +951,17 @@ async function generateCreativeBriefWithOpenAI({ project, playlist, tracks }) {
       album: track.album_name || "",
     })),
   };
-  const system = `You are a performance creative strategist for paid social ads promoting Spotify playlists. Create one evidence-based playlist brief and exactly eight materially different short-form video concepts. All user-facing copy must be in ${languageName}. Hooks must be overlay-ready (maximum 6 words and 38 characters). Use realistic, stock-video-findable scenes. Avoid generic playlist clichés and duplicate angles. Each concept needs a concrete human moment and a testable hypothesis.`;
+  const system = `You are a performance creative strategist for paid social ads promoting Spotify playlists. Create one evidence-based playlist brief and exactly eight materially different short-form concepts in this exact production portfolio and order: concepts 1–6 production_type=stock_simple, concept 7 production_type=stock_montage, concept 8 production_type=experimental_wildcard.
+
+All user-facing copy must be in ${languageName}. Every concept must contain:
+- a strategic angle;
+- an overlay-ready hook of at most 6 words and 38 characters;
+- visual_direction as ONE executable sentence describing footage that can realistically be found on Pexels;
+- footage_criteria with 5–7 concrete things that are directly visible in frames (subject, action, setting, light, composition, camera energy, usable negative space);
+- exactly two concise English Pexels search queries in visual_search_terms;
+- north_star_story as an optional ambitious idea. Use an empty string when it adds no value. This is inspiration only and must never be required for the stock clip to succeed.
+
+For stock_simple, one continuous stock clip must be sufficient. For stock_montage, describe 2–4 independently searchable shots that can be cut together. For experimental_wildcard, allow an emotionally defensible contrast or pattern interrupt, but keep the stock treatment findable. The story field explains the ad idea, but must not imply that every beat will appear in the selected footage. Avoid generic playlist clichés and duplicate angles. Each concept needs a concrete human moment and a testable hypothesis.`;
   const user = `Analyze this playlist snapshot and create the creative brief and concept portfolio. The primary ad format is ${project.format}.\n\n${JSON.stringify(source)}`;
   try {
     const response = await fetch("https://api.openai.com/v1/responses", {
@@ -1062,9 +1081,27 @@ function creativeMediaRecommendationSchema(candidateIds) {
 }
 
 async function recommendCreativeMediaWithOpenAI({ concept, project, candidates }) {
+  const productionType = ["stock_simple", "stock_montage", "experimental_wildcard"].includes(concept.production_type)
+    ? concept.production_type
+    : "stock_simple";
+  const criteria = Array.isArray(concept.footage_criteria) ? concept.footage_criteria.filter(Boolean).slice(0, 7) : [];
   const content = [{
     type: "input_text",
-    text: `Act as a performance creative director, not a literal storyboard checker. Select up to six diverse stock-video candidates for this playlist ad concept and rank the strongest first. Build a useful test portfolio: SAFE candidates communicate the premise immediately and usually match literally; CREATIVE candidates match the emotion or idea without illustrating every word; WILDCARD candidates create an intentional, memorable contrast or pattern interrupt that can make the hook more interesting. Include all three modes when the footage supports them. A non-literal or strange image is not a flaw when its relationship to the hook can be explained clearly. Classify match_type as literal, emotional or contrast. Score scroll-stop potential and originality separately from concept fit, plus usable text space, visual quality, portrait suitability and commercial brand safety. Recommend the layout that preserves the subject. Do not infer facts not visible in the supplied preview frames. A primary stock clip only needs to communicate the hook, emotion or deliberate creative tension in the first seconds; it is not expected to depict every later story beat. Set production_ready=false only for a material blocker: unusable quality/crop, brand-safety risk, accidental or confusing contradiction, or no defensible relationship to the hook. A deliberate contrast with a crisp rationale can be production-ready. Use rejection_reason only for a material blocker; otherwise return an empty string.\n\nConcept: ${concept.title}\nHook: ${concept.hook}\nAngle: ${concept.angle}\nStory: ${concept.story}\nVisual direction: ${concept.visual_direction}\nFormat: ${project.format}`,
+    text: `Act as a performance creative director selecting executable Pexels footage, not as a literal storyboard checker. Select up to six diverse candidates and rank the strongest first.
+
+The production type is ${productionType}. For stock_simple, one continuous clip must independently carry the treatment. For stock_montage, each candidate may satisfy one strong shot role and should be judged as montage material rather than as the whole story. For experimental_wildcard, allow an intentional, emotionally defensible contrast or pattern interrupt.
+
+Use the visible footage criteria as the primary matching rubric. Only award a criterion when it is actually visible in the supplied frames. The optional North-Star story is inspiration and MUST NOT be treated as a list of required events. SAFE candidates communicate the premise immediately; CREATIVE candidates match the emotion or idea; WILDCARD candidates introduce a memorable but defensible contrast. Classify match_type as literal, emotional or contrast. Score scroll-stop potential and originality separately from concept fit, plus usable text space, visual quality, portrait suitability and commercial brand safety. Recommend the layout that preserves the subject. A clip does not need to depict every story beat. Set production_ready=false only for a material blocker: unusable quality/crop, brand-safety risk, accidental contradiction, or no defensible relationship to the hook and criteria. Use rejection_reason only for a material blocker; otherwise return an empty string.
+
+Concept: ${concept.title}
+Production type: ${productionType}
+Hook: ${concept.hook}
+Strategic angle: ${concept.angle}
+Executable treatment: ${concept.visual_direction}
+Visible footage criteria:
+${criteria.map((criterion, index) => `${index + 1}. ${criterion}`).join("\n") || "No explicit criteria supplied; judge only the executable treatment."}
+Optional North-Star story (do not match literally): ${concept.north_star_story || "None"}
+Format: ${project.format}`,
   }];
   for (const candidate of candidates) {
     content.push({ type: "input_text", text: `Candidate video_id=${candidate.id}; duration=${candidate.duration}s; dimensions=${candidate.source_width}x${candidate.source_height}. The following images are preview frames from this candidate.` });
@@ -3195,17 +3232,24 @@ const routes = {
     try {
       const generated = await generateCreativeBriefWithOpenAI({ project, playlist, tracks });
       if (!Array.isArray(generated.concepts) || generated.concepts.length !== 8) throw new Error("openai_invalid_concept_count");
+      const expectedProductionTypes = [...Array(6).fill("stock_simple"), "stock_montage", "experimental_wildcard"];
+      if (generated.concepts.some((concept, index) => concept.production_type !== expectedProductionTypes[index])) {
+        throw new Error("openai_invalid_production_portfolio");
+      }
       const now = new Date().toISOString();
       const rows = generated.concepts.map((concept, index) => ({
         project_id: project.id,
         position: index + 1,
         title: String(concept.title || "").slice(0, 200),
+        production_type: concept.production_type,
         hook: String(concept.hook || "").slice(0, 200),
         angle: String(concept.angle || "").slice(0, 500),
         story: String(concept.story || "").slice(0, 2000),
         primary_emotion: String(concept.primary_emotion || "").slice(0, 200),
         visual_direction: String(concept.visual_direction || "").slice(0, 2000),
-        visual_search_terms: (concept.visual_search_terms || []).map((term) => String(term).slice(0, 100)).filter(Boolean).slice(0, 8),
+        footage_criteria: (concept.footage_criteria || []).map((criterion) => String(criterion).slice(0, 180)).filter(Boolean).slice(0, 7),
+        north_star_story: String(concept.north_star_story || "").slice(0, 2000),
+        visual_search_terms: (concept.visual_search_terms || []).map((term) => String(term).slice(0, 100)).filter(Boolean).slice(0, 2),
         text_design_direction: String(concept.text_design_direction || "").slice(0, 1000),
         audio_direction: String(concept.audio_direction || "").slice(0, 1000),
         cta: String(concept.cta || "").slice(0, 200),
