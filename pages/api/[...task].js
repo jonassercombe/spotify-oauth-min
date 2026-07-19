@@ -1006,16 +1006,24 @@ function normalizeGeneratedHookCandidates(concept = {}) {
       key,
       Math.max(1, Math.min(10, Number.parseInt(candidate?.[key], 10) || 1)),
     ]));
+    const rawText = String(candidate?.text || "").replace(/\s+/g, " ").trim();
+    const words = rawText.split(" ").filter(Boolean);
+    while (words.join(" ").length > 44 && words.length > 1) words.pop();
     return {
-      text: String(candidate?.text || "").trim().slice(0, 38),
+      text: words.join(" "),
       ...scores,
       total: Object.values(scores).reduce((sum, score) => sum + score, 0),
       rationale: String(candidate?.rationale || "").trim().slice(0, 500),
     };
   }).filter((candidate) => candidate.text);
   if (candidates.length < 4) throw new Error("openai_insufficient_hook_candidates");
-  const eligible = candidates.filter((candidate) => candidate.clarity >= 7 && candidate.playlist_fit >= 7 && candidate.visual_fit >= 7);
-  const ranked = (eligible.length ? eligible : candidates).slice().sort((a, b) => b.total - a.total);
+  const nonNumeric = candidates.filter((candidate) => !/\b\d+\b/.test(candidate.text));
+  const eligible = nonNumeric.filter((candidate) =>
+    candidate.clarity >= 7 &&
+    candidate.playlist_fit >= 7 &&
+    candidate.visual_fit >= 7
+  );
+  const ranked = (eligible.length ? eligible : nonNumeric.length ? nonNumeric : candidates).slice().sort((a, b) => b.total - a.total);
   return { candidates, chosenHook: ranked[0].text };
 }
 
@@ -1063,7 +1071,7 @@ async function generateCreativeBriefWithOpenAI({ project, playlist, tracks }) {
 
 All user-facing copy must be in ${languageName}. Every concept must contain:
 - a strategic angle;
-- 4–6 materially different overlay-ready hook_candidates, each at most 6 words and 38 characters;
+- 4–6 materially different overlay-ready hook_candidates, each at most 6 words and 44 characters;
 - integer scores from 1–10 for every hook candidate on clarity, scroll_stop, playlist_fit, originality, and visual_fit; total must equal the sum of those five scores;
 - hook as the selected candidate text. Choose it using minimum gates of clarity >= 7, playlist_fit >= 7, and visual_fit >= 7, then rank eligible candidates by total. Use hook_choice_rationale to explain the decision briefly;
 - visual_direction as ONE executable sentence describing footage that can realistically be found on Pexels;
@@ -1072,7 +1080,7 @@ All user-facing copy must be in ${languageName}. Every concept must contain:
 - creative_dna with compact, reusable labels for angle type, hook type, human moment, audience state, visible subject/action/setting, lighting, camera energy, composition, text layout, audio energy, CTA intent, and experiment level;
 - north_star_story as an optional ambitious idea. Use an empty string when it adds no value. This is inspiration only and must never be required for the stock clip to succeed.
 
-For stock_simple, one continuous stock clip must be sufficient. For stock_montage, describe 2–4 independently searchable shots that can be cut together. For experimental_wildcard, allow an emotionally defensible contrast or pattern interrupt, but keep the stock treatment findable. The story field explains the ad idea, but must not imply that every beat will appear in the selected footage. Avoid generic playlist clichés and duplicate angles. Each concept needs a concrete human moment and a testable hypothesis.`;
+For stock_simple, one continuous stock clip must be sufficient. For stock_montage, describe 2–4 independently searchable shots that can be cut together. For experimental_wildcard, allow an emotionally defensible contrast or pattern interrupt, but keep the stock treatment findable. The story field explains the ad idea, but must not imply that every beat will appear in the selected footage. Avoid generic playlist clichés and duplicate angles. Never use follower counts, track counts, positions, or other playlist metadata numbers as hooks or turn them into metaphors. Each concept needs a concrete human moment and a testable hypothesis.`;
   const user = cachedBrief
     ? `Use the cached playlist analysis below and create only a fresh concept portfolio. Do not repeat the playlist analysis. The primary ad format is ${project.format}. Treat creative_notes as optional campaign direction.\n\n${JSON.stringify({ cached_playlist_analysis: cachedBrief, ...source })}`
     : `Analyze this playlist snapshot and create the creative brief and concept portfolio. The primary ad format is ${project.format}. Treat creative_notes as optional campaign direction, never as factual playlist metadata.\n\n${JSON.stringify(source)}`;

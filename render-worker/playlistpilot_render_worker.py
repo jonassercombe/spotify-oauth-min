@@ -86,7 +86,7 @@ def text_units(value: str) -> float:
     return units
 
 
-def wrap_visual(value: str, max_units: float) -> list[str]:
+def wrap_visual(value: str, max_units: float, split_oversized: bool = True) -> list[str]:
     """Wrap on visual width and split a single oversized token without truncating it."""
     lines: list[str] = []
     for paragraph in value.replace("\r", "").split("\n"):
@@ -100,7 +100,7 @@ def wrap_visual(value: str, max_units: float) -> list[str]:
             if current and text_units(candidate) > max_units:
                 lines.append(current)
                 current = ""
-            while text_units(word) > max_units:
+            while split_oversized and text_units(word) > max_units:
                 split_at = max(1, len(word) - 1)
                 while split_at > 1 and text_units(word[:split_at]) > max_units:
                     split_at -= 1
@@ -114,16 +114,17 @@ def wrap_visual(value: str, max_units: float) -> list[str]:
 
 def fit_text(value: str, safe_width: int, safe_height: int, preferred_size: int, minimum_size: int) -> tuple[str, int, int]:
     """Fit all text inside a rectangular safe area by wrapping, then scaling down."""
+    width_safety = 1.10
     for font_size in range(preferred_size, minimum_size - 1, -2):
-        line_spacing = max(4, int(font_size * 0.16))
-        lines = wrap_visual(value, safe_width / font_size)
+        line_spacing = max(3, int(font_size * 0.10))
+        lines = wrap_visual(value, safe_width / (font_size * width_safety), split_oversized=False)
         rendered_height = len(lines) * font_size + max(0, len(lines) - 1) * line_spacing
-        rendered_width = max(text_units(line) for line in lines) * font_size
+        rendered_width = max(text_units(line) for line in lines) * font_size * width_safety
         if rendered_width <= safe_width and rendered_height <= safe_height:
             return "\n".join(lines), font_size, line_spacing
     font_size = minimum_size
-    line_spacing = max(3, int(font_size * 0.12))
-    lines = wrap_visual(value, safe_width / font_size)
+    line_spacing = max(3, int(font_size * 0.09))
+    lines = wrap_visual(value, safe_width / (font_size * width_safety))
     return "\n".join(lines), font_size, line_spacing
 
 
@@ -174,18 +175,18 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     width, height = dimensions(str(job.get("format") or editor.get("format") or "9:16"))
     template_id = str(editor.get("template_id") or "bold_center")
     template = {
-        "bold_center": {"font_ratio": 0.082, "safe_x": 0.11, "safe_top": 0.20, "safe_bottom": 0.57, "vertical": "center", "cover_ratio": 0.48},
-        "editorial_top": {"font_ratio": 0.068, "safe_x": 0.11, "safe_top": 0.17, "safe_bottom": 0.48, "vertical": "top", "cover_ratio": 0.36},
-        "minimal_bottom": {"font_ratio": 0.056, "safe_x": 0.11, "safe_top": 0.54, "safe_bottom": 0.75, "vertical": "center", "cover_ratio": 0.32},
-    }.get(template_id, {"font_ratio": 0.082, "safe_x": 0.11, "safe_top": 0.20, "safe_bottom": 0.57, "vertical": "center", "cover_ratio": 0.48})
+        "bold_center": {"font_ratio": 0.098, "safe_x": 0.13, "safe_top": 0.22, "safe_bottom": 0.54, "vertical": "center", "cover_ratio": 0.50},
+        "editorial_top": {"font_ratio": 0.084, "safe_x": 0.13, "safe_top": 0.19, "safe_bottom": 0.46, "vertical": "top", "cover_ratio": 0.38},
+        "minimal_bottom": {"font_ratio": 0.074, "safe_x": 0.13, "safe_top": 0.55, "safe_bottom": 0.73, "vertical": "center", "cover_ratio": 0.34},
+    }.get(template_id, {"font_ratio": 0.098, "safe_x": 0.13, "safe_top": 0.22, "safe_bottom": 0.54, "vertical": "center", "cover_ratio": 0.50})
     clip_start = max(0.0, float(editor.get("trim_start", editor.get("clip_start", 0)) or 0))
     clip_end = max(clip_start + 0.2, float(editor.get("trim_end", editor.get("clip_end", clip_start + 15)) or clip_start + 15))
-    duration = min(30.0, clip_end - clip_start)
+    duration = min(30.0, max(10.0, clip_end - clip_start))
     hook_start = max(0.0, float(editor.get("hook_start") or 0))
     hook_end = min(duration, max(hook_start + 0.2, float(editor.get("hook_end") or 4)))
     hook_position = str(editor.get("hook_position") or "center")
     if template_id == "bold_center":
-        position_zones = {"top": (0.17, 0.47, "top"), "center": (0.20, 0.57, "center"), "bottom": (0.52, 0.75, "center")}
+        position_zones = {"top": (0.19, 0.45, "top"), "center": (0.22, 0.54, "center"), "bottom": (0.53, 0.72, "center")}
         safe_top, safe_bottom, vertical = position_zones.get(hook_position, position_zones["center"])
     else:
         safe_top, safe_bottom, vertical = template["safe_top"], template["safe_bottom"], template["vertical"]
@@ -221,21 +222,21 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
         download(audio_url, audio)
     hook_fit_width = safe_width - (max(22, int(width * 0.04)) if template_id == "editorial_top" else 0)
     fitted_hook, hook_font_size, hook_line_spacing = fit_text(
-        hook, hook_fit_width, safe_height, max(34, int(width * template["font_ratio"])), max(24, int(width * 0.038))
+        hook, hook_fit_width, safe_height, max(42, int(width * template["font_ratio"])), max(30, int(width * 0.046))
     )
     fitted_cta, cta_font_size, cta_line_spacing = fit_text(
-        cta.upper(), int(width * 0.72), int(height * 0.08), max(18, int(width * 0.029)), max(15, int(width * 0.023))
+        cta.upper(), int(width * 0.70), int(height * 0.07), max(22, int(width * 0.036)), max(18, int(width * 0.028))
     )
     playlist_width = int(width * (0.74 if template_id == "bold_center" else 0.44))
     fitted_playlist, playlist_font_size, playlist_line_spacing = fit_text(
-        playlist_name, playlist_width, int(height * 0.13), max(25, int(width * 0.044)), max(18, int(width * 0.028))
+        playlist_name, playlist_width, int(height * 0.11), max(30, int(width * 0.052)), max(22, int(width * 0.034))
     )
     hook_y = str(safe_top_px) if vertical == "top" else f"{safe_top_px}+({safe_height}-text_h)/2"
     hook_file.write_text(fitted_hook, encoding="utf-8")
     cta_file.write_text(fitted_cta, encoding="utf-8")
     playlist_file.write_text(fitted_playlist, encoding="utf-8")
 
-    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{clip_start:.3f}", "-i", str(source)]
+    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-stream_loop", "-1", "-ss", f"{clip_start:.3f}", "-i", str(source)]
     cover = workdir / "cover.jpg"
     if show_cover:
         download(str(job["playlist_cover_url"]), cover)
@@ -248,12 +249,12 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     current = "base"
     accent_color = "white"
     reveal_start = min(duration, 4.0)
-    safe_bottom_ratio = 0.80 if height / width > 1.5 else 0.88
+    safe_bottom_ratio = 0.75 if height / width > 1.5 else 0.84
     cta_bottom = int(height * (1.0 - safe_bottom_ratio))
     cover_size = max(150, int(width * template["cover_ratio"]))
     if template_id == "bold_center":
         cover_x = int((width - cover_size) / 2)
-        cover_y = int(height * 0.29)
+        cover_y = int(height * 0.31)
         playlist_x = "(w-text_w)/2"
         playlist_y = cover_y + cover_size + max(20, int(height * 0.022))
     else:
@@ -274,7 +275,7 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     if hook:
         hook_alpha = fade_alpha(hook_start, hook_end)
         if template_id == "editorial_top":
-            label_font_size = max(15, int(width * 0.024))
+            label_font_size = max(18, int(width * 0.030))
             label_y = max(int(height * 0.11), safe_top_px - max(30, int(height * 0.038)))
             text_filters.append(
                 "drawtext="
