@@ -1120,11 +1120,11 @@ async function generateCreativeBriefWithOpenAI({ project, playlist, tracks, prio
   } : null;
   const system = `You are a performance creative strategist for paid social ads promoting Spotify playlists. ${cachedBrief ? "Use the supplied cached playlist analysis and create" : "Create one evidence-based playlist brief and"} exactly eight materially different short-form concepts. Keep concepts 1–6 easy to execute with one stock clip, concept 7 suitable for a small stock montage, and concept 8 open to an experimental wildcard.
 
-The supplied creative_deck contains one randomly drawn recipe per slot. Treat its mechanism, visual world, copy voice, footage strategy and typography as creative provocations. hook_structure is the required grammatical shape for that slot's selected hook, although the actual wording stays free. risk_level controls how far the idea may travel:
+The supplied creative_deck contains one randomly drawn recipe per slot. Treat its mechanism, visual world, copy voice, footage strategy and typography as creative provocations. hook_structure is the required grammatical shape for that slot's selected hook, although the actual wording stays free. The hook and authored campaign story are the creative authority; footage must support them and must never rewrite the idea around a random object. visual_role=direct_support calls for a clear emotional or literal companion image. visual_role=lateral_support permits a surprising or contrasting image, but the relationship must still be explainable from the hook. risk_level controls how far the idea may travel:
 - accessible: immediately understandable, emotionally direct and useful without decoding; prefer a recognizable listening moment, mood, benefit or invitation;
 - creative: one surprising visual or verbal connection, but still clear on first read;
 - wildcard: permission for the batch's strangest defensible idea.
-The planned portfolio contains four accessible, three creative and one wildcard concept. Preserve that balance. Do not make accessible slots weird merely because the playlist has a metaphorical creative world. serendipity_words are optional lateral-search sparks and should normally be ignored for accessible slots. For workflow=footage_first, create only a broad strategic territory and a provisional hook: the actual Pexels discovery is allowed to rewrite its hook, title and executable treatment later.
+The portfolio profile is randomized per generation while maintaining a quality floor: at least three accessible concepts and no more than two wildcards. Preserve the supplied slot-level risk labels. Do not make accessible slots weird merely because the playlist has a metaphorical creative world. serendipity_words are optional lateral-search sparks only for visual_role=lateral_support; they must never become the subject of the hook merely because footage exists.
 
 All user-facing copy must be in ${languageName}. Every concept must contain:
 - a strategic angle;
@@ -4618,7 +4618,7 @@ const routes = {
 
     const requestedQuery = String(body.query || "").replace(/\s+/g, " ").trim().slice(0, 120);
     const creativeRecipe = owned.concept.render_spec?.creative_deck || {};
-    const footageFirst = creativeRecipe.workflow === "footage_first";
+    const footageFirst = false;
     const lateralSeed = `${owned.project.id}:${owned.concept.id}:${Date.now()}`;
     const lateralQuery = serendipityPexelsQuery(creativeRecipe, `${lateralSeed}:a`);
     const generatedSecondLateralQuery = serendipityPexelsQuery({ ...creativeRecipe, slot: Number(creativeRecipe.slot || 0) + 17 }, `${lateralSeed}:b`);
@@ -4626,13 +4626,11 @@ const routes = {
     const secondLateralQuery = generatedSecondLateralQuery === lateralQuery && alternateWord
       ? `${creativeRecipe.serendipity_modifier || "unexpected"} ${alternateWord}`.slice(0, 120)
       : generatedSecondLateralQuery;
-    const useLateralSearch = footageFirst || Math.random() < 0.35;
+    const useLateralSearch = creativeRecipe.lateral_search === true || Math.random() < 0.18;
     const directedQueries = [requestedQuery, ...(owned.concept.visual_search_terms || []), owned.concept.visual_direction]
       .map((value) => String(value || "").replace(/\s+/g, " ").trim().slice(0, 120))
       .filter((value, index, values) => value.length >= 2 && values.indexOf(value) === index);
-    const queries = (footageFirst
-      ? [lateralQuery, secondLateralQuery, ...directedQueries]
-      : useLateralSearch
+    const queries = (useLateralSearch
         ? [directedQueries[0], lateralQuery, ...directedQueries.slice(1)]
       : directedQueries)
       .filter((value, index, values) => value?.length >= 2 && values.indexOf(value) === index)
@@ -4781,29 +4779,9 @@ const routes = {
     });
     const insertText = await insertResponse.text();
     if (!insertResponse.ok) return bad(res, 500, `creative_asset_save_failed: ${insertText.slice(0, 500)}`);
-    const footageFirst = owned.concept.render_spec?.creative_deck?.workflow === "footage_first";
-    const adaptedHook = normalizeOverlayHook(body.ai?.adapted_hook);
-    const adaptedTitle = String(body.ai?.adapted_title || "").replace(/\s+/g, " ").trim().slice(0, 120);
-    const adaptedTreatment = String(body.ai?.adapted_treatment || "").replace(/\s+/g, " ").trim().slice(0, 240);
     const conceptPatch = {
       status: "media_ready",
       updated_at: new Date().toISOString(),
-      ...(footageFirst && adaptedHook ? {
-        hook: adaptedHook,
-        title: adaptedTitle || owned.concept.title,
-        visual_direction: adaptedTreatment || owned.concept.visual_direction,
-        render_spec: {
-          ...(owned.concept.render_spec || {}),
-          footage_first_adaptation: {
-            original_hook: owned.concept.hook,
-            original_title: owned.concept.title,
-            selected_video_id: providerId,
-            adapted_hook: adaptedHook,
-            adapted_title: adaptedTitle,
-            adapted_treatment: adaptedTreatment,
-          },
-        },
-      } : {}),
     };
     const conceptUpdate = await sb(`/rest/v1/meta_creative_concepts?id=eq.${encodeURIComponent(conceptId)}`, {
       method: "PATCH",
