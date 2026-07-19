@@ -10,6 +10,7 @@ const ENABLE_OPTIMISTIC_PLAYLIST_UI = true;
 const ENABLE_FAST_PLAYLIST_MOVES = true;
 const ENABLE_FAST_PLAYLIST_MUTATIONS = true;
 const USE_RECHARTS_GROWTH_CHART = true;
+const META_CAMPAIGN_RESUME_STORAGE_KEY = "playlistpilot_meta_campaign_resume_v1";
 
 const CREATIVE_RENDER_TEMPLATES = [
   { id: "bold_center", name: "Bold Center", description: "Large centered hook with a strong cover reveal.", hook_position: "center", text_align: "center" },
@@ -886,6 +887,8 @@ export default function PlaylistManager() {
   const spotifyApiSectionRef = useRef(null);
   const playlistLoadSeqRef = useRef(0);
   const selectedPlaylistIdRef = useRef("");
+  const campaignDraftSaveTimerRef = useRef(null);
+  const campaignLibraryPlaylistRef = useRef("");
   const [busyLabel, setBusyLabel] = useState("");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -971,6 +974,8 @@ export default function PlaylistManager() {
   const [creativeProjectMediaRuns, setCreativeProjectMediaRuns] = useState({});
   const [adsSection, setAdsSection] = useState("overview");
   const [adsWizardStep, setAdsWizardStep] = useState(1);
+  const [campaignDraftRestored, setCampaignDraftRestored] = useState(false);
+  const [campaignDraftSavedAt, setCampaignDraftSavedAt] = useState("");
   const [metaDraftForm, setMetaDraftForm] = useState({
     playlist_id: "",
     name: "Bored Indie Kid — Spotify traffic",
@@ -1224,6 +1229,57 @@ export default function PlaylistManager() {
       router.replace(`${window.location.pathname}${next ? `?${next}` : ""}${window.location.hash}`, undefined, { shallow: true });
     }
   }, [router]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(META_CAMPAIGN_RESUME_STORAGE_KEY) || "null");
+      const savedTime = saved?.saved_at ? new Date(saved.saved_at).getTime() : 0;
+      const freshEnough = Number.isFinite(savedTime) && Date.now() - savedTime < 1000 * 60 * 60 * 24 * 30;
+      if (freshEnough && saved?.form && typeof saved.form === "object") {
+        setMetaDraftForm((current) => ({
+          ...current,
+          ...saved.form,
+          audio_snippet_ids: Array.isArray(saved.form.audio_snippet_ids) ? saved.form.audio_snippet_ids.slice(0, 8) : [],
+        }));
+        setAdsWizardStep(Math.max(1, Math.min(3, Number(saved.step) || 1)));
+        setCampaignDraftSavedAt(saved.saved_at);
+      } else if (saved) {
+        window.localStorage.removeItem(META_CAMPAIGN_RESUME_STORAGE_KEY);
+      }
+    } catch {
+      window.localStorage.removeItem(META_CAMPAIGN_RESUME_STORAGE_KEY);
+    } finally {
+      setCampaignDraftRestored(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!campaignDraftRestored || typeof window === "undefined") return undefined;
+    if (campaignDraftSaveTimerRef.current) window.clearTimeout(campaignDraftSaveTimerRef.current);
+    campaignDraftSaveTimerRef.current = window.setTimeout(() => {
+      const savedAt = new Date().toISOString();
+      window.localStorage.setItem(META_CAMPAIGN_RESUME_STORAGE_KEY, JSON.stringify({
+        version: 1,
+        saved_at: savedAt,
+        step: adsWizardStep,
+        form: metaDraftForm,
+      }));
+      setCampaignDraftSavedAt(savedAt);
+    }, 350);
+    return () => {
+      if (campaignDraftSaveTimerRef.current) window.clearTimeout(campaignDraftSaveTimerRef.current);
+    };
+  }, [campaignDraftRestored, adsWizardStep, metaDraftForm]);
+
+  useEffect(() => {
+    const playlistId = metaDraftForm.playlist_id;
+    if (!campaignDraftRestored || !playlistId || !session?.access_token || !isAdmin || view !== "ads") return;
+    if (campaignLibraryPlaylistRef.current === playlistId) return;
+    campaignLibraryPlaylistRef.current = playlistId;
+    loadCampaignAudioLibrary(playlistId);
+    loadCampaignCreativeBatches(playlistId);
+  }, [campaignDraftRestored, metaDraftForm.playlist_id, session?.access_token, isAdmin, view]);
 
   useEffect(() => {
     if (!initialSpotifySyncPending || !initialSpotifySyncUser || !userContext?.linked || !session?.access_token) return;
@@ -2854,6 +2910,8 @@ export default function PlaylistManager() {
   async function saveMetaDraft() {
     await run("Campaign draft saved", async () => {
       await api("/api/meta/campaign-drafts", { method: "POST", accessToken: accessToken(), body: metaDraftForm });
+      if (typeof window !== "undefined") window.localStorage.removeItem(META_CAMPAIGN_RESUME_STORAGE_KEY);
+      setCampaignDraftSavedAt("");
       const result = await loadMetaDrafts();
       openAdsSection("campaigns");
       setAdsWizardStep(1);
@@ -3186,6 +3244,7 @@ export default function PlaylistManager() {
     }));
     setCampaignAudioMasters([]);
     setCampaignAudioMasterId("");
+    campaignLibraryPlaylistRef.current = selectedId;
     if (selectedId) loadCampaignAudioLibrary(selectedId);
     if (selectedId) loadCampaignCreativeBatches(selectedId);
   }
@@ -4666,7 +4725,10 @@ export default function PlaylistManager() {
         <section className="dashboardPanel metaDraftComposer">
           <div className="panelHeader">
             <div><h2>New campaign</h2><p>Add the essentials, prepare audio, then generate eight ready-to-review playlist ads.</p></div>
-            <span className="metaReadOnlyBadge">Always PAUSED</span>
+            <div className="campaignDraftStatus">
+              {campaignDraftSavedAt ? <span>Draft auto-saved</span> : null}
+              <span className="metaReadOnlyBadge">Always PAUSED</span>
+            </div>
           </div>
           <div className="adsWizardSteps" aria-label="Campaign creation progress">
             {["Campaign", "Audio & snippets", "Generate & review"].map((label, index) => <button key={label} className={adsWizardStep === index + 1 ? "active" : adsWizardStep > index + 1 ? "complete" : ""} onClick={() => setAdsWizardStep(index + 1)}><span>{index + 1}</span>{label}</button>)}
@@ -7418,6 +7480,9 @@ export default function PlaylistManager() {
           font-weight: 900;
           text-transform: uppercase;
         }
+        .campaignDraftStatus { display: flex; align-items: center; gap: 9px; }
+        .campaignDraftStatus > span:first-child:not(.metaReadOnlyBadge) { position: relative; padding-left: 12px; color: #7f8b99; font-size: 9px; font-weight: 800; text-transform: uppercase; }
+        .campaignDraftStatus > span:first-child:not(.metaReadOnlyBadge)::before { content: ""; position: absolute; top: 50%; left: 0; width: 6px; height: 6px; border-radius: 50%; background: #18e06f; box-shadow: 0 0 10px rgba(24,224,111,.45); transform: translateY(-50%); }
         .metaMetricText {
           font-size: 25px;
           text-transform: capitalize;
