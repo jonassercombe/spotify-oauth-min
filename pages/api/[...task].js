@@ -990,14 +990,42 @@ function creativeBriefSchema() {
   };
 }
 
-function creativeConceptPortfolioSchema() {
+function creativeConceptPortfolioSchema(count = 8) {
   const schema = creativeBriefSchema();
+  const concepts = { ...schema.properties.concepts, minItems: count, maxItems: count };
   return {
     type: "object",
     additionalProperties: false,
     required: ["concepts"],
-    properties: { concepts: schema.properties.concepts },
+    properties: { concepts },
   };
+}
+
+function creativeMemoryItem(concept = {}) {
+  return {
+    hook: String(concept.hook || "").slice(0, 80),
+    angle: String(concept.angle || "").slice(0, 180),
+    visual_direction: String(concept.visual_direction || "").slice(0, 220),
+    search_terms: (concept.visual_search_terms || []).slice(0, 2),
+    dna: Object.fromEntries(["angle_type", "hook_type", "human_moment", "audience_state", "visual_subject", "visual_action", "setting"].map((key) => [key, concept.creative_dna?.[key] || ""])),
+  };
+}
+
+function conceptSimilarity(left = {}, right = {}) {
+  const tokens = (value) => new Set(String(value || "").toLowerCase().replace(/[^a-z0-9äöüß]+/g, " ").split(" ").filter((token) => token.length > 2));
+  const jaccard = (a, b) => {
+    const union = new Set([...a, ...b]);
+    return union.size ? [...a].filter((token) => b.has(token)).length / union.size : 0;
+  };
+  const hookScore = jaccard(tokens(left.hook), tokens(right.hook));
+  const ideaScore = jaccard(tokens(`${left.angle || ""} ${left.visual_direction || ""}`), tokens(`${right.angle || ""} ${right.visual_direction || ""}`));
+  const dnaKeys = ["angle_type", "hook_type", "human_moment", "visual_subject", "visual_action", "setting"];
+  const dnaMatches = dnaKeys.filter((key) => {
+    const a = String(left.creative_dna?.[key] || "").toLowerCase();
+    const b = String(right.creative_dna?.[key] || "").toLowerCase();
+    return a && b && a === b;
+  }).length;
+  return Math.max(hookScore, ideaScore * 0.82 + (dnaMatches / dnaKeys.length) * 0.18);
 }
 
 function normalizeGeneratedHookCandidates(concept = {}) {
@@ -1038,9 +1066,9 @@ function extractOpenAIText(payload) {
   throw new Error(`openai_empty_response: ${payload?.status || "unknown"}`);
 }
 
-async function generateCreativeBriefWithOpenAI({ project, playlist, tracks }) {
+async function generateCreativeBriefWithOpenAI({ project, playlist, tracks, priorConcepts = [] }) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 95000);
+  const timeout = setTimeout(() => controller.abort(), 72000);
   const languageName = project.language === "de" ? "German" : "English";
   const source = {
     playlist: {
@@ -1056,6 +1084,8 @@ async function generateCreativeBriefWithOpenAI({ project, playlist, tracks }) {
       album: track.album_name || "",
     })),
     creative_notes: String(project.brief?.creative_notes || "").slice(0, 2000),
+    novelty_mode: String(project.brief?.novelty_mode || "balanced"),
+    creative_memory: priorConcepts.slice(0, 48).map(creativeMemoryItem),
   };
   const cachedBrief = project.brief?.mood_summary ? {
     title: project.brief.title,
@@ -1082,7 +1112,7 @@ All user-facing copy must be in ${languageName}. Every concept must contain:
 
 For stock_simple, one continuous stock clip must be sufficient. For stock_montage, describe 2–4 independently searchable shots that can be cut together. For experimental_wildcard, allow an emotionally defensible contrast or pattern interrupt, but keep the stock treatment findable. The story field explains the ad idea, but must not imply that every beat will appear in the selected footage. Avoid generic playlist clichés and duplicate angles. Never use follower counts, track counts, positions, or other playlist metadata numbers as hooks or turn them into metaphors. Each concept needs a concrete human moment and a testable hypothesis.`;
   const user = cachedBrief
-    ? `Use the cached playlist analysis below and create only a fresh concept portfolio. Do not repeat the playlist analysis. The primary ad format is ${project.format}. Treat creative_notes as optional campaign direction.\n\n${JSON.stringify({ cached_playlist_analysis: cachedBrief, ...source })}`
+    ? `Use the cached playlist analysis below and create only a fresh concept portfolio. Do not repeat the playlist analysis. The primary ad format is ${project.format}. Treat creative_notes as optional campaign direction. creative_memory contains recent concepts that must not be paraphrased or recreated. In explore mode, maximize distance from their hooks, angles, human moments, settings, visible actions, and search terms.\n\n${JSON.stringify({ cached_playlist_analysis: cachedBrief, ...source })}`
     : `Analyze this playlist snapshot and create the creative brief and concept portfolio. The primary ad format is ${project.format}. Treat creative_notes as optional campaign direction, never as factual playlist metadata.\n\n${JSON.stringify(source)}`;
   try {
     const model = process.env.OPENAI_MODEL || "gpt-5.6";
@@ -1109,6 +1139,56 @@ For stock_simple, one continuous stock clip must be sufficient. For stock_montag
     const parsed = await parseJsonSafe(response);
     if (!response.ok) throw new Error(`openai_${response.status}: ${parsed.json?.error?.message || parsed.text.slice(0, 500)}`);
     return { generated: { brief: cachedBrief, ...JSON.parse(extractOpenAIText(parsed.json)) }, payload: parsed.json, model };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function generateCreativeReplacementsWithOpenAI({ project, playlist, priorConcepts, acceptedConcepts, slots }) {
+  const model = process.env.OPENAI_NOVELTY_MODEL || process.env.OPENAI_VISION_MODEL || "gpt-5.4-mini";
+  const slotPlan = slots.map((position) => ({
+    position,
+    production_type: position <= 6 ? "stock_simple" : position === 7 ? "stock_montage" : "experimental_wildcard",
+  }));
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 35000);
+  try {
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      signal: controller.signal,
+      headers: { Authorization: `Bearer ${need("OPENAI_API_KEY")}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+      model,
+      reasoning: { effort: "low" },
+      input: [{
+        role: "system",
+        content: `You replace duplicate paid-social concepts for a Spotify playlist. Return exactly ${slots.length} complete concepts in the supplied slot order. Preserve each required production_type. Every replacement must be materially different from creative_memory and accepted_concepts in strategic angle, hook mechanism, human moment, visible action, setting and search terms. A synonym or paraphrase is not novel. Hooks must be at most 6 words and 44 characters and must not use playlist metadata numbers.`,
+      }, {
+        role: "user",
+        content: JSON.stringify({
+          playlist_analysis: {
+            title: project.brief?.title || playlist.name,
+            mood_summary: project.brief?.mood_summary || "",
+            audience_summary: project.brief?.audience_summary || "",
+            creative_notes: project.brief?.creative_notes || "",
+          },
+          slot_plan: slotPlan,
+          creative_memory: priorConcepts.slice(0, 48).map(creativeMemoryItem),
+          accepted_concepts: acceptedConcepts.map(creativeMemoryItem),
+        }),
+      }],
+      text: {
+        verbosity: "low",
+        format: { type: "json_schema", name: "playlist_creative_replacements", strict: true, schema: creativeConceptPortfolioSchema(slots.length) },
+      },
+      max_output_tokens: Math.max(2200, slots.length * 1100),
+      prompt_cache_key: "playlistpilot-creative-replacements-v1",
+      store: false,
+      }),
+    });
+    const parsed = await parseJsonSafe(response);
+    if (!response.ok) throw new Error(`openai_${response.status}: ${parsed.json?.error?.message || parsed.text.slice(0, 500)}`);
+    return { concepts: JSON.parse(extractOpenAIText(parsed.json)).concepts || [], payload: parsed.json, model };
   } finally {
     clearTimeout(timeout);
   }
@@ -1275,7 +1355,7 @@ Format: ${project.format}`,
   }];
   for (const candidate of candidates) {
     content.push({ type: "input_text", text: `Candidate video_id=${candidate.id}; duration=${candidate.duration}s; dimensions=${candidate.source_width}x${candidate.source_height}. The following images are preview frames from this candidate.` });
-    for (const imageUrl of (candidate.preview_images?.length ? candidate.preview_images : [candidate.image]).filter(Boolean).slice(0, 2)) {
+    for (const imageUrl of (candidate.preview_images?.length ? candidate.preview_images : [candidate.image]).filter(Boolean).slice(0, 1)) {
       content.push({ type: "input_image", image_url: imageUrl, detail: "low" });
     }
   }
@@ -3419,6 +3499,7 @@ const routes = {
       : campaignDraft?.audio_snippet_ids || [];
     const audioSnippetIds = [...new Set(requestedSnippetIds.map(String).filter((id) => /^[0-9a-f-]{36}$/i.test(id)))].slice(0, 8);
     const creativeNotes = String(body.creative_notes ?? campaignDraft?.creative_notes ?? "").trim().slice(0, 2000);
+    const noveltyMode = ["balanced", "explore", "wildcard"].includes(String(body.novelty_mode || "")) ? String(body.novelty_mode) : "explore";
     if (audioSnippetIds.length) {
       const snippetsResponse = await sb(
         `/rest/v1/meta_audio_snippets?select=id,start_seconds,end_seconds&playlist_id=eq.${encodeURIComponent(playlist.id)}` +
@@ -3468,6 +3549,7 @@ const routes = {
           followers: Number(playlist.followers || 0),
           tracks_total: Number(playlist.tracks_total || 0),
           creative_notes: creativeNotes,
+          novelty_mode: noveltyMode,
           campaign_batch: true,
           campaign_draft_id: campaignDraft?.id || null,
         },
@@ -4226,6 +4308,17 @@ const routes = {
     );
     const tracks = tracksResponse.ok ? await tracksResponse.json().catch(() => []) : [];
     if (!tracks.length) return bad(res, 409, "creative_playlist_tracks_missing_sync_playlist_first");
+    const priorProjectsResponse = await sb(
+      `/rest/v1/meta_creative_projects?select=id&playlist_id=eq.${encodeURIComponent(playlist.id)}` +
+      `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&id=neq.${encodeURIComponent(project.id)}&order=created_at.desc&limit=12`
+    );
+    const priorProjectIds = priorProjectsResponse.ok
+      ? (await priorProjectsResponse.json().catch(() => [])).map((item) => item.id).filter(Boolean)
+      : [];
+    const priorConceptsResponse = priorProjectIds.length
+      ? await sb(`/rest/v1/meta_creative_concepts?select=hook,angle,visual_direction,visual_search_terms,creative_dna&project_id=in.(${priorProjectIds.join(",")})&order=created_at.desc&limit=64`)
+      : null;
+    const priorConcepts = priorConceptsResponse?.ok ? await priorConceptsResponse.json().catch(() => []) : [];
 
     await sb(`/rest/v1/meta_creative_projects?id=eq.${encodeURIComponent(project.id)}`, {
       method: "PATCH",
@@ -4234,7 +4327,7 @@ const routes = {
     });
 
     try {
-      const generation = await generateCreativeBriefWithOpenAI({ project, playlist, tracks });
+      const generation = await generateCreativeBriefWithOpenAI({ project, playlist, tracks, priorConcepts });
       const generated = generation.generated;
       await recordOpenAIUsage({
         bubbleUserId: ctx.bubble_user_id,
@@ -4242,14 +4335,59 @@ const routes = {
         operation: project.brief?.mood_summary ? "creative_concepts_cached_analysis" : "creative_brief_and_concepts",
         model: generation.model,
         payload: generation.payload,
-        metadata: { cached_playlist_analysis: Boolean(project.brief?.mood_summary) },
+        metadata: { cached_playlist_analysis: Boolean(project.brief?.mood_summary), memory_concepts: priorConcepts.length },
       });
       if (!Array.isArray(generated.concepts) || generated.concepts.length !== 8) throw new Error("openai_invalid_concept_count");
       const expectedProductionTypes = [...Array(6).fill("stock_simple"), "stock_montage", "experimental_wildcard"];
       if (generated.concepts.some((concept, index) => concept.production_type !== expectedProductionTypes[index])) {
         throw new Error("openai_invalid_production_portfolio");
       }
-      const normalizedHooks = generated.concepts.map(normalizeGeneratedHookCandidates);
+      let normalizedHooks = generated.concepts.map(normalizeGeneratedHookCandidates);
+      generated.concepts.forEach((concept, index) => { concept.hook = normalizedHooks[index].chosenHook; });
+      const noveltyMode = ["balanced", "explore", "wildcard"].includes(project.brief?.novelty_mode) ? project.brief.novelty_mode : (priorConcepts.length ? "explore" : "balanced");
+      const threshold = noveltyMode === "wildcard" ? 0.40 : noveltyMode === "explore" ? 0.48 : 0.62;
+      const accepted = [];
+      const duplicateSlots = [];
+      generated.concepts.forEach((concept, index) => {
+        const comparisonPool = [...priorConcepts, ...accepted];
+        const similarity = comparisonPool.reduce((highest, previous) => Math.max(highest, conceptSimilarity(concept, previous)), 0);
+        concept.novelty_score = Math.round((1 - similarity) * 100);
+        if (comparisonPool.length && similarity >= threshold) duplicateSlots.push(index + 1);
+        else accepted.push(concept);
+      });
+      if (duplicateSlots.length) {
+        try {
+          const replacement = await generateCreativeReplacementsWithOpenAI({
+            project,
+            playlist,
+            priorConcepts,
+            acceptedConcepts: accepted,
+            slots: duplicateSlots,
+          });
+          await recordOpenAIUsage({
+            bubbleUserId: ctx.bubble_user_id,
+            projectId: project.id,
+            operation: "creative_novelty_replacements",
+            model: replacement.model,
+            payload: replacement.payload,
+            metadata: { slots: duplicateSlots, novelty_mode: noveltyMode },
+          });
+          if (replacement.concepts.length === duplicateSlots.length) {
+            replacement.concepts.forEach((concept, replacementIndex) => {
+              const position = duplicateSlots[replacementIndex];
+              concept.production_type = expectedProductionTypes[position - 1];
+              const normalized = normalizeGeneratedHookCandidates(concept);
+              concept.hook = normalized.chosenHook;
+              concept.novelty_score = 100;
+              generated.concepts[position - 1] = concept;
+            });
+            normalizedHooks = generated.concepts.map(normalizeGeneratedHookCandidates);
+          }
+        } catch {
+          // A novelty retry is an enhancement; keep the valid primary portfolio
+          // rather than failing the entire eight-creative batch.
+        }
+      }
       const now = new Date().toISOString();
       const rows = generated.concepts.map((concept, index) => ({
         project_id: project.id,
@@ -4283,6 +4421,9 @@ const routes = {
           ])),
           source: "openai",
           format: project.format,
+          novelty_score: Number(concept.novelty_score || 0),
+          novelty_mode: noveltyMode,
+          memory_concepts: priorConcepts.length,
         },
         updated_at: now,
       }));
@@ -4386,14 +4527,30 @@ const routes = {
     if (!queries.length) queries.push("people listening music");
 
     try {
-      const searches = await Promise.all(queries.map((query) => searchPexelsVideos({ query, format: owned.project.format, language: owned.project.language, perPage: 8 })));
+      const [searches, recentProjectsResponse] = await Promise.all([
+        Promise.all(queries.map((query) => searchPexelsVideos({ query, format: owned.project.format, language: owned.project.language, perPage: 12 }))),
+        sb(`/rest/v1/meta_creative_projects?select=id&playlist_id=eq.${encodeURIComponent(owned.project.playlist_id)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&order=created_at.desc&limit=20`),
+      ]);
+      const recentProjectIds = recentProjectsResponse.ok
+        ? (await recentProjectsResponse.json().catch(() => [])).map((item) => item.id).filter(Boolean)
+        : [];
+      const usedAssetsResponse = recentProjectIds.length
+        ? await sb(`/rest/v1/meta_creative_assets?select=provider_id&asset_type=eq.video&source=eq.pexels&project_id=in.(${recentProjectIds.join(",")})&limit=500`)
+        : null;
+      const usedVideoIds = new Set(usedAssetsResponse?.ok
+        ? (await usedAssetsResponse.json().catch(() => [])).map((item) => String(item.provider_id || "")).filter(Boolean)
+        : []);
       const unique = new Map();
       searches.flatMap((search) => search.videos).forEach((video) => {
         const portraitEnough = video.source_height >= video.source_width;
         const usefulDuration = video.duration >= 5 && video.duration <= 30;
         if (portraitEnough && usefulDuration && !unique.has(video.id)) unique.set(video.id, video);
       });
-      const candidates = [...unique.values()].slice(0, 6);
+      const available = [...unique.values()];
+      const candidates = [
+        ...available.filter((video) => !usedVideoIds.has(String(video.id))),
+        ...available.filter((video) => usedVideoIds.has(String(video.id))),
+      ].slice(0, 12);
       if (!candidates.length) return bad(res, 404, "no_suitable_pexels_videos");
       const recommendation = await recommendCreativeMediaWithOpenAI({ concept: owned.concept, project: owned.project, candidates });
       const ranked = recommendation.ranked;
@@ -4405,7 +4562,7 @@ const routes = {
         model: recommendation.model,
         payload: recommendation.payload,
         imageCount: recommendation.imageCount,
-        metadata: { candidates: candidates.length, queries: queries.length },
+        metadata: { candidates: candidates.length, queries: queries.length, excluded_recent_video_ids: usedVideoIds.size },
       });
       const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
       const recommendations = (ranked.recommendations || []).map((recommendation) => {

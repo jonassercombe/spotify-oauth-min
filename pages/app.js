@@ -1051,6 +1051,7 @@ export default function PlaylistManager() {
     end_date: new Date(Date.now() + 15 * 86400000).toISOString().slice(0, 10),
     placement_mode: "automatic",
     creative_notes: "",
+    novelty_mode: "explore",
     audio_snippet_ids: [],
   });
   const [spotifyClientId, setSpotifyClientId] = useState("");
@@ -3153,6 +3154,7 @@ export default function PlaylistManager() {
             name: metaDraftForm.name,
             language: "en",
             creative_notes: metaDraftForm.creative_notes,
+            novelty_mode: metaDraftForm.novelty_mode,
             audio_snippet_ids: metaDraftForm.audio_snippet_ids,
           },
         });
@@ -4813,6 +4815,7 @@ export default function PlaylistManager() {
               <label className="metaDraftWide"><span>Campaign name</span><input value={metaDraftForm.name} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, name: e.target.value })} /></label>
               <label className="metaDraftWide"><span>Spotify destination URL</span><input type="url" value={metaDraftForm.destination_url} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, destination_url: e.target.value })} placeholder="https://open.spotify.com/playlist/..." /></label>
               <label className="metaDraftWide"><span>Creative notes <small>optional guidance for the 8 creatives</small></span><textarea rows="3" value={metaDraftForm.creative_notes} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, creative_notes: e.target.value })} placeholder="Darker, urban, no obvious party footage. Hooks can be bold and experimental." /></label>
+              <label className="metaDraftWide"><span>Creative variety <small>how far this batch should move away from earlier ideas</small></span><select value={metaDraftForm.novelty_mode || "explore"} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, novelty_mode: e.target.value })}><option value="balanced">Balanced · familiar angles plus new directions</option><option value="explore">Explore · strongly avoid previous concepts</option><option value="wildcard">Wildcard · maximize unusual directions</option></select></label>
               {metaDraftForm.playlist_id ? <article className="adsSelectedPlaylist"><Artwork src={playlists.find((item) => item.id === metaDraftForm.playlist_id)?.image} alt="" size="lg" /><div><span>Campaign destination</span><strong>{playlists.find((item) => item.id === metaDraftForm.playlist_id)?.name}</strong><small>Spotify link and cover imported automatically</small></div></article> : null}
             </> : null}
             {adsWizardStep === 2 ? <>
