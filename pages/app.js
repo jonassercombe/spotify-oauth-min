@@ -1053,6 +1053,7 @@ export default function PlaylistManager() {
     creative_notes: "",
     novelty_mode: "explore",
     audio_snippet_ids: [],
+    selected_render_asset_ids: [],
   });
   const [spotifyClientId, setSpotifyClientId] = useState("");
   const [spotifyClientSecret, setSpotifyClientSecret] = useState("");
@@ -1302,6 +1303,7 @@ export default function PlaylistManager() {
           ...current,
           ...saved.form,
           audio_snippet_ids: Array.isArray(saved.form.audio_snippet_ids) ? saved.form.audio_snippet_ids.slice(0, 8) : [],
+          selected_render_asset_ids: Array.isArray(saved.form.selected_render_asset_ids) ? saved.form.selected_render_asset_ids.slice(0, 8) : [],
         }));
         setAdsWizardStep(Math.max(1, Math.min(3, Number(saved.step) || 1)));
         setCampaignDraftSavedAt(saved.saved_at);
@@ -3250,11 +3252,22 @@ export default function PlaylistManager() {
   async function reviewCampaignCreative(batch, concept, decision) {
     await run(decision === "approved" ? "Creative approved" : "Creative rejected", async () => {
       await api("/api/meta/campaign-creative-reviews", { method: "POST", accessToken: accessToken(), body: { batch_id: batch.id, concept_id: concept.id, decision } });
+      const renders = batch.meta_creative_projects?.meta_creative_render_jobs || [];
+      const assets = batch.meta_creative_projects?.meta_creative_assets || [];
+      const render = renders
+        .filter((item) => item.concept_id === concept.id && item.status === "completed")
+        .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0];
+      const outputAsset = assets.find((item) => item.id === render?.output_asset_id);
+      if (outputAsset?.id) {
+        setMetaDraftForm((current) => {
+          const selected = current.selected_render_asset_ids || [];
+          const next = decision === "approved"
+            ? (selected.includes(outputAsset.id) || selected.length >= 8 ? selected : [...selected, outputAsset.id])
+            : selected.filter((id) => id !== outputAsset.id);
+          return { ...current, selected_render_asset_ids: next };
+        });
+      }
       if (decision === "approved") {
-        const renders = batch.meta_creative_projects?.meta_creative_render_jobs || [];
-        const render = renders
-          .filter((item) => item.concept_id === concept.id && item.status === "completed")
-          .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0];
         const hasQuality = Array.isArray(render?.meta_creative_render_quality_reports)
           ? render.meta_creative_render_quality_reports.length > 0
           : Boolean(render?.meta_creative_render_quality_reports);
@@ -3267,6 +3280,17 @@ export default function PlaylistManager() {
         }
       }
       return loadCampaignCreativeBatches(metaDraftForm.playlist_id);
+    });
+  }
+
+  function toggleCampaignRenderSelection(assetId) {
+    if (!assetId) return;
+    setMetaDraftForm((current) => {
+      const selected = current.selected_render_asset_ids || [];
+      const next = selected.includes(assetId)
+        ? selected.filter((id) => id !== assetId)
+        : selected.length < 8 ? [...selected, assetId] : selected;
+      return { ...current, selected_render_asset_ids: next };
     });
   }
 
@@ -3317,6 +3341,7 @@ export default function PlaylistManager() {
       image_url: selected?.image || current.image_url,
       headline: selected ? `Discover ${selected.name}`.slice(0, 255) : current.headline,
       audio_snippet_ids: [],
+      selected_render_asset_ids: [],
     }));
     setCampaignAudioMasters([]);
     setCampaignAudioMasterId("");
@@ -4858,6 +4883,10 @@ export default function PlaylistManager() {
                     ? "Generating all eight as one ranked set · usually 30–90 seconds"
                     : `${campaignGeneration.completed || 0} of ${campaignGeneration.total || 8} complete${campaignGeneration.failed ? ` · ${campaignGeneration.failed} failed` : ""}`)}</small>
                 </div> : null}
+                <div className="campaignTestSelection">
+                  <div><span>Phase 1 test set</span><strong>{(metaDraftForm.selected_render_asset_ids || []).length} of 8 selected</strong><small>Approve a creative to add it automatically. Use 4–8 distinct videos for a useful first Meta test.</small></div>
+                  <button disabled={busy || (metaDraftForm.selected_render_asset_ids || []).length < 2} onClick={saveMetaDraft}>Save campaign draft</button>
+                </div>
                 <div className="campaignBatchList">
                   {campaignCreativeBatches.map((batch) => {
                     const project = batch.meta_creative_projects || {};
@@ -4874,8 +4903,9 @@ export default function PlaylistManager() {
                           const decision = reviews.find((item) => item.concept_id === concept.id)?.decision || "pending";
                           const creativeDna = campaignCreativeDna(concept);
                           const quality = campaignCreativeQuality(render, outputAsset);
+                          const selectedForTest = Boolean(outputAsset?.id && (metaDraftForm.selected_render_asset_ids || []).includes(outputAsset.id));
                           const qualityLabel = quality ? (quality.status === "passed" || quality.status === "pass" ? "Quality passed" : quality.status === "failed" || quality.status === "fail" ? "Needs fixing" : "Review quality") : "Not checked";
-                          return <article className={`campaignReviewCard campaignReviewCard--${decision}`} key={concept.id}>
+                          return <article className={`campaignReviewCard campaignReviewCard--${decision}${selectedForTest ? " campaignReviewCard--selected" : ""}`} key={concept.id}>
                             {outputAsset?.source_url ? <video src={outputAsset.source_url} controls muted playsInline preload="metadata" /> : <div className="campaignReviewPlaceholder"><span>{render?.status || batch.status}</span></div>}
                             <div className="campaignReviewIdentity"><span>Concept {concept.position} · {decision}</span><h4>{concept.hook || concept.title}</h4><small>{concept.title}</small></div>
                             <div className={`campaignQuality campaignQuality--${quality?.status || "unchecked"}`}>
@@ -4895,6 +4925,7 @@ export default function PlaylistManager() {
                             </details> : null}
                             <div className="campaignReviewActions">
                               <button className={decision === "approved" ? "active" : ""} disabled={busy || !outputAsset?.source_url} onClick={() => reviewCampaignCreative(batch, concept, "approved")}>Approve{decision !== "approved" && !quality ? " + QA" : ""}</button>
+                              <button className={selectedForTest ? "active" : "secondary"} disabled={busy || decision !== "approved" || !outputAsset?.id} onClick={() => toggleCampaignRenderSelection(outputAsset?.id)}>{selectedForTest ? "Selected for test" : "Add to test"}</button>
                               <button className={decision === "rejected" ? "active" : "secondary"} disabled={busy} onClick={() => reviewCampaignCreative(batch, concept, "rejected")}>Reject</button>
                               <button className="secondary" disabled={busy} onClick={() => regenerateCampaignCreative(batch, concept)}>Regenerate</button>
                               <button className="secondary" onClick={() => { setOpenCreativeProjectId(project.id); openAdsSection("creatives"); }}>Edit</button>
@@ -4922,14 +4953,22 @@ export default function PlaylistManager() {
           <div className="panelHeader"><div><h2>Campaigns</h2><p>Drafts and complete paused Meta packages in one place.</p></div><button onClick={() => openAdsSection("new")}>New campaign</button></div>
           <div className="metaDraftCards">
             {metaDrafts.map((draft) => <article key={draft.id}>
+              {(() => {
+                const videoItems = draft.meta_ads_campaign_video_items || [];
+                const completedVideoAds = videoItems.filter((item) => item.status === "complete").length;
+                return <>
               <div className="metaDraftCardHeader"><div><strong>{draft.name}</strong><small>{draft.status.replaceAll("_", " ")}</small></div><span>€{(Number(draft.daily_budget_minor || 0) / 100).toFixed(2)}/day</span></div>
               <p>{draft.primary_text}</p>
-              <dl><div><dt>Target</dt><dd>{(draft.countries || []).join(", ")} · {draft.age_min}–{draft.age_max}</dd></div><div><dt>Schedule</dt><dd>{draft.start_date && draft.end_date ? `${draft.start_date} → ${draft.end_date}` : "Not scheduled"}</dd></div><div><dt>Placements</dt><dd>{(draft.placement_mode || "automatic").replaceAll("_", " ")}</dd></div><div><dt>Destination</dt><dd>{draft.destination_url}</dd></div><div><dt>Creation stage</dt><dd>{(draft.creation_stage || "local").replaceAll("_", " ")}</dd></div>{draft.meta_campaign_id ? <div><dt>Meta campaign</dt><dd>{draft.meta_campaign_id}</dd></div> : null}{draft.meta_adset_id ? <div><dt>Meta ad set</dt><dd>{draft.meta_adset_id}</dd></div> : null}{draft.meta_creative_id ? <div><dt>Meta creative</dt><dd>{draft.meta_creative_id}</dd></div> : null}{draft.meta_ad_id ? <div><dt>Meta ad</dt><dd>{draft.meta_ad_id}</dd></div> : null}</dl>
+              <dl><div><dt>Target</dt><dd>{(draft.countries || []).join(", ")} · {draft.age_min}–{draft.age_max}</dd></div><div><dt>Schedule</dt><dd>{draft.start_date && draft.end_date ? `${draft.start_date} → ${draft.end_date}` : "Not scheduled"}</dd></div><div><dt>Placements</dt><dd>{(draft.placement_mode || "automatic").replaceAll("_", " ")}</dd></div><div><dt>Destination</dt><dd>{draft.destination_url}</dd></div><div><dt>Creative test</dt><dd>{videoItems.length ? `${completedVideoAds}/${videoItems.length} video ads created` : `${(draft.selected_render_asset_ids || []).length} videos selected`}</dd></div><div><dt>Creation stage</dt><dd>{(draft.creation_stage || "local").replaceAll("_", " ")}</dd></div>{draft.meta_campaign_id ? <div><dt>Meta campaign</dt><dd>{draft.meta_campaign_id}</dd></div> : null}{draft.meta_adset_id ? <div><dt>Meta ad set</dt><dd>{draft.meta_adset_id}</dd></div> : null}</dl>
               {draft.last_error ? <div className="metaWarnings"><p>{draft.last_error}</p></div> : null}
+              {videoItems.some((item) => item.last_error) ? <div className="metaWarnings">{videoItems.filter((item) => item.last_error).map((item) => <p key={item.id}>Variant {item.position}: {item.last_error}</p>)}</div> : null}
               <div className="metaDraftActions">
                 <button disabled={busy || draft.status !== "draft"} onClick={() => reviewMetaDraft(draft.id)}>{draft.status === "draft" ? "Approve review" : "Reviewed"}</button>
                 <button className="dangerButton" disabled={busy || !["review_ready", "error"].includes(draft.status)} onClick={() => createPausedMetaCampaign(draft.id)}>{draft.status === "error" ? "Resume PAUSED creation" : draft.status === "created_paused" ? "Created PAUSED" : "Create PAUSED package"}</button>
+                {draft.experiment_id ? <button className="secondary" onClick={() => openAdsSection("experiments")}>View experiment</button> : null}
               </div>
+              </>;
+              })()}
             </article>)}
             {!metaDrafts.length ? <p>No campaign drafts yet.</p> : null}
           </div>
@@ -8040,6 +8079,11 @@ export default function PlaylistManager() {
         .campaignGenerateHero h3 { margin: 7px 0; font-size: clamp(24px, 3vw, 38px); }
         .campaignGenerateHero p { margin: 0; color: #929dab; line-height: 1.55; }
         .campaignGenerateButton { min-width: 190px; min-height: 52px; color: #08120d; background: #fff; }
+        .campaignTestSelection { display: flex; align-items: center; justify-content: space-between; gap: 22px; padding: 16px 18px; border: 1px solid #303844; border-radius: 12px; background: #10151b; }
+        .campaignTestSelection > div { display: grid; gap: 4px; }
+        .campaignTestSelection span { color: #18e06f; font-size: 9px; font-weight: 900; letter-spacing: .08em; text-transform: uppercase; }
+        .campaignTestSelection strong { color: #f0f3f7; font-size: 17px; }
+        .campaignTestSelection small { color: #8993a0; }
         .campaignGenerationProgress { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px 14px; padding: 14px; border: 1px solid #303744; border-radius: 10px; }
         .campaignGenerationProgress > div { grid-column: 1 / -1; height: 5px; overflow: hidden; border-radius: 999px; background: #252c36; }
         .campaignGenerationProgress > div span { display: block; height: 100%; background: #8ea7ff; transition: width .25s ease; }
@@ -8055,6 +8099,7 @@ export default function PlaylistManager() {
         .campaignReviewGrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
         .campaignReviewCard { display: grid; align-content: start; gap: 10px; overflow: hidden; padding: 9px; border: 1px solid #303744; border-radius: 10px; background: #151a21; }
         .campaignReviewCard--approved { border-color: rgba(24,224,111,.5); }
+        .campaignReviewCard--selected { border-color: rgba(24,224,111,.8); box-shadow: 0 0 0 1px rgba(24,224,111,.15); }
         .campaignReviewCard--rejected { opacity: .62; }
         .campaignReviewCard video, .campaignReviewPlaceholder { width: 100%; aspect-ratio: 9 / 16; border-radius: 7px; object-fit: cover; background: #0a0e13; }
         .campaignReviewPlaceholder { display: grid; place-items: center; color: #687383; font-size: 10px; text-transform: uppercase; }
@@ -10336,6 +10381,8 @@ export default function PlaylistManager() {
           .adsWizardSteps { grid-template-columns: repeat(3, minmax(0, 1fr)); }
           .campaignGenerateHero { align-items: stretch; flex-direction: column; }
           .campaignGenerateButton { width: 100%; }
+          .campaignTestSelection { align-items: stretch; flex-direction: column; }
+          .campaignTestSelection button { width: 100%; }
           .campaignReviewGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
           .adsPlacementChoices { grid-template-columns: 1fr; }
           .adsDeliverySummary { grid-template-columns: 1fr; }

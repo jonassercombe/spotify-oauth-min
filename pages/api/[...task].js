@@ -853,6 +853,7 @@ function normalizeMetaDraftInput(body = {}) {
   const countries = Array.from(new Set(String(body.countries || "DE").split(",").map((item) => item.trim().toUpperCase()).filter((item) => /^[A-Z]{2}$/.test(item)))).slice(0, 25);
   const creativeNotes = String(body.creative_notes || "").trim().slice(0, 2000);
   const audioSnippetIds = [...new Set((body.audio_snippet_ids || []).map(String).filter((id) => /^[0-9a-f-]{36}$/i.test(id)))].slice(0, 8);
+  const selectedRenderAssetIds = [...new Set((body.selected_render_asset_ids || []).map(String).filter((id) => /^[0-9a-f-]{36}$/i.test(id)))].slice(0, 8);
   if (name.length < 3) throw new Error("campaign_name_required");
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(playlistId)) throw new Error("playlist_required");
   if (!Number.isInteger(dailyBudgetMinor) || dailyBudgetMinor < 100) throw new Error("daily_budget_must_be_at_least_1_eur");
@@ -885,6 +886,7 @@ function normalizeMetaDraftInput(body = {}) {
     placement_mode: placementMode,
     creative_notes: creativeNotes,
     audio_snippet_ids: audioSnippetIds,
+    selected_render_asset_ids: selectedRenderAssetIds,
   };
 }
 
@@ -5166,7 +5168,7 @@ const routes = {
     if (!connection) return bad(res, 400, "meta_connection_not_configured");
     if (req.method === "GET") {
       const response = await sb(
-        `/rest/v1/meta_ads_campaign_drafts?select=*&connection_id=eq.${encodeURIComponent(connection.id)}&order=created_at.desc&limit=50`
+        `/rest/v1/meta_ads_campaign_drafts?select=*,meta_ads_campaign_video_items(*)&connection_id=eq.${encodeURIComponent(connection.id)}&order=created_at.desc&limit=50`
       );
       if (!response.ok) return bad(res, 500, `meta_drafts_load_failed: ${(await response.text()).slice(0, 1000)}`);
       return json(res, 200, { drafts: await response.json().catch(() => []) });
@@ -5189,6 +5191,19 @@ const routes = {
       const snippets = snippetsResponse.ok ? await snippetsResponse.json().catch(() => []) : [];
       if (snippets.length !== input.audio_snippet_ids.length) return bad(res, 400, "campaign_audio_snippet_not_found");
       if (snippets.some((snippet) => Math.abs(Number(snippet.end_seconds) - Number(snippet.start_seconds) - 30) > 0.05)) return bad(res, 400, "campaign_audio_snippet_must_be_30_seconds");
+    }
+    if (input.selected_render_asset_ids.length) {
+      const selectedAssetsResponse = await sb(
+        `/rest/v1/meta_creative_assets?select=id,asset_type,source_url,meta_creative_projects!inner(playlist_id,bubble_user_id)` +
+        `&id=in.(${input.selected_render_asset_ids.join(",")})&asset_type=eq.render`
+      );
+      const selectedAssets = selectedAssetsResponse.ok ? await selectedAssetsResponse.json().catch(() => []) : [];
+      const validAssets = selectedAssets.filter((asset) =>
+        asset.source_url &&
+        asset.meta_creative_projects?.playlist_id === input.playlist_id &&
+        asset.meta_creative_projects?.bubble_user_id === ctx.bubble_user_id
+      );
+      if (validAssets.length !== input.selected_render_asset_ids.length) return bad(res, 400, "campaign_selected_render_not_found");
     }
     const payload = {
       connection_id: connection.id,
@@ -5263,6 +5278,24 @@ const routes = {
     if ((draft.countries || []).some((country) => EU_DSA_COUNTRIES.has(country)) && (!connection.dsa_beneficiary || !connection.dsa_payor)) {
       return bad(res, 409, "meta_dsa_disclosure_required: add beneficiary and payor in Meta Settings");
     }
+    const selectedRenderAssetIds = [...new Set((draft.selected_render_asset_ids || []).map(String).filter((id) => /^[0-9a-f-]{36}$/i.test(id)))].slice(0, 8);
+    let selectedRenders = [];
+    if (selectedRenderAssetIds.length) {
+      const selectedRendersResponse = await sb(
+        `/rest/v1/meta_creative_assets?select=*,meta_creative_projects!inner(playlist_id,bubble_user_id,name,format),meta_creative_concepts(*)` +
+        `&id=in.(${selectedRenderAssetIds.join(",")})&asset_type=eq.render`
+      );
+      selectedRenders = selectedRendersResponse.ok ? await selectedRendersResponse.json().catch(() => []) : [];
+      selectedRenders = selectedRenderAssetIds.map((id) => selectedRenders.find((asset) => asset.id === id)).filter(Boolean);
+      if (
+        selectedRenders.length !== selectedRenderAssetIds.length ||
+        selectedRenders.some((asset) =>
+          !asset.source_url ||
+          asset.meta_creative_projects?.playlist_id !== draft.playlist_id ||
+          asset.meta_creative_projects?.bubble_user_id !== ctx.bubble_user_id
+        )
+      ) return bad(res, 409, "campaign_selected_render_not_found");
+    }
     const persistDraft = async (patch, representation = false) => {
       const response = await sb(`/rest/v1/meta_ads_campaign_drafts?id=eq.${encodeURIComponent(draft.id)}`, {
         method: "PATCH",
@@ -5274,8 +5307,20 @@ const routes = {
       Object.assign(draft, patch);
       return representation ? JSON.parse(text || "[]")[0] : draft;
     };
+    const persistVideoItem = async (item, patch) => {
+      const response = await sb(`/rest/v1/meta_ads_campaign_video_items?id=eq.${encodeURIComponent(item.id)}&draft_id=eq.${encodeURIComponent(draft.id)}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify({ ...patch, updated_at: new Date().toISOString() }),
+      });
+      const text = await response.text();
+      if (!response.ok) throw new Error(`meta_video_item_update_failed: ${text.slice(0, 500)}`);
+      Object.assign(item, patch);
+      return JSON.parse(text || "[]")[0] || item;
+    };
     const startedAt = new Date().toISOString();
     await persistDraft({ status: "creating", last_error: null, updated_at: startedAt });
+    let activeVideoItem = null;
     try {
       if (!draft.meta_campaign_id) {
         const campaign = await metaGraphMutation(connection, `act_${adAccount.meta_id}/campaigns`, {
@@ -5318,19 +5363,192 @@ const routes = {
         if (!adset.id) throw new Error("meta_adset_id_missing");
         await persistDraft({ meta_adset_id: String(adset.id), creation_stage: "adset" });
       }
-      if (!draft.meta_creative_id) {
-        const adAccountInstagram = await metaGraphRequest(connection, `act_${adAccount.meta_id}/instagram_accounts`, {
-          fields: "id,username",
-          limit: 100,
+      const adAccountInstagram = await metaGraphRequest(connection, `act_${adAccount.meta_id}/instagram_accounts`, {
+        fields: "id,username",
+        limit: 100,
+      });
+      const selectedInstagramUsername = String(instagram.metadata?.username || "").replace(/^@/, "").toLowerCase();
+      const instagramActor = (adAccountInstagram.data || []).find((candidate) =>
+        String(candidate.id) === String(instagram.meta_id) ||
+        (selectedInstagramUsername && String(candidate.username || "").toLowerCase() === selectedInstagramUsername)
+      );
+      if (!instagramActor?.id) {
+        throw new Error("meta_instagram_not_assigned_to_ad_account: assign the selected Instagram account to the selected Meta ad account");
+      }
+      if (selectedRenders.length) {
+        const seedItemsResponse = await sb(`/rest/v1/meta_ads_campaign_video_items?on_conflict=draft_id,asset_id`, {
+          method: "POST",
+          headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
+          body: JSON.stringify(selectedRenders.map((asset, index) => ({
+            draft_id: draft.id,
+            asset_id: asset.id,
+            concept_id: asset.concept_id,
+            position: index + 1,
+          }))),
         });
-        const selectedInstagramUsername = String(instagram.metadata?.username || "").replace(/^@/, "").toLowerCase();
-        const instagramActor = (adAccountInstagram.data || []).find((candidate) =>
-          String(candidate.id) === String(instagram.meta_id) ||
-          (selectedInstagramUsername && String(candidate.username || "").toLowerCase() === selectedInstagramUsername)
-        );
-        if (!instagramActor?.id) {
-          throw new Error("meta_instagram_not_assigned_to_ad_account: assign the selected Instagram account to the selected Meta ad account");
+        if (!seedItemsResponse.ok) throw new Error(`meta_video_items_seed_failed: ${(await seedItemsResponse.text()).slice(0, 500)}`);
+        const itemsResponse = await sb(`/rest/v1/meta_ads_campaign_video_items?select=*&draft_id=eq.${encodeURIComponent(draft.id)}&order=position.asc`);
+        const videoItems = itemsResponse.ok ? await itemsResponse.json().catch(() => []) : [];
+        if (videoItems.length !== selectedRenders.length) throw new Error("meta_video_items_incomplete");
+
+        let experimentId = draft.experiment_id;
+        if (!experimentId) {
+          const firstAsset = selectedRenders[0];
+          const experimentResponse = await sb(`/rest/v1/meta_creative_experiments`, {
+            method: "POST",
+            headers: { Prefer: "return=representation" },
+            body: JSON.stringify([{
+              project_id: firstAsset.project_id,
+              connection_id: connection.id,
+              bubble_user_id: ctx.bubble_user_id,
+              name: `${draft.name} — Phase 1 test`.slice(0, 160),
+              objective: "spotify_open",
+              primary_metric: "cost_per_spotify_open",
+              status: "active",
+              settings: { strategy: "campaign_video_test", phases: 3, draft_id: draft.id, format: "9:16" },
+              updated_at: new Date().toISOString(),
+            }]),
+          });
+          const experimentText = await experimentResponse.text();
+          if (!experimentResponse.ok) throw new Error(`meta_campaign_experiment_failed: ${experimentText.slice(0, 500)}`);
+          experimentId = JSON.parse(experimentText || "[]")[0]?.id;
+          if (!experimentId) throw new Error("meta_campaign_experiment_id_missing");
+          await persistDraft({ experiment_id: experimentId });
         }
+        let phaseResponse = await sb(`/rest/v1/meta_creative_experiment_phases?select=*&experiment_id=eq.${encodeURIComponent(experimentId)}&phase_number=eq.1&limit=1`);
+        let phase = phaseResponse.ok ? (await phaseResponse.json().catch(() => []))[0] : null;
+        if (!phase) {
+          phaseResponse = await sb(`/rest/v1/meta_creative_experiment_phases`, {
+            method: "POST",
+            headers: { Prefer: "return=representation" },
+            body: JSON.stringify([{
+              experiment_id: experimentId,
+              phase_number: 1,
+              phase_type: "explore",
+              name: "Phase 1 — Creative test",
+              status: "ready",
+              hypothesis: "Identify the strongest video and hook concepts before expanding audio and micro-variations.",
+              primary_metric: "cost_per_spotify_open",
+              config: { next_phase: "expand", winner_slots: 3, campaign_draft_id: draft.id },
+              updated_at: new Date().toISOString(),
+            }]),
+          });
+          const phaseText = await phaseResponse.text();
+          if (!phaseResponse.ok) throw new Error(`meta_campaign_phase_failed: ${phaseText.slice(0, 500)}`);
+          phase = JSON.parse(phaseText || "[]")[0];
+        }
+        const variantRows = selectedRenders.map((asset, index) => {
+          const concept = asset.meta_creative_concepts || {};
+          const dna = {
+            ...(concept.creative_dna || concept.render_spec?.creative_dna || {}),
+            campaign_draft_id: draft.id,
+            render_asset_id: asset.id,
+            phase: 1,
+          };
+          return {
+            experiment_id: experimentId,
+            phase_id: phase.id,
+            concept_id: asset.concept_id,
+            video_asset_id: asset.id,
+            output_asset_id: asset.id,
+            audio_snippet_id: /^[0-9a-f-]{36}$/i.test(String(concept.render_spec?.editor?.audio_snippet_id || "")) ? concept.render_spec.editor.audio_snippet_id : null,
+            generation: 1,
+            label: `${index + 1}. ${concept.title || concept.hook || "Creative"}`.slice(0, 200),
+            status: "ready",
+            template_id: ["bold_center", "editorial_top", "minimal_bottom"].includes(asset.metadata?.template_id) ? asset.metadata.template_id : "bold_center",
+            format: "9:16",
+            hook_text: String(concept.hook || "").slice(0, 500),
+            cta_text: "Listen on Spotify",
+            video_start_seconds: 0,
+            video_end_seconds: Number(asset.duration_seconds || 15),
+            song_start_seconds: Math.max(0, Number(concept.render_spec?.editor?.song_start_seconds || 0)),
+            duration_seconds: Math.max(1, Math.min(60, Number(asset.duration_seconds || 15))),
+            dna,
+            dna_hash: createHash("sha256").update(JSON.stringify(dna)).digest("hex"),
+            updated_at: new Date().toISOString(),
+          };
+        });
+        const variantsResponse = await sb(`/rest/v1/meta_creative_variants?on_conflict=phase_id,dna_hash`, {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+          body: JSON.stringify(variantRows),
+        });
+        const variantsText = await variantsResponse.text();
+        if (!variantsResponse.ok) throw new Error(`meta_campaign_variants_failed: ${variantsText.slice(0, 500)}`);
+        const variants = JSON.parse(variantsText || "[]");
+        for (const item of videoItems) {
+          const asset = selectedRenders.find((candidate) => candidate.id === item.asset_id);
+          const variant = variants.find((candidate) => candidate.output_asset_id === item.asset_id || candidate.dna?.render_asset_id === item.asset_id);
+          if (!asset || !variant) throw new Error("meta_campaign_variant_mapping_failed");
+          activeVideoItem = item;
+          if (item.variant_id !== variant.id) await persistVideoItem(item, { variant_id: variant.id, last_error: null });
+          if (!item.meta_video_id) {
+            await persistVideoItem(item, { status: "uploading", last_error: null });
+            const uploadedVideo = await metaGraphMutation(connection, `act_${adAccount.meta_id}/advideos`, {
+              name: `${draft.name} — Video ${item.position}`,
+              file_url: asset.source_url,
+            });
+            if (!uploadedVideo.id) throw new Error("meta_video_id_missing");
+            await persistVideoItem(item, { meta_video_id: String(uploadedVideo.id), status: "uploaded" });
+          }
+          if (!item.meta_creative_id) {
+            const thumbnailUrl = asset.metadata?.qa_frame_urls?.[0] || draft.image_url;
+            const creative = await metaGraphMutation(connection, `act_${adAccount.meta_id}/adcreatives`, {
+              name: `${draft.name} — Creative ${item.position}`,
+              object_story_spec: JSON.stringify({
+                page_id: page.meta_id,
+                instagram_user_id: String(instagramActor.id),
+                video_data: {
+                  video_id: item.meta_video_id,
+                  image_url: thumbnailUrl,
+                  message: draft.primary_text,
+                  title: draft.headline,
+                  call_to_action: { type: "LEARN_MORE", value: { link: draft.destination_url } },
+                },
+              }),
+            });
+            if (!creative.id) throw new Error("meta_creative_id_missing");
+            await persistVideoItem(item, { meta_creative_id: String(creative.id), status: "creative_created" });
+          }
+          if (!item.meta_ad_id) {
+            const ad = await metaGraphMutation(connection, `act_${adAccount.meta_id}/ads`, {
+              name: `${draft.name} — Variant ${item.position}`,
+              adset_id: draft.meta_adset_id,
+              creative: JSON.stringify({ creative_id: item.meta_creative_id }),
+              status: "PAUSED",
+            });
+            if (!ad.id) throw new Error("meta_ad_id_missing");
+            await persistVideoItem(item, { meta_ad_id: String(ad.id), status: "complete" });
+          }
+          await sb(`/rest/v1/meta_creative_variants?id=eq.${encodeURIComponent(variant.id)}`, {
+            method: "PATCH",
+            headers: { Prefer: "return=minimal" },
+            body: JSON.stringify({
+              status: "paused",
+              meta_campaign_id: draft.meta_campaign_id,
+              meta_adset_id: draft.meta_adset_id,
+              meta_creative_id: item.meta_creative_id,
+              meta_ad_id: item.meta_ad_id,
+              updated_at: new Date().toISOString(),
+            }),
+          });
+        }
+        const firstItem = videoItems[0];
+        await sb(`/rest/v1/meta_creative_experiment_phases?id=eq.${encodeURIComponent(phase.id)}`, {
+          method: "PATCH",
+          headers: { Prefer: "return=minimal" },
+          body: JSON.stringify({ status: "active", started_at: new Date().toISOString(), updated_at: new Date().toISOString() }),
+        });
+        const completed = await persistDraft({
+          meta_creative_id: firstItem.meta_creative_id,
+          meta_ad_id: firstItem.meta_ad_id,
+          status: "created_paused",
+          creation_stage: "complete",
+          last_error: null,
+        }, true);
+        return json(res, 200, { draft: completed, video_ads: videoItems, experiment_id: experimentId });
+      }
+      if (!draft.meta_creative_id) {
         const creative = await metaGraphMutation(connection, `act_${adAccount.meta_id}/adcreatives`, {
           name: `${draft.name} — Creative`,
           object_story_spec: JSON.stringify({
@@ -5362,6 +5580,9 @@ const routes = {
       return json(res, 200, { draft: completed });
     } catch (error) {
       const message = String(error?.message || "meta_paused_package_create_failed").slice(0, 1000);
+      if (activeVideoItem?.id) {
+        await persistVideoItem(activeVideoItem, { status: "error", last_error: message }).catch(() => null);
+      }
       await sb(`/rest/v1/meta_ads_campaign_drafts?id=eq.${encodeURIComponent(draft.id)}`, {
         method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "error", last_error: message, updated_at: new Date().toISOString() }),
       }).catch(() => null);
