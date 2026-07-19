@@ -350,6 +350,100 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
         <button className={selected ? "selected" : ""} onClick={() => onToggle(snippet.id)}>{selected ? <><Check aria-hidden="true" /> Selected</> : "Use snippet"}</button>
       </article>;
     })}</div></section> : null}
+    <style jsx>{`
+      .campaignAudioTrimmer { display: grid; gap: 20px; padding: 22px; border: 1px solid #343d49; border-radius: 16px; background: linear-gradient(145deg, rgba(142,167,255,.045), transparent 35%), #0e1319; box-shadow: 0 20px 52px rgba(0,0,0,.18); }
+      audio { display: none; }
+      .campaignTrimmerHeader { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 13px; }
+      .campaignTrimmerTrackIcon { display: grid; place-items: center; width: 40px; height: 40px; border: 1px solid rgba(142,167,255,.26); border-radius: 11px; color: #9fb1ff; background: rgba(142,167,255,.09); }
+      .campaignTrimmerTrackIcon :global(svg) { width: 18px; height: 18px; }
+      .campaignTrimmerTrack { display: grid; gap: 4px; min-width: 0; }
+      .campaignTrimmerTrack strong { overflow: hidden; color: #f4f7fa; font-size: 15px; text-overflow: ellipsis; white-space: nowrap; }
+      .campaignTrimmerTrack small { display: flex; align-items: center; gap: 7px; color: #75808f; }
+      .campaignTrimmerTrack small i { width: 3px; height: 3px; border-radius: 50%; background: #505b69; }
+      .campaignTrimmerSelection { display: grid; gap: 2px; min-width: 112px; padding: 8px 11px; border: 1px solid #303846; border-radius: 10px; background: #11171e; text-align: right; }
+      .campaignTrimmerSelection strong { color: #edf1f7; font-size: 13px; }
+      .campaignTrimmerSelection small { color: #7f8997; font-size: 9px; }
+      .campaignWaveformWorkspace { display: grid; gap: 10px; min-width: 0; }
+      .campaignWaveformTopline { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+      .campaignWaveformTopline span { color: #dce2ea; font-size: 11px; font-weight: 800; }
+      .campaignWaveformTopline small { color: #717c8b; }
+      .campaignWaveform { position: relative; height: 190px; overflow: hidden; border: 1px solid #2d3642; border-radius: 12px; cursor: crosshair; background: #090f15; box-shadow: inset 0 1px 10px rgba(0,0,0,.2); }
+      .campaignWaveform::before { content: ""; position: absolute; z-index: 1; inset: 0; background: repeating-linear-gradient(90deg, transparent 0, transparent calc(12.5% - 1px), rgba(255,255,255,.045) 12.5%); pointer-events: none; }
+      .campaignWaveform canvas { display: block; width: 100%; height: 158px; margin-top: 5px; opacity: .92; }
+      .campaignWaveform > span { position: absolute; inset: 0; display: grid; place-items: center; color: #8290a3; font-size: 11px; }
+      .campaignWaveformSelection { position: absolute; top: 7px; bottom: 25px; z-index: 2; border: 1px solid rgba(255,255,255,.92); border-radius: 6px; background: rgba(142,167,255,.13); box-shadow: 0 0 0 9999px rgba(3,7,12,.54), 0 0 24px rgba(142,167,255,.14); pointer-events: none; }
+      .campaignWaveformSelection i { position: absolute; top: 50%; width: 5px; height: 31px; border-radius: 4px; background: #fff; transform: translateY(-50%); }
+      .campaignWaveformSelection i:first-child { left: -3px; }
+      .campaignWaveformSelection i:last-child { right: -3px; }
+      .campaignWaveformTimes { position: absolute; z-index: 3; right: 10px; bottom: 6px; left: 10px; display: flex; justify-content: space-between; color: #576372; font-size: 8px; pointer-events: none; }
+      .campaignAudioTransport { display: flex; align-items: center; gap: 12px; min-height: 48px; padding: 6px; border: 1px solid #2b333e; border-radius: 11px; background: #11171e; }
+      .campaignPreviewButton { display: flex; align-items: center; gap: 8px; min-width: 106px; padding: 9px 13px; border: 1px solid #394352; border-radius: 8px; color: #f4f6fa; background: #252d38; }
+      .campaignPreviewButton.playing { border-color: rgba(142,167,255,.5); background: rgba(142,167,255,.13); }
+      .campaignPreviewButton :global(svg) { width: 14px; height: 14px; color: #a9b8ff; fill: currentColor; }
+      .campaignLengthPresets { display: flex; align-items: center; gap: 4px; }
+      .campaignLengthPresets > span { margin: 0 6px 0 3px; color: #697585; font-size: 8px; font-weight: 900; letter-spacing: .06em; text-transform: uppercase; }
+      .campaignLengthPresets button { min-width: auto; padding: 7px 10px; border: 1px solid transparent; border-radius: 7px; color: #8994a2; background: transparent; }
+      .campaignLengthPresets button:hover { color: #e2e7ed; background: #1d252f; }
+      .campaignLengthPresets button.active { color: #10151c; background: #e9edff; }
+      .campaignLoopToggle { display: flex; align-items: center; gap: 8px; margin-left: auto; padding: 0 10px; color: #a4aeba; font-size: 10px; }
+      .campaignLoopToggle input { width: auto; accent-color: #8ea7ff; }
+      .campaignTrimFineTune { overflow: hidden; border: 1px solid #2b333e; border-radius: 11px; background: #11171e; }
+      .campaignTrimFineTune summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 13px 15px; cursor: pointer; list-style: none; }
+      .campaignTrimFineTune summary::-webkit-details-marker { display: none; }
+      .campaignTrimFineTune summary > span { display: flex; align-items: center; gap: 8px; color: #c9d0da; font-size: 10px; font-weight: 800; }
+      .campaignTrimFineTune summary :global(svg) { width: 14px; height: 14px; color: #8ea7ff; }
+      .campaignTrimFineTune summary small { color: #6f7b8a; font-size: 9px; }
+      .campaignTrimFineTune[open] summary { border-bottom: 1px solid #29313b; }
+      .campaignTrimFineTune > div { padding: 14px; }
+      .campaignTimingGrid { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 9px; }
+      .campaignTimingGrid label, .campaignSnippetName { display: grid; gap: 5px; }
+      .campaignTimingGrid label > span, .campaignSnippetName > span { color: #7c8796; font-size: 8px; font-weight: 900; letter-spacing: .06em; text-transform: uppercase; }
+      .campaignTimingGrid label > div { position: relative; }
+      .campaignTimingGrid input, .campaignSnippetName input { width: 100%; padding: 9px 10px; border: 1px solid #303946; border-radius: 8px; color: #e7ebf0; background: #0d1319; }
+      .campaignTimingGrid input { padding-right: 24px; }
+      .campaignTimingGrid label b { position: absolute; top: 50%; right: 9px; color: #596575; font-size: 9px; transform: translateY(-50%); }
+      .campaignSnippetComposer { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: end; gap: 12px; padding-top: 2px; }
+      .campaignSnippetName > span { display: flex; gap: 6px; align-items: center; }
+      .campaignSnippetName > span small { color: #576270; font-size: 8px; letter-spacing: 0; text-transform: none; }
+      .campaignSnippetComposer > div { display: grid; justify-items: end; gap: 5px; }
+      .campaignSaveSnippet { min-width: 190px; padding: 10px 14px; border: 1px solid #f4f7fa; border-radius: 8px; color: #09120d; background: #f4f7fa; }
+      .campaignTrimHint { color: #718b7d; font-size: 8px; }
+      .campaignTrimHint.invalid { color: #b48282; }
+      .campaignSavedSnippets { display: grid; gap: 11px; padding-top: 4px; border-top: 1px solid #29313b; }
+      .campaignSavedSnippets > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-top: 17px; }
+      .campaignSavedSnippets > div:first-child > div { display: grid; gap: 3px; }
+      .campaignSavedSnippets > div:first-child > div > span { color: #e5e9ef; font-size: 11px; font-weight: 800; }
+      .campaignSavedSnippets > div:first-child small { color: #75808f; }
+      .campaignSavedSnippets > div:first-child > b { padding: 6px 9px; border-radius: 8px; color: #aab8ff; background: rgba(142,167,255,.09); font-size: 8px; text-transform: uppercase; }
+      .campaignSnippetList { display: grid; gap: 7px; }
+      .campaignSnippetList article { display: grid; grid-template-columns: auto minmax(0,1fr) auto auto; align-items: center; gap: 12px; padding: 10px 11px; border: 1px solid #2c3440; border-radius: 10px; background: #10161c; }
+      .campaignSnippetList article.selected { border-color: rgba(142,167,255,.5); background: rgba(91,132,255,.075); }
+      .campaignSnippetList article > i { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 8px; color: #788493; background: #192029; font-size: 8px; font-style: normal; }
+      .campaignSnippetList article.selected > i { color: #aebcff; background: rgba(142,167,255,.12); }
+      .campaignSnippetList span { display: grid; gap: 3px; min-width: 0; }
+      .campaignSnippetList strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .campaignSnippetList small { color: #7f8998; font-size: 9px; }
+      .campaignSnippetList article > em { min-width: 45px; color: #9aa5b3; font-size: 10px; font-style: normal; text-align: right; }
+      .campaignSnippetList article > button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-width: 94px; padding: 7px 9px; border: 1px solid #394351; border-radius: 8px; color: #aeb7c3; background: #171e26; }
+      .campaignSnippetList article > button.selected { border-color: rgba(142,167,255,.46); color: #dbe1ff; background: rgba(142,167,255,.12); }
+      .campaignSnippetList article > button :global(svg) { width: 12px; height: 12px; }
+      @media (max-width: 720px) {
+        .campaignAudioTrimmer { padding: 16px; }
+        .campaignTrimmerHeader { grid-template-columns: auto minmax(0,1fr); }
+        .campaignTrimmerSelection { grid-column: 1 / -1; justify-self: stretch; text-align: left; }
+        .campaignWaveformTopline { align-items: flex-start; flex-direction: column; gap: 3px; }
+        .campaignAudioTransport { align-items: stretch; flex-direction: column; }
+        .campaignLengthPresets { order: 3; width: 100%; overflow-x: auto; }
+        .campaignLoopToggle { margin-left: 0; }
+        .campaignTrimFineTune summary { align-items: flex-start; flex-direction: column; gap: 4px; }
+        .campaignTimingGrid, .campaignSnippetComposer { grid-template-columns: 1fr; }
+        .campaignSnippetComposer > div { justify-items: stretch; }
+        .campaignSaveSnippet { width: 100%; }
+        .campaignSnippetList article { grid-template-columns: auto minmax(0,1fr) auto; }
+        .campaignSnippetList article > em { display: none; }
+        .campaignSnippetList article > button { grid-column: 2 / -1; width: 100%; }
+      }
+    `}</style>
   </div>;
 }
 
