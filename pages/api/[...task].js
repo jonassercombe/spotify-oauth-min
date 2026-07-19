@@ -1143,6 +1143,17 @@ Across the eight concepts, seek genuine range. A person wearing headphones is al
 
 The selected hook for each slot must follow its assigned creative_deck.hook_structure. Across the portfolio, do not use the same grammatical gimmick more than twice. In particular, avoid a run of anthropomorphic “the [object/place] has/chose/wants/sent…” lines. At least two accessible hooks must clearly communicate a playlist benefit, listening use-case, mood or invitation without a metaphor. creative_dna.hook_type must repeat the assigned structural label, not merely the tone. A hook may use a number only when that exact count is an intentional, visibly verifiable part of the planned shot; never invent a count for rhythm.
 
+creative_deck.hook_focus is binding:
+- audience story addresses who the listener is or how they feel;
+- emotional truth states a relatable feeling;
+- playlist benefit says what the music gives the listener;
+- listening moment names a use-case rather than a prop;
+- identity helps the audience recognize themselves;
+- invitation directly welcomes the listener;
+- scene-led may mention a visible place or object;
+- wildcard is unconstrained.
+Only scene-led and wildcard hooks may be built around a prop, room, street, appliance, sign or other footage noun. Across all eight hooks, at most two may be scene/object-led or anthropomorphize something visible. At least four hooks must remain meaningful over several different possible videos because the audience, emotion, identity or playlist promise—not the stock clip—is the idea.
+
 Treat creative_notes as the campaign's authored CORE STORY, not as optional flavor. First infer its central emotional promise in one sentence internally. Two or three concepts must express that core story directly and recognizably in their hooks; these should usually be accessible or creative slots. The remaining concepts may interpret it through mood, humor, imagery or contrast, while the wildcard may depart from it. Preserve distinctive user-written language when it is concise and strong. For example, notes about feeling alien or born on the wrong planet should be allowed to yield lines such as “For those born on the wrong planet” or “For those who feel alien on Earth.” Do not replace every emotional story with an object joke.
 
 For stock_simple, one continuous stock clip must be sufficient. For stock_montage, describe 2–4 independently searchable shots that can be cut together. For experimental_wildcard, allow an emotionally defensible contrast or pattern interrupt, but keep the stock treatment findable. The story field explains the ad idea, but must not imply that every beat will appear in the selected footage. Avoid generic playlist clichés and duplicate angles. Never use follower counts, track counts, positions, or other playlist metadata numbers as hooks or turn them into metaphors. Each concept needs a concrete human, sensory or visual moment and a testable hypothesis.`;
