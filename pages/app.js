@@ -840,7 +840,7 @@ export default function PlaylistManager() {
   const [creativeAudioSnippets, setCreativeAudioSnippets] = useState([]);
   const [campaignAudioMasters, setCampaignAudioMasters] = useState([]);
   const [campaignAudioMasterId, setCampaignAudioMasterId] = useState("");
-  const [campaignAudioUpload, setCampaignAudioUpload] = useState({ title: "", artist: "", rights_status: "test_only", file: null });
+  const [campaignAudioUpload, setCampaignAudioUpload] = useState({ title: "", artist: "", rights_status: "licensed", file: null });
   const [campaignCreativeBatches, setCampaignCreativeBatches] = useState([]);
   const [campaignGeneration, setCampaignGeneration] = useState(null);
   const [creativeExperimentForm, setCreativeExperimentForm] = useState({ project_id: "", name: "" });
@@ -2813,7 +2813,7 @@ export default function PlaylistManager() {
         accessToken: accessToken(),
         body: { master_id: prepared.master.id, duration_seconds: duration },
       });
-      setCampaignAudioUpload({ title: "", artist: "", rights_status: "test_only", file: null });
+      setCampaignAudioUpload({ title: "", artist: "", rights_status: "licensed", file: null });
       const library = await loadCampaignAudioLibrary(metaDraftForm.playlist_id);
       if (library?.masters?.length) setCampaignAudioMasterId(library.masters[0].id);
       return library;
@@ -4586,7 +4586,6 @@ export default function PlaylistManager() {
                     <div>
                       <label><span>Song title</span><input value={campaignAudioUpload.title} onChange={(event) => setCampaignAudioUpload((current) => ({ ...current, title: event.target.value }))} placeholder={campaignAudioUpload.file?.name?.replace(/\.[^.]+$/, "") || "e.g. Midnight Drive"} /></label>
                       <label><span>Artist</span><input value={campaignAudioUpload.artist} onChange={(event) => setCampaignAudioUpload((current) => ({ ...current, artist: event.target.value }))} placeholder="Artist name" /></label>
-                      <label><span>Usage rights</span><select value={campaignAudioUpload.rights_status} onChange={(event) => setCampaignAudioUpload((current) => ({ ...current, rights_status: event.target.value }))}><option value="owned">Owned</option><option value="licensed">Licensed</option><option value="test_only">Test only</option><option value="unknown">Unknown</option></select></label>
                     </div>
                     <button className="campaignUploadMasterButton" disabled={busy || !metaDraftForm.playlist_id || !campaignAudioUpload.file} onClick={uploadCampaignAudioMaster}>Upload and analyze master</button>
                   </div>
@@ -7640,7 +7639,7 @@ export default function PlaylistManager() {
         .campaignAudioMetadataHeading { display: grid; gap: 3px; }
         .campaignAudioMetadataHeading span { color: #f3f6fa; font-size: 13px; font-weight: 800; }
         .campaignAudioMetadataHeading small { color: #75808f; }
-        .campaignAudioMetadata > div:nth-child(2) { display: grid; grid-template-columns: 1fr 1fr .75fr; gap: 9px; }
+        .campaignAudioMetadata > div:nth-child(2) { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
         .campaignAudioMetadata label { display: grid; gap: 6px; }
         .campaignAudioMetadata label > span,
         .campaignTimingGrid label > span,
@@ -10011,7 +10010,6 @@ export default function PlaylistManager() {
           .creativeEditor { grid-template-columns: 1fr; }
           .campaignAudioWorkbench { grid-template-columns: 1fr; }
           .campaignAudioMetadata > div:nth-child(2) { grid-template-columns: 1fr 1fr; }
-          .campaignAudioMetadata > div:nth-child(2) label:last-child { grid-column: 1 / -1; }
           .campaignAudioPresets { flex-wrap: wrap; }
           .campaignAudioPresets label { margin-left: 0; }
           .creativeTemplateGrid { grid-template-columns: 1fr; }
@@ -10182,9 +10180,6 @@ export default function PlaylistManager() {
           .campaignTimingGrid,
           .campaignSnippetList {
             grid-template-columns: 1fr;
-          }
-          .campaignAudioMetadata > div:nth-child(2) label:last-child {
-            grid-column: auto;
           }
           .campaignAudioPresets > div {
             order: 3;
