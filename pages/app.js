@@ -3166,7 +3166,7 @@ export default function PlaylistManager() {
         const generated = await api("/api/meta/creative-projects/generate", {
           method: "POST",
           accessToken: accessToken(),
-          body: { project_id: created.project.id },
+          body: { project_id: created.project.id, creative_notes: metaDraftForm.creative_notes },
         });
         const concepts = [...(generated.concepts || [])].sort((a, b) => Number(a.position || 0) - Number(b.position || 0));
         if (concepts.length !== 8) throw new Error("The creative batch did not return eight concepts.");

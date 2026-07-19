@@ -1070,7 +1070,9 @@ function coreStoryHookSeeds(notes) {
   const quoted = [...source.matchAll(/[“"]([^”"]+)[”"]/g)]
     .map((match) => normalizeOverlayHook(match[1]))
     .filter((value) => value.split(/\s+/).length >= 3);
-  return [...new Set(quoted)].slice(0, 3);
+  const coreSentence = source.match(/core story\s*:\s*([^.!?]+[.!?]?)/i)?.[1] || "";
+  const normalizedCore = normalizeOverlayHook(coreSentence);
+  return [...new Set([...quoted, ...(normalizedCore.split(/\s+/).length >= 3 ? [normalizedCore] : [])])].slice(0, 3);
 }
 
 function extractOpenAIText(payload) {
@@ -4356,6 +4358,10 @@ const routes = {
     );
     const project = projectResponse.ok ? (await projectResponse.json().catch(() => []))[0] : null;
     if (!project) return bad(res, 404, "creative_project_not_found");
+    const requestCreativeNotes = String(body.creative_notes || "").trim().slice(0, 2000);
+    if (requestCreativeNotes) {
+      project.brief = { ...(project.brief || {}), creative_notes: requestCreativeNotes };
+    }
 
     const existingResponse = await sb(`/rest/v1/meta_creative_concepts?select=*&project_id=eq.${encodeURIComponent(project.id)}&order=position.asc`);
     const existing = existingResponse.ok ? await existingResponse.json().catch(() => []) : [];
