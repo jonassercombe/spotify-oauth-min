@@ -185,7 +185,7 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
   const canvasRef = useRef(null);
   const audioRef = useRef(null);
   const [start, setStart] = useState(0);
-  const [end, setEnd] = useState(Math.min(15, duration));
+  const [end, setEnd] = useState(Math.min(30, duration));
   const [fadeIn, setFadeIn] = useState(0.2);
   const [fadeOut, setFadeOut] = useState(0.2);
   const [title, setTitle] = useState("");
@@ -195,7 +195,7 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
 
   useEffect(() => {
     setStart(0);
-    setEnd(Math.min(15, duration));
+    setEnd(Math.min(30, duration));
     setTitle("");
     setPlaying(false);
     setWaveformStatus("loading");
@@ -239,15 +239,12 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
     return () => { cancelled = true; };
   }, [master.id, master.source_url, duration]);
 
-  function applyPreset(seconds) {
-    setEnd(Math.min(duration, start + seconds));
-  }
-
   function seekFromWaveform(event) {
     const rect = event.currentTarget.getBoundingClientRect();
-    const nextStart = Math.max(0, Math.min(duration - 5, ((event.clientX - rect.left) / rect.width) * duration));
-    setStart(Math.round(nextStart * 10) / 10);
-    setEnd(Math.min(duration, Math.round((nextStart + 15) * 10) / 10));
+    const nextStart = Math.max(0, Math.min(duration - 30, ((event.clientX - rect.left) / rect.width) * duration));
+    const roundedStart = Math.round(nextStart * 10) / 10;
+    setStart(roundedStart);
+    setEnd(Math.min(duration, roundedStart + 30));
   }
 
   function handleTimeUpdate() {
@@ -283,7 +280,7 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
   }
 
   const snippetDuration = Math.max(0, end - start);
-  const valid = snippetDuration >= 5 && snippetDuration <= 30 && fadeIn + fadeOut < snippetDuration;
+  const valid = duration >= 30 && Math.abs(snippetDuration - 30) < 0.05 && fadeIn + fadeOut < snippetDuration;
   const formatAudioTime = (seconds) => {
     const safeSeconds = Math.max(0, Number(seconds || 0));
     return `${Math.floor(safeSeconds / 60)}:${String(Math.floor(safeSeconds % 60)).padStart(2, "0")}`;
@@ -320,7 +317,7 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
           {playing ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}
           <span>{playing ? "Pause" : "Preview"}</span>
         </button>
-        <div className="campaignLengthPresets"><span>Length</span>{[8, 10, 15, 20, 30].map((seconds) => <button className={Math.abs(snippetDuration - seconds) < 0.05 ? "active" : ""} key={seconds} onClick={() => applyPreset(seconds)}>{seconds}s</button>)}</div>
+        <span className="campaignFixedLength">30-second ad format</span>
         <label className="campaignLoopToggle"><input type="checkbox" checked={loop} onChange={(event) => setLoop(event.target.checked)} /><span>Loop</span></label>
       </div>
     </div>
@@ -328,8 +325,7 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
       <summary><span><SlidersHorizontal aria-hidden="true" /> Fine-tune timing & fades</span><small>{start.toFixed(1)}s–{end.toFixed(1)}s · {fadeIn.toFixed(1)}s / {fadeOut.toFixed(1)}s fades</small></summary>
       <div>
         <div className="campaignTimingGrid">
-          <label><span>Start</span><div><input type="number" min="0" max={Math.max(0, duration - 5)} step="0.1" value={start} onChange={(event) => { const value = Math.max(0, Math.min(duration - 5, Number(event.target.value) || 0)); setStart(value); if (end < value + 5) setEnd(Math.min(duration, value + 15)); }} /><b>s</b></div></label>
-          <label><span>End</span><div><input type="number" min={start + 5} max={Math.min(duration, start + 30)} step="0.1" value={end} onChange={(event) => setEnd(Math.max(start + 5, Math.min(duration, start + 30, Number(event.target.value) || start + 15)))} /><b>s</b></div></label>
+          <label><span>Start</span><div><input type="number" min="0" max={Math.max(0, duration - 30)} step="0.1" value={start} onChange={(event) => { const value = Math.max(0, Math.min(duration - 30, Number(event.target.value) || 0)); setStart(value); setEnd(Math.min(duration, value + 30)); }} /><b>s</b></div></label>
           <label><span>Fade in</span><div><input type="number" min="0" max="3" step="0.05" value={fadeIn} onChange={(event) => setFadeIn(Math.max(0, Math.min(3, Number(event.target.value) || 0)))} /><b>s</b></div></label>
           <label><span>Fade out</span><div><input type="number" min="0" max="3" step="0.05" value={fadeOut} onChange={(event) => setFadeOut(Math.max(0, Math.min(3, Number(event.target.value) || 0)))} /><b>s</b></div></label>
         </div>
@@ -339,16 +335,18 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
       <label className="campaignSnippetName"><span>Snippet name <small>optional</small></span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder={`${master.title} · Chorus`} /></label>
       <div>
         <button className="campaignSaveSnippet" disabled={busy || !valid} onClick={() => onSave({ master_id: master.id, title: title || `${master.title} · ${start.toFixed(1)}s`, start_seconds: start, end_seconds: end, fade_in_seconds: fadeIn, fade_out_seconds: fadeOut })}>Save as new snippet</button>
-        <small className={valid ? "campaignTrimHint" : "campaignTrimHint invalid"}>{valid ? "Original audio stays untouched" : "Choose 5–30 seconds"}</small>
+        <small className={valid ? "campaignTrimHint" : "campaignTrimHint invalid"}>{valid ? "Original audio stays untouched" : "Audio master must be at least 30 seconds"}</small>
       </div>
     </div>
     {snippets.length ? <section className="campaignSavedSnippets"><div><div><span>Saved snippets</span><small>Choose the moments to test in your creatives</small></div><b>{selectedIds.length} of 8 selected</b></div><div className="campaignSnippetList">{snippets.map((snippet, index) => {
       const selected = selectedIds.includes(snippet.id);
+      const snippetLength = Number(snippet.end_seconds - snippet.start_seconds);
+      const eligible = Math.abs(snippetLength - 30) < 0.05;
       return <article className={selected ? "selected" : ""} key={snippet.id}>
         <i>{String(index + 1).padStart(2, "0")}</i>
-        <span><strong>{snippet.title}</strong><small>{formatAudioTime(snippet.start_seconds)}–{formatAudioTime(snippet.end_seconds)} in master</small></span>
-        <em>{Number(snippet.end_seconds - snippet.start_seconds).toFixed(1)}s</em>
-        <button className={selected ? "selected" : ""} onClick={() => onToggle(snippet.id)}>{selected ? <><Check aria-hidden="true" /> Selected</> : "Use snippet"}</button>
+        <span><strong>{snippet.title}</strong><small>{eligible ? `${formatAudioTime(snippet.start_seconds)}–${formatAudioTime(snippet.end_seconds)} in master` : "Legacy snippet · create a new 30s version"}</small></span>
+        <em>{snippetLength.toFixed(1)}s</em>
+        <button disabled={!eligible} className={selected ? "selected" : ""} onClick={() => onToggle(snippet.id)}>{selected ? <><Check aria-hidden="true" /> Selected</> : eligible ? "Use snippet" : "Not eligible"}</button>
       </article>;
     })}</div></section> : null}
     <style jsx>{`
@@ -381,11 +379,7 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
       .campaignPreviewButton { display: flex; align-items: center; gap: 8px; min-width: 106px; padding: 9px 13px; border: 1px solid #394352; border-radius: 8px; color: #f4f6fa; background: #252d38; }
       .campaignPreviewButton.playing { border-color: rgba(142,167,255,.5); background: rgba(142,167,255,.13); }
       .campaignPreviewButton :global(svg) { width: 14px; height: 14px; color: #a9b8ff; fill: currentColor; }
-      .campaignLengthPresets { display: flex; align-items: center; gap: 4px; }
-      .campaignLengthPresets > span { margin: 0 6px 0 3px; color: #697585; font-size: 8px; font-weight: 900; letter-spacing: .06em; text-transform: uppercase; }
-      .campaignLengthPresets button { min-width: auto; padding: 7px 10px; border: 1px solid transparent; border-radius: 7px; color: #8994a2; background: transparent; }
-      .campaignLengthPresets button:hover { color: #e2e7ed; background: #1d252f; }
-      .campaignLengthPresets button.active { color: #10151c; background: #e9edff; }
+      .campaignFixedLength { padding: 7px 10px; border-radius: 7px; color: #aeb8ff; background: rgba(142,167,255,.09); font-size: 8px; font-weight: 900; letter-spacing: .06em; text-transform: uppercase; }
       .campaignLoopToggle { display: flex; align-items: center; gap: 8px; margin-left: auto; padding: 0 10px; color: #a4aeba; font-size: 10px; }
       .campaignLoopToggle input { width: auto; accent-color: #8ea7ff; }
       .campaignTrimFineTune { overflow: hidden; border: 1px solid #2b333e; border-radius: 11px; background: #11171e; }
@@ -396,7 +390,7 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
       .campaignTrimFineTune summary small { color: #6f7b8a; font-size: 9px; }
       .campaignTrimFineTune[open] summary { border-bottom: 1px solid #29313b; }
       .campaignTrimFineTune > div { padding: 14px; }
-      .campaignTimingGrid { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 9px; }
+      .campaignTimingGrid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 9px; }
       .campaignTimingGrid label, .campaignSnippetName { display: grid; gap: 5px; }
       .campaignTimingGrid label > span, .campaignSnippetName > span { color: #7c8796; font-size: 8px; font-weight: 900; letter-spacing: .06em; text-transform: uppercase; }
       .campaignTimingGrid label > div { position: relative; }
@@ -434,7 +428,7 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
         .campaignTrimmerSelection { grid-column: 1 / -1; justify-self: stretch; text-align: left; }
         .campaignWaveformTopline { align-items: flex-start; flex-direction: column; gap: 3px; }
         .campaignAudioTransport { align-items: stretch; flex-direction: column; }
-        .campaignLengthPresets { order: 3; width: 100%; overflow-x: auto; }
+        .campaignFixedLength { order: 3; text-align: center; }
         .campaignLoopToggle { margin-left: 0; }
         .campaignTrimFineTune summary { align-items: flex-start; flex-direction: column; gap: 4px; }
         .campaignTimingGrid, .campaignSnippetComposer { grid-template-columns: 1fr; }
@@ -2931,8 +2925,10 @@ export default function PlaylistManager() {
     });
     if (data) {
       const masters = data.masters || [];
+      const eligibleSnippetIds = new Set(masters.flatMap((master) => master.meta_audio_snippets || []).filter((snippet) => Math.abs(Number(snippet.end_seconds - snippet.start_seconds) - 30) < 0.05).map((snippet) => snippet.id));
       setCampaignAudioMasters(masters);
       setCampaignAudioMasterId((current) => masters.some((master) => master.id === current) ? current : masters[0]?.id || "");
+      setMetaDraftForm((current) => ({ ...current, audio_snippet_ids: (current.audio_snippet_ids || []).filter((id) => eligibleSnippetIds.has(id)) }));
     }
     return data;
   }
@@ -7885,7 +7881,7 @@ export default function PlaylistManager() {
         .campaignTrimFineTune summary small { color: #6f7b8a; font-size: 9px; }
         .campaignTrimFineTune[open] summary { border-bottom: 1px solid #29313b; }
         .campaignTrimFineTune > div { padding: 14px; }
-        .campaignTimingGrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; }
+        .campaignTimingGrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; }
         .campaignTimingGrid label, .campaignSnippetName { display: grid; gap: 5px; }
         .campaignTimingGrid label > div { position: relative; }
         .campaignTimingGrid input { padding-right: 24px; }

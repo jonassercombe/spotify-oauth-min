@@ -3262,7 +3262,7 @@ const routes = {
     const duration = end - start;
     const fadeIn = Math.max(0, Math.min(3, Math.round(Number(body.fade_in_seconds ?? 0.2) * 1000) / 1000));
     const fadeOut = Math.max(0, Math.min(3, Math.round(Number(body.fade_out_seconds ?? 0.2) * 1000) / 1000));
-    if (duration < 5 || duration > 30 || end > Number(master.duration_seconds || 0) + 0.01 || fadeIn + fadeOut >= duration) return bad(res, 400, "audio_snippet_timing_invalid");
+    if (Math.abs(duration - 30) > 0.01 || end > Number(master.duration_seconds || 0) + 0.01 || fadeIn + fadeOut >= duration) return bad(res, 400, "audio_snippet_must_be_30_seconds");
     const title = String(body.title || `${master.title} · ${Math.round(start)}s`).trim().slice(0, 200);
     if (!title) return bad(res, 400, "audio_snippet_title_required");
     const now = new Date().toISOString();
@@ -3337,11 +3337,12 @@ const routes = {
     const creativeNotes = String(body.creative_notes ?? campaignDraft?.creative_notes ?? "").trim().slice(0, 2000);
     if (audioSnippetIds.length) {
       const snippetsResponse = await sb(
-        `/rest/v1/meta_audio_snippets?select=id&playlist_id=eq.${encodeURIComponent(playlist.id)}` +
+        `/rest/v1/meta_audio_snippets?select=id,start_seconds,end_seconds&playlist_id=eq.${encodeURIComponent(playlist.id)}` +
         `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&id=in.(${audioSnippetIds.join(",")})`
       );
       const snippets = snippetsResponse.ok ? await snippetsResponse.json().catch(() => []) : [];
       if (snippets.length !== audioSnippetIds.length) return bad(res, 400, "campaign_audio_snippet_not_found");
+      if (snippets.some((snippet) => Math.abs(Number(snippet.end_seconds) - Number(snippet.start_seconds) - 30) > 0.05)) return bad(res, 400, "campaign_audio_snippet_must_be_30_seconds");
     }
     const now = new Date().toISOString();
     const batchLabel = new Intl.DateTimeFormat("en-GB", { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", timeZone: "Europe/Berlin" }).format(new Date());
@@ -4866,11 +4867,12 @@ const routes = {
     if (!ownedPlaylist) return bad(res, 404, "campaign_playlist_not_found");
     if (input.audio_snippet_ids.length) {
       const snippetsResponse = await sb(
-        `/rest/v1/meta_audio_snippets?select=id&playlist_id=eq.${encodeURIComponent(input.playlist_id)}` +
+        `/rest/v1/meta_audio_snippets?select=id,start_seconds,end_seconds&playlist_id=eq.${encodeURIComponent(input.playlist_id)}` +
         `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&id=in.(${input.audio_snippet_ids.join(",")})`
       );
       const snippets = snippetsResponse.ok ? await snippetsResponse.json().catch(() => []) : [];
       if (snippets.length !== input.audio_snippet_ids.length) return bad(res, 400, "campaign_audio_snippet_not_found");
+      if (snippets.some((snippet) => Math.abs(Number(snippet.end_seconds) - Number(snippet.start_seconds) - 30) > 0.05)) return bad(res, 400, "campaign_audio_snippet_must_be_30_seconds");
     }
     const payload = {
       connection_id: connection.id,
