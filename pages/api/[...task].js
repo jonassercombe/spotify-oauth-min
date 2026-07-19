@@ -72,6 +72,29 @@ async function sb(path, init = {}) {
   return fetch(url, { ...init, headers });
 }
 
+async function recordOpenAIUsage({ bubbleUserId, projectId = null, conceptId = null, renderJobId = null, operation, model, payload, imageCount = 0, metadata = {} }) {
+  const usage = payload?.usage || {};
+  await sb("/rest/v1/meta_openai_usage_events", {
+    method: "POST",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify([{
+      bubble_user_id: String(bubbleUserId || "unknown").slice(0, 200),
+      project_id: projectId,
+      concept_id: conceptId,
+      render_job_id: renderJobId,
+      operation,
+      model,
+      input_tokens: Number(usage.input_tokens || 0),
+      cached_input_tokens: Number(usage.input_tokens_details?.cached_tokens || 0),
+      cache_write_tokens: Number(usage.input_tokens_details?.cache_write_tokens || 0),
+      output_tokens: Number(usage.output_tokens || 0),
+      reasoning_tokens: Number(usage.output_tokens_details?.reasoning_tokens || 0),
+      image_count: imageCount,
+      metadata,
+    }]),
+  }).catch(() => null);
+}
+
 function requireRenderWorker(req, res) {
   const expected = process.env.RENDER_WORKER_SECRET || "";
   const supplied = String(req.headers?.["x-render-worker-secret"] || "");
@@ -967,6 +990,16 @@ function creativeBriefSchema() {
   };
 }
 
+function creativeConceptPortfolioSchema() {
+  const schema = creativeBriefSchema();
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["concepts"],
+    properties: { concepts: schema.properties.concepts },
+  };
+}
+
 function normalizeGeneratedHookCandidates(concept = {}) {
   const candidates = (Array.isArray(concept.hook_candidates) ? concept.hook_candidates : []).slice(0, 6).map((candidate) => {
     const scores = Object.fromEntries(["clarity", "scroll_stop", "playlist_fit", "originality", "visual_fit"].map((key) => [
@@ -1016,7 +1049,17 @@ async function generateCreativeBriefWithOpenAI({ project, playlist, tracks }) {
     })),
     creative_notes: String(project.brief?.creative_notes || "").slice(0, 2000),
   };
-  const system = `You are a performance creative strategist for paid social ads promoting Spotify playlists. Create one evidence-based playlist brief and exactly eight materially different short-form concepts in this exact production portfolio and order: concepts 1–6 production_type=stock_simple, concept 7 production_type=stock_montage, concept 8 production_type=experimental_wildcard.
+  const cachedBrief = project.brief?.mood_summary ? {
+    title: project.brief.title,
+    description: project.brief.description,
+    mood_summary: project.brief.mood_summary,
+    audience_summary: project.brief.audience_summary,
+    use_cases: project.brief.use_cases,
+    core_angles: project.brief.core_angles,
+    extracted_artists: project.brief.extracted_artists,
+    extracted_tracks: project.brief.extracted_tracks,
+  } : null;
+  const system = `You are a performance creative strategist for paid social ads promoting Spotify playlists. ${cachedBrief ? "Use the supplied cached playlist analysis and create" : "Create one evidence-based playlist brief and"} exactly eight materially different short-form concepts in this exact production portfolio and order: concepts 1–6 production_type=stock_simple, concept 7 production_type=stock_montage, concept 8 production_type=experimental_wildcard.
 
 All user-facing copy must be in ${languageName}. Every concept must contain:
 - a strategic angle;
@@ -1030,8 +1073,11 @@ All user-facing copy must be in ${languageName}. Every concept must contain:
 - north_star_story as an optional ambitious idea. Use an empty string when it adds no value. This is inspiration only and must never be required for the stock clip to succeed.
 
 For stock_simple, one continuous stock clip must be sufficient. For stock_montage, describe 2–4 independently searchable shots that can be cut together. For experimental_wildcard, allow an emotionally defensible contrast or pattern interrupt, but keep the stock treatment findable. The story field explains the ad idea, but must not imply that every beat will appear in the selected footage. Avoid generic playlist clichés and duplicate angles. Each concept needs a concrete human moment and a testable hypothesis.`;
-  const user = `Analyze this playlist snapshot and create the creative brief and concept portfolio. The primary ad format is ${project.format}. Treat creative_notes as optional campaign direction, never as factual playlist metadata.\n\n${JSON.stringify(source)}`;
+  const user = cachedBrief
+    ? `Use the cached playlist analysis below and create only a fresh concept portfolio. Do not repeat the playlist analysis. The primary ad format is ${project.format}. Treat creative_notes as optional campaign direction.\n\n${JSON.stringify({ cached_playlist_analysis: cachedBrief, ...source })}`
+    : `Analyze this playlist snapshot and create the creative brief and concept portfolio. The primary ad format is ${project.format}. Treat creative_notes as optional campaign direction, never as factual playlist metadata.\n\n${JSON.stringify(source)}`;
   try {
+    const model = process.env.OPENAI_MODEL || "gpt-5.6";
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       signal: controller.signal,
@@ -1040,20 +1086,21 @@ For stock_simple, one continuous stock clip must be sufficient. For stock_montag
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: process.env.OPENAI_MODEL || "gpt-5.6",
+        model,
         input: [{ role: "system", content: system }, { role: "user", content: user }],
         reasoning: { effort: "low" },
         text: {
           verbosity: "low",
-          format: { type: "json_schema", name: "playlist_creative_brief", strict: true, schema: creativeBriefSchema() },
+          format: { type: "json_schema", name: cachedBrief ? "playlist_creative_concepts" : "playlist_creative_brief", strict: true, schema: cachedBrief ? creativeConceptPortfolioSchema() : creativeBriefSchema() },
         },
-        max_output_tokens: 8000,
+        max_output_tokens: cachedBrief ? 6500 : 8000,
+        prompt_cache_key: "playlistpilot-creative-strategy-v1",
         store: false,
       }),
     });
     const parsed = await parseJsonSafe(response);
     if (!response.ok) throw new Error(`openai_${response.status}: ${parsed.json?.error?.message || parsed.text.slice(0, 500)}`);
-    return JSON.parse(extractOpenAIText(parsed.json));
+    return { generated: { brief: cachedBrief, ...JSON.parse(extractOpenAIText(parsed.json)) }, payload: parsed.json, model };
   } finally {
     clearTimeout(timeout);
   }
@@ -1220,28 +1267,30 @@ Format: ${project.format}`,
   }];
   for (const candidate of candidates) {
     content.push({ type: "input_text", text: `Candidate video_id=${candidate.id}; duration=${candidate.duration}s; dimensions=${candidate.source_width}x${candidate.source_height}. The following images are preview frames from this candidate.` });
-    for (const imageUrl of (candidate.preview_images?.length ? candidate.preview_images : [candidate.image]).filter(Boolean).slice(0, 3)) {
+    for (const imageUrl of (candidate.preview_images?.length ? candidate.preview_images : [candidate.image]).filter(Boolean).slice(0, 2)) {
       content.push({ type: "input_image", image_url: imageUrl, detail: "low" });
     }
   }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 110000);
   try {
+    const model = process.env.OPENAI_VISION_MODEL || "gpt-5.4-mini";
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       signal: controller.signal,
       headers: { Authorization: `Bearer ${need("OPENAI_API_KEY")}`, "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || "gpt-5.6",
+        model,
         input: [{ role: "user", content }],
+        reasoning: { effort: "low" },
         text: { format: { type: "json_schema", name: "creative_media_recommendations", strict: true, schema: creativeMediaRecommendationSchema(candidates.map((candidate) => candidate.id)) } },
-        max_output_tokens: 3500,
+        max_output_tokens: 2200,
         store: false,
       }),
     });
     const parsed = await parseJsonSafe(response);
     if (!response.ok) throw new Error(`openai_${response.status}: ${parsed.json?.error?.message || parsed.text.slice(0, 500)}`);
-    return JSON.parse(extractOpenAIText(parsed.json));
+    return { ranked: JSON.parse(extractOpenAIText(parsed.json)), payload: parsed.json, model, imageCount: content.filter((item) => item.type === "input_image").length };
   } finally {
     clearTimeout(timeout);
   }
@@ -1294,22 +1343,23 @@ Creative DNA: ${JSON.stringify(concept.creative_dna || job.render_spec?.creative
 Format: ${job.render_spec?.editor?.format || "9:16"}
 Rendered asset: ${asset.source_url}`,
   }];
-  frameUrls.slice(0, 4).forEach((url) => content.push({ type: "input_image", image_url: url, detail: "high" }));
-  const model = process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || "gpt-5.6";
+  frameUrls.slice(0, 2).forEach((url) => content.push({ type: "input_image", image_url: url, detail: "low" }));
+  const model = process.env.OPENAI_VISION_MODEL || "gpt-5.4-mini";
   const response = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: { Authorization: `Bearer ${need("OPENAI_API_KEY")}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model,
       input: [{ role: "user", content }],
+      reasoning: { effort: "low" },
       text: { format: { type: "json_schema", name: "creative_render_quality", strict: true, schema: creativeRenderQaSchema() } },
-      max_output_tokens: 3000,
+      max_output_tokens: 1800,
       store: false,
     }),
   });
   const parsed = await parseJsonSafe(response);
   if (!response.ok) throw new Error(`openai_${response.status}: ${parsed.json?.error?.message || parsed.text.slice(0, 500)}`);
-  return { model, report: JSON.parse(extractOpenAIText(parsed.json)) };
+  return { model, report: JSON.parse(extractOpenAIText(parsed.json)), payload: parsed.json, imageCount: Math.min(2, frameUrls.length) };
 }
 
 async function loadOwnedCreativeConcept(conceptId, connectionId, bubbleUserId) {
@@ -3373,6 +3423,13 @@ const routes = {
     const now = new Date().toISOString();
     const batchLabel = new Intl.DateTimeFormat("en-GB", { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", timeZone: "Europe/Berlin" }).format(new Date());
     const projectName = `${String(body.name || playlist.name || "Playlist").slice(0, 90)} · Batch ${batchLabel}`.slice(0, 120);
+    const previousProjectsResponse = await sb(
+      `/rest/v1/meta_creative_projects?select=id,brief&playlist_id=eq.${encodeURIComponent(playlist.id)}` +
+      `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&order=created_at.desc&limit=10`
+    );
+    const previousProjects = previousProjectsResponse.ok ? await previousProjectsResponse.json().catch(() => []) : [];
+    const cachedAnalysisProject = previousProjects.find((item) => item.brief?.mood_summary && item.brief?.audience_summary);
+    const cachedAnalysis = cachedAnalysisProject?.brief || {};
     const projectResponse = await sb(`/rest/v1/meta_creative_projects`, {
       method: "POST",
       headers: { Prefer: "return=representation" },
@@ -3386,6 +3443,17 @@ const routes = {
         status: "brief_pending",
         current_step: 1,
         brief: {
+          ...(cachedAnalysisProject ? {
+            title: cachedAnalysis.title || playlist.name || "",
+            description: cachedAnalysis.description || "",
+            mood_summary: cachedAnalysis.mood_summary || "",
+            audience_summary: cachedAnalysis.audience_summary || "",
+            use_cases: cachedAnalysis.use_cases || [],
+            core_angles: cachedAnalysis.core_angles || [],
+            extracted_artists: cachedAnalysis.extracted_artists || [],
+            extracted_tracks: cachedAnalysis.extracted_tracks || [],
+            cached_analysis_source_project_id: cachedAnalysisProject.id,
+          } : {}),
           playlist_name: playlist.name || "",
           spotify_playlist_id: playlist.playlist_id || "",
           cover_image: playlist.image || "",
@@ -4158,7 +4226,16 @@ const routes = {
     });
 
     try {
-      const generated = await generateCreativeBriefWithOpenAI({ project, playlist, tracks });
+      const generation = await generateCreativeBriefWithOpenAI({ project, playlist, tracks });
+      const generated = generation.generated;
+      await recordOpenAIUsage({
+        bubbleUserId: ctx.bubble_user_id,
+        projectId: project.id,
+        operation: project.brief?.mood_summary ? "creative_concepts_cached_analysis" : "creative_brief_and_concepts",
+        model: generation.model,
+        payload: generation.payload,
+        metadata: { cached_playlist_analysis: Boolean(project.brief?.mood_summary) },
+      });
       if (!Array.isArray(generated.concepts) || generated.concepts.length !== 8) throw new Error("openai_invalid_concept_count");
       const expectedProductionTypes = [...Array(6).fill("stock_simple"), "stock_montage", "experimental_wildcard"];
       if (generated.concepts.some((concept, index) => concept.production_type !== expectedProductionTypes[index])) {
@@ -4308,9 +4385,20 @@ const routes = {
         const usefulDuration = video.duration >= 5 && video.duration <= 30;
         if (portraitEnough && usefulDuration && !unique.has(video.id)) unique.set(video.id, video);
       });
-      const candidates = [...unique.values()].slice(0, 12);
+      const candidates = [...unique.values()].slice(0, 6);
       if (!candidates.length) return bad(res, 404, "no_suitable_pexels_videos");
-      const ranked = await recommendCreativeMediaWithOpenAI({ concept: owned.concept, project: owned.project, candidates });
+      const recommendation = await recommendCreativeMediaWithOpenAI({ concept: owned.concept, project: owned.project, candidates });
+      const ranked = recommendation.ranked;
+      await recordOpenAIUsage({
+        bubbleUserId: ctx.bubble_user_id,
+        projectId: owned.project.id,
+        conceptId: owned.concept.id,
+        operation: "creative_media_ranking",
+        model: recommendation.model,
+        payload: recommendation.payload,
+        imageCount: recommendation.imageCount,
+        metadata: { candidates: candidates.length, queries: queries.length },
+      });
       const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
       const recommendations = (ranked.recommendations || []).map((recommendation) => {
         const video = byId.get(String(recommendation.video_id));
@@ -4321,7 +4409,7 @@ const routes = {
         inspected: candidates.length,
         recommendations,
         rate_limit: { remaining: searches.map((search) => search.remaining).filter(Boolean).at(-1) || null, reset: searches.map((search) => search.reset).filter(Boolean).at(-1) || null },
-        model: process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || "gpt-5.6",
+        model: recommendation.model,
       });
     } catch (error) {
       return bad(res, 502, String(error?.name === "AbortError" ? "creative_media_recommendation_timed_out" : error?.message || error).slice(0, 1000));
@@ -4690,6 +4778,16 @@ const routes = {
     if (!pendingResponse.ok) return bad(res, 500, "creative_render_quality_save_failed");
     try {
       const analyzed = await analyzeCreativeRenderWithOpenAI({ job, asset, concept, frameUrls });
+      await recordOpenAIUsage({
+        bubbleUserId: ctx.bubble_user_id,
+        projectId: project.id,
+        conceptId: concept.id,
+        renderJobId: job.id,
+        operation: "creative_render_qa",
+        model: analyzed.model,
+        payload: analyzed.payload,
+        imageCount: analyzed.imageCount,
+      });
       const report = analyzed.report;
       const status = !report.technical_pass ? "failed" : (!report.creative_pass || report.overall_score < 75 ? "warning" : "passed");
       const updateResponse = await sb(`/rest/v1/meta_creative_render_quality_reports?render_job_id=eq.${encodeURIComponent(job.id)}`, {

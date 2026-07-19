@@ -3132,39 +3132,6 @@ export default function PlaylistManager() {
       const failed = latestJobs.filter((job) => ["failed", "cancelled"].includes(job.status)).length;
       setCampaignGeneration({ batch_id: batchId, stage: "rendering", completed, total, failed });
       if (latestJobs.length === concepts.length && completed + failed >= concepts.length) {
-        const pendingQaJobs = latestJobs.filter((job) =>
-          job.status === "completed" &&
-          !(Array.isArray(job.meta_creative_render_quality_reports)
-            ? job.meta_creative_render_quality_reports.length
-            : job.meta_creative_render_quality_reports)
-        );
-        if (pendingQaJobs.length) {
-          await setCampaignBatchStatus(batchId, "rendering", { stage: "quality", completed: 0, total: pendingQaJobs.length, failed: 0 });
-          setCampaignGeneration({ batch_id: batchId, stage: "quality", completed: 0, total: pendingQaJobs.length, failed: 0 });
-          let qaCursor = 0;
-          let qaCompleted = 0;
-          let qaFailed = 0;
-          const qaWorker = async () => {
-            while (qaCursor < pendingQaJobs.length) {
-              const qaJob = pendingQaJobs[qaCursor];
-              qaCursor += 1;
-              try {
-                await api("/api/meta/creative-renders/quality", {
-                  method: "POST",
-                  accessToken: accessToken(),
-                  body: { render_job_id: qaJob.id },
-                });
-                qaCompleted += 1;
-              } catch {
-                qaFailed += 1;
-              }
-              const qaProgress = { stage: "quality", completed: qaCompleted, total: pendingQaJobs.length, failed: qaFailed };
-              setCampaignGeneration({ batch_id: batchId, ...qaProgress });
-              await setCampaignBatchStatus(batchId, "rendering", qaProgress).catch(() => null);
-            }
-          };
-          await Promise.all([qaWorker(), qaWorker()]);
-        }
         await setCampaignBatchStatus(batchId, "review", { stage: "review", completed, total, failed });
         await loadCampaignCreativeBatches(metaDraftForm.playlist_id);
         setCampaignGeneration({ batch_id: batchId, stage: "review", completed, total, failed });
@@ -3278,9 +3245,25 @@ export default function PlaylistManager() {
     });
   }
 
-  async function reviewCampaignCreative(batchId, conceptId, decision) {
+  async function reviewCampaignCreative(batch, concept, decision) {
     await run(decision === "approved" ? "Creative approved" : "Creative rejected", async () => {
-      await api("/api/meta/campaign-creative-reviews", { method: "POST", accessToken: accessToken(), body: { batch_id: batchId, concept_id: conceptId, decision } });
+      await api("/api/meta/campaign-creative-reviews", { method: "POST", accessToken: accessToken(), body: { batch_id: batch.id, concept_id: concept.id, decision } });
+      if (decision === "approved") {
+        const renders = batch.meta_creative_projects?.meta_creative_render_jobs || [];
+        const render = renders
+          .filter((item) => item.concept_id === concept.id && item.status === "completed")
+          .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0];
+        const hasQuality = Array.isArray(render?.meta_creative_render_quality_reports)
+          ? render.meta_creative_render_quality_reports.length > 0
+          : Boolean(render?.meta_creative_render_quality_reports);
+        if (render?.id && !hasQuality) {
+          await api("/api/meta/creative-renders/quality", {
+            method: "POST",
+            accessToken: accessToken(),
+            body: { render_job_id: render.id },
+          });
+        }
+      }
       return loadCampaignCreativeBatches(metaDraftForm.playlist_id);
     });
   }
@@ -4908,8 +4891,8 @@ export default function PlaylistManager() {
                               <dl>{creativeDna.map((item) => <div key={item.label}><dt>{item.label}</dt><dd>{item.value}</dd></div>)}</dl>
                             </details> : null}
                             <div className="campaignReviewActions">
-                              <button className={decision === "approved" ? "active" : ""} disabled={busy || !outputAsset?.source_url} onClick={() => reviewCampaignCreative(batch.id, concept.id, "approved")}>Approve</button>
-                              <button className={decision === "rejected" ? "active" : "secondary"} disabled={busy} onClick={() => reviewCampaignCreative(batch.id, concept.id, "rejected")}>Reject</button>
+                              <button className={decision === "approved" ? "active" : ""} disabled={busy || !outputAsset?.source_url} onClick={() => reviewCampaignCreative(batch, concept, "approved")}>Approve{decision !== "approved" && !quality ? " + QA" : ""}</button>
+                              <button className={decision === "rejected" ? "active" : "secondary"} disabled={busy} onClick={() => reviewCampaignCreative(batch, concept, "rejected")}>Reject</button>
                               <button className="secondary" disabled={busy} onClick={() => regenerateCampaignCreative(batch, concept)}>Regenerate</button>
                               <button className="secondary" onClick={() => { setOpenCreativeProjectId(project.id); openAdsSection("creatives"); }}>Edit</button>
                             </div>
