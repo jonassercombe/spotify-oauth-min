@@ -3206,7 +3206,7 @@ const routes = {
 
     const existingResponse = await sb(`/rest/v1/meta_creative_concepts?select=*&project_id=eq.${encodeURIComponent(project.id)}&order=position.asc`);
     const existing = existingResponse.ok ? await existingResponse.json().catch(() => []) : [];
-    if (existing.length >= 8 && project.brief?.mood_summary) {
+    if (existing.length >= 8 && project.brief?.mood_summary && body.force !== true) {
       return json(res, 200, { project, concepts: existing, reused: true });
     }
 

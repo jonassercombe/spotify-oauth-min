@@ -2185,13 +2185,13 @@ export default function PlaylistManager() {
     });
   }
 
-  async function generateCreativeProject(projectId) {
+  async function generateCreativeProject(projectId, force = false) {
     setOpenCreativeProjectId(projectId);
-    await run("Creative brief and concepts generated", async () => {
+    await run(force ? "Creative concepts rebuilt" : "Creative brief and concepts generated", async () => {
       await api("/api/meta/creative-projects/generate", {
         method: "POST",
         accessToken: accessToken(),
-        body: { project_id: projectId },
+        body: { project_id: projectId, force },
       });
       return loadCreativeProjects();
     });
@@ -3730,7 +3730,7 @@ export default function PlaylistManager() {
                     <button onClick={() => setOpenCreativeProjectId(isOpen ? "" : project.id)}>{isOpen ? "Close" : "Open project"}</button>
                   </div>
                   {isOpen ? <div className="creativeProjectDetail">
-                    {hasBrief ? <div className="creativeBriefPanel"><span>Creative brief</span><h3>{project.brief.title || project.name}</h3><p>{project.brief.mood_summary}</p><p>{project.brief.audience_summary}</p><div>{(project.brief.core_angles || []).map((angle) => <b key={angle}>{angle}</b>)}</div></div> : <div className="creativeEmptyState"><strong>Ready to analyze</strong><p>PlaylistPilot will read the local playlist snapshot and create a brief plus eight testable concepts.</p><button disabled={busy} onClick={() => generateCreativeProject(project.id)}>{project.status === "error" ? "Retry generation" : "Generate brief & concepts"}</button>{project.last_error ? <small>{project.last_error}</small> : null}</div>}
+                    {hasBrief ? <div className="creativeBriefPanel"><span>Creative brief</span><h3>{project.brief.title || project.name}</h3><p>{project.brief.mood_summary}</p><p>{project.brief.audience_summary}</p><div>{(project.brief.core_angles || []).map((angle) => <b key={angle}>{angle}</b>)}</div><button className="secondary" disabled={busy} onClick={() => generateCreativeProject(project.id, true)}>Rebuild 6+1+1 concepts</button></div> : <div className="creativeEmptyState"><strong>Ready to analyze</strong><p>PlaylistPilot will read the local playlist snapshot and create a brief plus eight testable concepts.</p><button disabled={busy} onClick={() => generateCreativeProject(project.id)}>{project.status === "error" ? "Retry generation" : "Generate brief & concepts"}</button>{project.last_error ? <small>{project.last_error}</small> : null}</div>}
                     {concepts.length ? <section className="creativeMediaAutomation">
                       <div className="creativeBatchHeader"><div><span>AI media director</span><h3>Find matching video for every concept</h3><p>Two searches and multi-frame Vision scoring per concept, with duplicate clips avoided across the project.</p></div><button className="aiMediaButton" disabled={busy || projectMediaRun?.status === "running"} onClick={() => recommendProjectMedia(project)}>{projectMediaRun?.status === "running" ? `Reviewing ${projectMediaRun.completed}/${projectMediaRun.total}…` : projectMediaRun?.status === "review" ? "Regenerate all" : `Generate media for all ${concepts.length}`}</button></div>
                       {projectMediaRun ? <div className="creativeProjectMediaProgress"><div><span style={{ width: `${Math.round((projectMediaRun.completed / Math.max(1, projectMediaRun.total)) * 100)}%` }} /></div><small>{projectMediaRun.status === "running" ? "Pexels search and visual ranking are running with two concurrent jobs." : `${projectMediaResults.length} concepts ready for review${projectMediaRun.errors?.length ? ` · ${projectMediaRun.errors.length} failed` : ""}`}</small></div> : null}
