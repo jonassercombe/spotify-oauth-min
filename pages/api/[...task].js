@@ -4,6 +4,7 @@ export const config = { api: { bodyParser: false } };
 import Stripe from "stripe";
 import { createHash, randomUUID } from "crypto";
 import { createClient } from "@supabase/supabase-js";
+import { buildCreativeDeck, serendipityPexelsQuery } from "../../lib/creativeDeck";
 
 /* ==============================
    Shared Utils (Server-only)
@@ -1069,7 +1070,7 @@ function extractOpenAIText(payload) {
   throw new Error(`openai_empty_response: ${payload?.status || "unknown"}`);
 }
 
-async function generateCreativeBriefWithOpenAI({ project, playlist, tracks, priorConcepts = [] }) {
+async function generateCreativeBriefWithOpenAI({ project, playlist, tracks, priorConcepts = [], creativeDeck }) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 72000);
   const languageName = project.language === "de" ? "German" : "English";
@@ -1090,6 +1091,7 @@ async function generateCreativeBriefWithOpenAI({ project, playlist, tracks, prio
     creative_notes: String(project.brief?.creative_notes || "").slice(0, 2000),
     novelty_mode: String(project.brief?.novelty_mode || "balanced"),
     creative_memory: priorConcepts.slice(0, 32).map(creativeMemoryItem),
+    creative_deck: creativeDeck,
   };
   const cachedBrief = project.brief?.mood_summary ? {
     title: project.brief.title,
@@ -1102,7 +1104,9 @@ async function generateCreativeBriefWithOpenAI({ project, playlist, tracks, prio
     extracted_artists: project.brief.extracted_artists,
     extracted_tracks: project.brief.extracted_tracks,
   } : null;
-  const system = `You are a performance creative strategist for paid social ads promoting Spotify playlists. ${cachedBrief ? "Use the supplied cached playlist analysis and create" : "Create one evidence-based playlist brief and"} exactly eight materially different short-form concepts in this exact production portfolio and order: concepts 1–6 production_type=stock_simple, concept 7 production_type=stock_montage, concept 8 production_type=experimental_wildcard.
+  const system = `You are a performance creative strategist for paid social ads promoting Spotify playlists. ${cachedBrief ? "Use the supplied cached playlist analysis and create" : "Create one evidence-based playlist brief and"} exactly eight materially different short-form concepts. Keep concepts 1–6 easy to execute with one stock clip, concept 7 suitable for a small stock montage, and concept 8 open to an experimental wildcard.
+
+The supplied creative_deck contains one randomly drawn recipe per slot. Treat each recipe as a creative provocation, not a checklist: combine, bend or deliberately subvert its mechanism, visual world, copy voice, footage strategy and typography when a stronger idea appears. risk_level describes permission, not a mandatory degree of weirdness. serendipity_words are optional lateral-search sparks; they may inspire a surprising connection but never need to appear literally. Preserve production feasibility, but do not make all eight concepts obey one formula.
 
 All user-facing copy must be in ${languageName}. Every concept must contain:
 - a strategic angle;
@@ -1117,7 +1121,7 @@ All user-facing copy must be in ${languageName}. Every concept must contain:
 
 Creative range is a primary quality criterion, not an optional embellishment. First derive a concise creative_world from the playlist name, description and cover-art presence: a memorable metaphorical universe that can inspire visual jokes, playful language and visual search. A distinctive name such as “Indie Music From Another Planet” should yield a world such as “ordinary life, slightly extraterrestrial”, rather than being reduced to generic listening footage. For a name with a rich metaphorical world, at least 3 of the 8 concepts must explore that world through three different mechanisms (for example: a witty line, an uncanny everyday object, a cinematic environment, or a visual contrast). These must remain Pexels-findable; do not require literal CGI or a full sci-fi storyline.
 
-Across the eight concepts, use at least 2 non-human-first visual subjects (object, texture, light, landscape, architecture, machine, food, signage or abstract motion) and at least 1 playful or humorous hook. A person wearing headphones is allowed but must not be the default visual answer, and must appear as the primary subject in no more than 4 concepts. Prefer metaphor, visual tension, odd specificity, pattern interruption and surprising but defensible pairings over generic “night city / person listening to music” footage. Search queries must expose the actual distinct visual idea, not merely the playlist's mood.
+Across the eight concepts, seek genuine range. A person wearing headphones is allowed but must not be the default visual answer. Prefer metaphor, visual tension, odd specificity, pattern interruption and surprising but defensible pairings over generic “night city / person listening to music” footage. Search queries should expose the distinct visual idea, while leaving room for lateral discoveries.
 
 For stock_simple, one continuous stock clip must be sufficient. For stock_montage, describe 2–4 independently searchable shots that can be cut together. For experimental_wildcard, allow an emotionally defensible contrast or pattern interrupt, but keep the stock treatment findable. The story field explains the ad idea, but must not imply that every beat will appear in the selected footage. Avoid generic playlist clichés and duplicate angles. Never use follower counts, track counts, positions, or other playlist metadata numbers as hooks or turn them into metaphors. Each concept needs a concrete human, sensory or visual moment and a testable hypothesis.`;
   const user = cachedBrief
@@ -1347,6 +1351,7 @@ async function recommendCreativeMediaWithOpenAI({ concept, project, candidates }
     ? concept.production_type
     : "stock_simple";
   const criteria = Array.isArray(concept.footage_criteria) ? concept.footage_criteria.filter(Boolean).slice(0, 7) : [];
+  const creativeRecipe = concept.render_spec?.creative_deck || {};
   const content = [{
     type: "input_text",
     text: `Act as a performance creative director selecting executable Pexels footage, not as a literal storyboard checker. Select up to six diverse candidates and rank the strongest first.
@@ -1363,10 +1368,11 @@ Executable treatment: ${concept.visual_direction}
 Visible footage criteria:
 ${criteria.map((criterion, index) => `${index + 1}. ${criterion}`).join("\n") || "No explicit criteria supplied; judge only the executable treatment."}
 Optional North-Star story (do not match literally): ${concept.north_star_story || "None"}
+Random creative provocation: ${JSON.stringify(creativeRecipe)}
 Format: ${project.format}`,
   }];
   for (const candidate of candidates) {
-    content.push({ type: "input_text", text: `Candidate video_id=${candidate.id}; duration=${candidate.duration}s; dimensions=${candidate.source_width}x${candidate.source_height}. The following images are preview frames from this candidate.` });
+    content.push({ type: "input_text", text: `Candidate video_id=${candidate.id}; duration=${candidate.duration}s; dimensions=${candidate.source_width}x${candidate.source_height}; discovered_by_query=${candidate.search_query || "unknown"}. The following images are preview frames from this candidate. A lateral-search candidate may win through an original, defensible association even when it is not literal.` });
     for (const imageUrl of (candidate.preview_images?.length ? candidate.preview_images : [candidate.image]).filter(Boolean).slice(0, 1)) {
       content.push({ type: "input_image", image_url: imageUrl, detail: "low" });
     }
@@ -4340,7 +4346,8 @@ const routes = {
     });
 
     try {
-      const generation = await generateCreativeBriefWithOpenAI({ project, playlist, tracks, priorConcepts });
+      const creativeDeck = buildCreativeDeck(`${project.id}:${Date.now()}:${randomUUID()}`, 8);
+      const generation = await generateCreativeBriefWithOpenAI({ project, playlist, tracks, priorConcepts, creativeDeck });
       const generated = generation.generated;
       await recordOpenAIUsage({
         bubbleUserId: ctx.bubble_user_id,
@@ -4348,7 +4355,7 @@ const routes = {
         operation: project.brief?.mood_summary ? "creative_concepts_cached_analysis" : "creative_brief_and_concepts",
         model: generation.model,
         payload: generation.payload,
-        metadata: { cached_playlist_analysis: Boolean(project.brief?.mood_summary), memory_concepts: priorConcepts.length },
+        metadata: { cached_playlist_analysis: Boolean(project.brief?.mood_summary), memory_concepts: priorConcepts.length, creative_deck_seed: creativeDeck.seed },
       });
       if (!Array.isArray(generated.concepts) || generated.concepts.length !== 8) throw new Error("openai_invalid_concept_count");
       const expectedProductionTypes = [...Array(6).fill("stock_simple"), "stock_montage", "experimental_wildcard"];
@@ -4453,6 +4460,7 @@ const routes = {
           novelty_score: Number(concept.novelty_score || 0),
           novelty_mode: noveltyMode,
           memory_concepts: priorConcepts.length,
+          creative_deck: creativeDeck.recipes[index],
         },
         updated_at: now,
       }));
@@ -4549,9 +4557,16 @@ const routes = {
     if (!owned) return bad(res, 404, "creative_concept_not_found");
 
     const requestedQuery = String(body.query || "").replace(/\s+/g, " ").trim().slice(0, 120);
-    const queries = [requestedQuery, ...(owned.concept.visual_search_terms || []), owned.concept.visual_direction]
+    const creativeRecipe = owned.concept.render_spec?.creative_deck || {};
+    const lateralQuery = serendipityPexelsQuery(creativeRecipe, `${owned.project.id}:${owned.concept.id}:${Date.now()}`);
+    const useLateralSearch = Math.random() < 0.45;
+    const directedQueries = [requestedQuery, ...(owned.concept.visual_search_terms || []), owned.concept.visual_direction]
       .map((value) => String(value || "").replace(/\s+/g, " ").trim().slice(0, 120))
-      .filter((value, index, values) => value.length >= 2 && values.indexOf(value) === index)
+      .filter((value, index, values) => value.length >= 2 && values.indexOf(value) === index);
+    const queries = (useLateralSearch
+      ? [directedQueries[0], lateralQuery, ...directedQueries.slice(1)]
+      : directedQueries)
+      .filter((value, index, values) => value?.length >= 2 && values.indexOf(value) === index)
       .slice(0, 2);
     if (!queries.length) queries.push("people listening music");
 
@@ -4569,8 +4584,16 @@ const routes = {
       const usedVideoIds = new Set(usedAssetsResponse?.ok
         ? (await usedAssetsResponse.json().catch(() => [])).map((item) => String(item.provider_id || "")).filter(Boolean)
         : []);
+      const interleavedVideos = [];
+      const longestSearch = Math.max(0, ...searches.map((search) => search.videos.length));
+      for (let index = 0; index < longestSearch; index += 1) {
+        searches.forEach((search, searchIndex) => {
+          const video = search.videos[index];
+          if (video) interleavedVideos.push({ ...video, search_query: queries[searchIndex] });
+        });
+      }
       const unique = new Map();
-      searches.flatMap((search) => search.videos).forEach((video) => {
+      interleavedVideos.forEach((video) => {
         const portraitEnough = video.source_height >= video.source_width;
         const usefulDuration = video.duration >= 5 && video.duration <= 30;
         if (portraitEnough && usefulDuration && !unique.has(video.id)) unique.set(video.id, video);
@@ -4591,7 +4614,7 @@ const routes = {
         model: recommendation.model,
         payload: recommendation.payload,
         imageCount: recommendation.imageCount,
-        metadata: { candidates: candidates.length, queries: queries.length, excluded_recent_video_ids: usedVideoIds.size },
+        metadata: { candidates: candidates.length, queries: queries.length, excluded_recent_video_ids: usedVideoIds.size, lateral_search: useLateralSearch, lateral_query: useLateralSearch ? lateralQuery : null },
       });
       const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
       const recommendations = (ranked.recommendations || []).map((recommendation) => {
@@ -4600,6 +4623,7 @@ const routes = {
       }).filter(Boolean);
       return json(res, 200, {
         queries,
+        search_mode: useLateralSearch ? "directed_plus_serendipity" : "directed",
         inspected: candidates.length,
         recommendations,
         rate_limit: { remaining: searches.map((search) => search.remaining).filter(Boolean).at(-1) || null, reset: searches.map((search) => search.reset).filter(Boolean).at(-1) || null },
