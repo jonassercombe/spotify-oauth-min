@@ -3173,6 +3173,7 @@ export default function PlaylistManager() {
         await setCampaignBatchStatus(created.batch.id, "media", { stage: "media", completed: 0, total: 8 });
         setCampaignGeneration({ batch_id: created.batch.id, stage: "media", completed: 0, total: 8, failed: 0 });
         const usedVideoIds = new Set();
+        const usedVisualSignatures = new Set();
         const prepared = [];
         let cursor = 0;
         const mediaWorker = async () => {
@@ -3186,23 +3187,38 @@ export default function PlaylistManager() {
               body: { concept_id: concept.id, query },
             });
             const recommendations = media.recommendations || [];
-            const video = recommendations.find((item) => item.ai?.production_ready && !usedVideoIds.has(item.id))
+            const signature = (item) => String(item?.ai?.visual_signature || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+            const isDistinct = (item) => {
+              const value = signature(item);
+              if (!value) return true;
+              return ![...usedVisualSignatures].some((used) => used === value || used.includes(value) || value.includes(used));
+            };
+            const video = recommendations.find((item) => item.ai?.production_ready && !usedVideoIds.has(item.id) && isDistinct(item))
+              || recommendations.find((item) => !usedVideoIds.has(item.id) && isDistinct(item))
+              || recommendations.find((item) => item.ai?.production_ready && !usedVideoIds.has(item.id))
               || recommendations.find((item) => !usedVideoIds.has(item.id))
               || recommendations[0];
             if (!video) throw new Error(`No usable footage found for ${concept.title}.`);
             usedVideoIds.add(video.id);
+            if (signature(video)) usedVisualSignatures.add(signature(video));
             const selected = await api("/api/meta/creative-media/select", {
               method: "POST",
               accessToken: accessToken(),
               body: { concept_id: concept.id, provider_id: video.id, source_url: video.source_url, width: video.source_width, height: video.source_height, duration: video.duration, image: video.image, pexels_url: video.url, creator_name: video.user?.name, creator_url: video.user?.url, query, ai: video.ai || null },
             });
-            prepared.push({ concept, video, asset: selected.asset });
+            prepared.push({ concept: selected.concept || concept, video, asset: selected.asset });
             setCampaignGeneration((current) => ({ ...(current || {}), batch_id: created.batch.id, stage: "media", completed: prepared.length, total: 8, failed: 0 }));
             await setCampaignBatchStatus(created.batch.id, "media", { stage: "media", completed: prepared.length, total: 8 });
           }
         };
         await Promise.all([mediaWorker(), mediaWorker()]);
+        prepared.sort((left, right) => Number(left.concept.position || 0) - Number(right.concept.position || 0));
         const snippets = campaignAudioMasters.flatMap((master) => master.meta_audio_snippets || []).filter((snippet) => (metaDraftForm.audio_snippet_ids || []).includes(snippet.id));
+        const contextLabelConceptId = prepared.find(({ concept }, index) => {
+          const templateId = concept.production_type === "stock_montage" ? "editorial_top" : concept.production_type === "experimental_wildcard" ? "bold_center" : CREATIVE_RENDER_TEMPLATES[index % CREATIVE_RENDER_TEMPLATES.length].id;
+          return templateId === "editorial_top";
+        })?.concept.id;
+        const revealStyles = ["center_stack", "side_lockup", "compact_corner"];
         for (let index = 0; index < prepared.length; index += 1) {
           const { concept, video, asset } = prepared[index];
           const snippet = snippets.length ? snippets[index % snippets.length] : null;
@@ -3227,6 +3243,8 @@ export default function PlaylistManager() {
               overlay_opacity: 0.28,
               show_cover: true,
               show_cta: true,
+              show_context_label: concept.id === contextLabelConceptId,
+              reveal_style: revealStyles[index % revealStyles.length],
               audio_snippet_id: snippet?.id || null,
             },
           });

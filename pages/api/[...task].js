@@ -1059,6 +1059,12 @@ function normalizeGeneratedHookCandidates(concept = {}) {
   return { candidates, chosenHook: ranked[0].text };
 }
 
+function normalizeOverlayHook(value) {
+  const words = String(value || "").replace(/\s+/g, " ").trim().split(" ").filter(Boolean).slice(0, 6);
+  while (words.join(" ").length > 44 && words.length > 1) words.pop();
+  return words.join(" ");
+}
+
 function extractOpenAIText(payload) {
   if (typeof payload?.output_text === "string" && payload.output_text.trim()) return payload.output_text;
   for (const item of payload?.output || []) {
@@ -1106,7 +1112,7 @@ async function generateCreativeBriefWithOpenAI({ project, playlist, tracks, prio
   } : null;
   const system = `You are a performance creative strategist for paid social ads promoting Spotify playlists. ${cachedBrief ? "Use the supplied cached playlist analysis and create" : "Create one evidence-based playlist brief and"} exactly eight materially different short-form concepts. Keep concepts 1–6 easy to execute with one stock clip, concept 7 suitable for a small stock montage, and concept 8 open to an experimental wildcard.
 
-The supplied creative_deck contains one randomly drawn recipe per slot. Treat each recipe as a creative provocation, not a checklist: combine, bend or deliberately subvert its mechanism, visual world, copy voice, footage strategy and typography when a stronger idea appears. risk_level describes permission, not a mandatory degree of weirdness. serendipity_words are optional lateral-search sparks; they may inspire a surprising connection but never need to appear literally. Preserve production feasibility, but do not make all eight concepts obey one formula.
+The supplied creative_deck contains one randomly drawn recipe per slot. Treat each recipe as a creative provocation, not a checklist: combine, bend or deliberately subvert its mechanism, visual world, copy voice, footage strategy and typography when a stronger idea appears. risk_level describes permission, not a mandatory degree of weirdness. serendipity_words are optional lateral-search sparks; they may inspire a surprising connection but never need to appear literally. Preserve production feasibility, but do not make all eight concepts obey one formula. For workflow=footage_first, create only a broad strategic territory and a provisional hook: the actual Pexels discovery is allowed to rewrite its hook, title and executable treatment later.
 
 All user-facing copy must be in ${languageName}. Every concept must contain:
 - a strategic angle;
@@ -1322,7 +1328,7 @@ function creativeMediaRecommendationSchema(candidateIds) {
         items: {
           type: "object",
           additionalProperties: false,
-          required: ["video_id", "creative_mode", "match_type", "overall_score", "concept_match", "scroll_stop", "originality", "hook_space", "visual_quality", "vertical_suitability", "brand_safety", "production_ready", "rejection_reason", "best_template", "summary"],
+          required: ["video_id", "creative_mode", "match_type", "overall_score", "concept_match", "scroll_stop", "originality", "hook_space", "visual_quality", "vertical_suitability", "brand_safety", "production_ready", "rejection_reason", "best_template", "visual_signature", "adapted_hook", "adapted_title", "adapted_treatment", "summary"],
           properties: {
             video_id: { type: "string", enum: candidateIds },
             creative_mode: { type: "string", enum: ["safe", "creative", "wildcard"] },
@@ -1338,6 +1344,10 @@ function creativeMediaRecommendationSchema(candidateIds) {
             production_ready: { type: "boolean" },
             rejection_reason: { type: "string", maxLength: 180 },
             best_template: { type: "string", enum: ["bold_center", "editorial_top", "minimal_bottom"] },
+            visual_signature: { type: "string", maxLength: 100 },
+            adapted_hook: { type: "string", maxLength: 44 },
+            adapted_title: { type: "string", maxLength: 120 },
+            adapted_treatment: { type: "string", maxLength: 240 },
             summary: { type: "string", maxLength: 240 },
           },
         },
@@ -1357,6 +1367,10 @@ async function recommendCreativeMediaWithOpenAI({ concept, project, candidates }
     text: `Act as a performance creative director selecting executable Pexels footage, not as a literal storyboard checker. Select up to six diverse candidates and rank the strongest first.
 
 The production type is ${productionType}. For stock_simple, one continuous clip must independently carry the treatment. For stock_montage, each candidate may satisfy one strong shot role and should be judged as montage material rather than as the whole story. For experimental_wildcard, allow an intentional, emotionally defensible contrast or pattern interrupt.
+
+For every recommendation, return visual_signature as a compact generic description of the dominant visible setting and subject, such as "supermarket shopper", "night street reflections" or "office headset worker". This is used only to avoid near-duplicate footage inside one batch.
+
+When the creative recipe has workflow=footage_first, let the visible clip lead. Return an adapted_hook of at most 6 words and 44 characters, an adapted_title, and one-sentence adapted_treatment that make a witty, playlist-relevant idea from what is actually visible. Do not force the provisional concept onto the clip. For workflow=concept_first, return empty strings for all three adapted fields.
 
 Use the visible footage criteria as the primary matching rubric. Only award a criterion when it is actually visible in the supplied frames. The optional North-Star story is inspiration and MUST NOT be treated as a list of required events. SAFE candidates communicate the premise immediately; CREATIVE candidates match the emotion or idea; WILDCARD candidates introduce a memorable but defensible contrast. Classify match_type as literal, emotional or contrast. Score scroll-stop potential and originality separately from concept fit, plus usable text space, visual quality, portrait suitability and commercial brand safety. Recommend the layout that preserves the subject. A clip does not need to depict every story beat. Set production_ready=false only for a material blocker: unusable quality/crop, brand-safety risk, accidental contradiction, or no defensible relationship to the hook and criteria. Use rejection_reason only for a material blocker; otherwise return an empty string.
 
@@ -1512,6 +1526,8 @@ function normalizeCreativeRenderSpec(body = {}, asset) {
     show_cover: body.show_cover !== false,
     cover_position: coverPosition,
     show_cta: body.show_cta !== false,
+    show_context_label: body.show_context_label === true,
+    reveal_style: ["center_stack", "side_lockup", "compact_corner"].includes(body.reveal_style) ? body.reveal_style : "side_lockup",
     audio_snippet_id: /^[0-9a-f-]{36}$/i.test(String(body.audio_snippet_id || "")) ? String(body.audio_snippet_id) : null,
     song_start_seconds: Math.max(0, Number(body.song_start_seconds || 0)),
     song_end_seconds: Math.max(0, Number(body.song_end_seconds || 0)) || null,
@@ -4558,13 +4574,22 @@ const routes = {
 
     const requestedQuery = String(body.query || "").replace(/\s+/g, " ").trim().slice(0, 120);
     const creativeRecipe = owned.concept.render_spec?.creative_deck || {};
-    const lateralQuery = serendipityPexelsQuery(creativeRecipe, `${owned.project.id}:${owned.concept.id}:${Date.now()}`);
-    const useLateralSearch = Math.random() < 0.45;
+    const footageFirst = creativeRecipe.workflow === "footage_first";
+    const lateralSeed = `${owned.project.id}:${owned.concept.id}:${Date.now()}`;
+    const lateralQuery = serendipityPexelsQuery(creativeRecipe, `${lateralSeed}:a`);
+    const generatedSecondLateralQuery = serendipityPexelsQuery({ ...creativeRecipe, slot: Number(creativeRecipe.slot || 0) + 17 }, `${lateralSeed}:b`);
+    const alternateWord = (creativeRecipe.serendipity_words || []).find((word) => !lateralQuery.toLowerCase().includes(String(word).toLowerCase()));
+    const secondLateralQuery = generatedSecondLateralQuery === lateralQuery && alternateWord
+      ? `${creativeRecipe.serendipity_modifier || "unexpected"} ${alternateWord}`.slice(0, 120)
+      : generatedSecondLateralQuery;
+    const useLateralSearch = footageFirst || Math.random() < 0.35;
     const directedQueries = [requestedQuery, ...(owned.concept.visual_search_terms || []), owned.concept.visual_direction]
       .map((value) => String(value || "").replace(/\s+/g, " ").trim().slice(0, 120))
       .filter((value, index, values) => value.length >= 2 && values.indexOf(value) === index);
-    const queries = (useLateralSearch
-      ? [directedQueries[0], lateralQuery, ...directedQueries.slice(1)]
+    const queries = (footageFirst
+      ? [lateralQuery, secondLateralQuery, ...directedQueries]
+      : useLateralSearch
+        ? [directedQueries[0], lateralQuery, ...directedQueries.slice(1)]
       : directedQueries)
       .filter((value, index, values) => value?.length >= 2 && values.indexOf(value) === index)
       .slice(0, 2);
@@ -4614,7 +4639,7 @@ const routes = {
         model: recommendation.model,
         payload: recommendation.payload,
         imageCount: recommendation.imageCount,
-        metadata: { candidates: candidates.length, queries: queries.length, excluded_recent_video_ids: usedVideoIds.size, lateral_search: useLateralSearch, lateral_query: useLateralSearch ? lateralQuery : null },
+        metadata: { candidates: candidates.length, queries: queries.length, excluded_recent_video_ids: usedVideoIds.size, lateral_search: useLateralSearch, footage_first: footageFirst, lateral_query: useLateralSearch ? lateralQuery : null },
       });
       const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
       const recommendations = (ranked.recommendations || []).map((recommendation) => {
@@ -4623,7 +4648,7 @@ const routes = {
       }).filter(Boolean);
       return json(res, 200, {
         queries,
-        search_mode: useLateralSearch ? "directed_plus_serendipity" : "directed",
+        search_mode: footageFirst ? "footage_first" : useLateralSearch ? "directed_plus_serendipity" : "directed",
         inspected: candidates.length,
         recommendations,
         rate_limit: { remaining: searches.map((search) => search.remaining).filter(Boolean).at(-1) || null, reset: searches.map((search) => search.reset).filter(Boolean).at(-1) || null },
@@ -4693,6 +4718,10 @@ const routes = {
           creative_mode: ["safe", "creative", "wildcard"].includes(body.ai.creative_mode) ? body.ai.creative_mode : "safe",
           match_type: ["literal", "emotional", "contrast"].includes(body.ai.match_type) ? body.ai.match_type : "literal",
           best_template: ["bold_center", "editorial_top", "minimal_bottom"].includes(body.ai.best_template) ? body.ai.best_template : "bold_center",
+          visual_signature: String(body.ai.visual_signature || "").replace(/\s+/g, " ").trim().slice(0, 100),
+          adapted_hook: normalizeOverlayHook(body.ai.adapted_hook),
+          adapted_title: String(body.ai.adapted_title || "").replace(/\s+/g, " ").trim().slice(0, 120),
+          adapted_treatment: String(body.ai.adapted_treatment || "").replace(/\s+/g, " ").trim().slice(0, 240),
           summary: String(body.ai.summary || "").slice(0, 240),
         } : null,
       },
@@ -4705,11 +4734,36 @@ const routes = {
     });
     const insertText = await insertResponse.text();
     if (!insertResponse.ok) return bad(res, 500, `creative_asset_save_failed: ${insertText.slice(0, 500)}`);
-    await sb(`/rest/v1/meta_creative_concepts?id=eq.${encodeURIComponent(conceptId)}`, {
+    const footageFirst = owned.concept.render_spec?.creative_deck?.workflow === "footage_first";
+    const adaptedHook = normalizeOverlayHook(body.ai?.adapted_hook);
+    const adaptedTitle = String(body.ai?.adapted_title || "").replace(/\s+/g, " ").trim().slice(0, 120);
+    const adaptedTreatment = String(body.ai?.adapted_treatment || "").replace(/\s+/g, " ").trim().slice(0, 240);
+    const conceptPatch = {
+      status: "media_ready",
+      updated_at: new Date().toISOString(),
+      ...(footageFirst && adaptedHook ? {
+        hook: adaptedHook,
+        title: adaptedTitle || owned.concept.title,
+        visual_direction: adaptedTreatment || owned.concept.visual_direction,
+        render_spec: {
+          ...(owned.concept.render_spec || {}),
+          footage_first_adaptation: {
+            original_hook: owned.concept.hook,
+            original_title: owned.concept.title,
+            selected_video_id: providerId,
+            adapted_hook: adaptedHook,
+            adapted_title: adaptedTitle,
+            adapted_treatment: adaptedTreatment,
+          },
+        },
+      } : {}),
+    };
+    const conceptUpdate = await sb(`/rest/v1/meta_creative_concepts?id=eq.${encodeURIComponent(conceptId)}`, {
       method: "PATCH",
-      headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({ status: "media_ready", updated_at: new Date().toISOString() }),
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify(conceptPatch),
     });
+    const updatedConcept = conceptUpdate.ok ? (await conceptUpdate.json().catch(() => []))[0] : null;
     const remainingResponse = await sb(
       `/rest/v1/meta_creative_concepts?select=id&project_id=eq.${encodeURIComponent(owned.project.id)}&status=neq.media_ready&limit=1`
     );
@@ -4721,7 +4775,7 @@ const routes = {
         body: JSON.stringify({ status: "render_ready", current_step: 4, updated_at: new Date().toISOString() }),
       });
     }
-    return json(res, 201, { asset: JSON.parse(insertText || "[]")[0], reused: false });
+    return json(res, 201, { asset: JSON.parse(insertText || "[]")[0], concept: updatedConcept || owned.concept, reused: false });
   },
 
   /* ---------- meta/creative-editor/save (POST) ---------- */
