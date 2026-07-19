@@ -828,6 +828,8 @@ function normalizeMetaDraftInput(body = {}) {
   const ageMin = Math.max(13, Math.min(65, Number.parseInt(body.age_min, 10) || 18));
   const ageMax = Math.max(ageMin, Math.min(65, Number.parseInt(body.age_max, 10) || 45));
   const countries = Array.from(new Set(String(body.countries || "DE").split(",").map((item) => item.trim().toUpperCase()).filter((item) => /^[A-Z]{2}$/.test(item)))).slice(0, 25);
+  const creativeNotes = String(body.creative_notes || "").trim().slice(0, 2000);
+  const audioSnippetIds = [...new Set((body.audio_snippet_ids || []).map(String).filter((id) => /^[0-9a-f-]{36}$/i.test(id)))].slice(0, 8);
   if (name.length < 3) throw new Error("campaign_name_required");
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(playlistId)) throw new Error("playlist_required");
   if (!Number.isInteger(dailyBudgetMinor) || dailyBudgetMinor < 100) throw new Error("daily_budget_must_be_at_least_1_eur");
@@ -858,6 +860,8 @@ function normalizeMetaDraftInput(body = {}) {
     start_date: startDate,
     end_date: endDate,
     placement_mode: placementMode,
+    creative_notes: creativeNotes,
+    audio_snippet_ids: audioSnippetIds,
   };
 }
 
@@ -2943,7 +2947,7 @@ const routes = {
     const connection = await loadMetaConnection(ctx.bubble_user_id);
     if (!connection) return bad(res, 400, "meta_connection_not_configured");
     if (req.method === "GET") {
-      const [experimentsResponse, audioResponse] = await Promise.all([
+      const [experimentsResponse, audioResponse, snippetsResponse] = await Promise.all([
         sb(
           `/rest/v1/meta_creative_experiments?select=*,meta_creative_projects(name,format,language,playlists(name,image)),` +
           `meta_creative_experiment_phases(*,meta_creative_variants(*,meta_creative_variant_metrics(*)))` +
@@ -2951,12 +2955,15 @@ const routes = {
           `&order=created_at.desc&meta_creative_experiment_phases.order=phase_number.asc&limit=50`
         ),
         sb(`/rest/v1/meta_creative_audio_tracks?select=*,meta_creative_assets(source_url,duration_seconds,mime_type)&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&order=created_at.desc&limit=100`),
+        sb(`/rest/v1/meta_audio_snippets?select=*,meta_audio_masters(title,artist,source_url,duration_seconds,mime_type)&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&order=created_at.desc&limit=200`),
       ]);
       if (!experimentsResponse.ok) return bad(res, 500, `creative_experiments_load_failed: ${(await experimentsResponse.text()).slice(0, 1000)}`);
       if (!audioResponse.ok) return bad(res, 500, `creative_audio_load_failed: ${(await audioResponse.text()).slice(0, 1000)}`);
+      if (!snippetsResponse.ok) return bad(res, 500, `creative_audio_snippets_load_failed: ${(await snippetsResponse.text()).slice(0, 1000)}`);
       return json(res, 200, {
         experiments: await experimentsResponse.json().catch(() => []),
         audio_tracks: await audioResponse.json().catch(() => []),
+        audio_snippets: await snippetsResponse.json().catch(() => []),
       });
     }
     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
@@ -3004,6 +3011,147 @@ const routes = {
     const phaseText = await phaseResponse.text();
     if (!phaseResponse.ok) return bad(res, 500, `creative_experiment_phase_save_failed: ${phaseText.slice(0, 1000)}`);
     return json(res, 201, { experiment, phase: JSON.parse(phaseText || "[]")[0] });
+  },
+
+  /* ---------- meta/audio-library (GET) ---------- */
+  "meta/audio-library": async (req, res) => {
+    if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const playlistId = String(req.query.playlist_id || "");
+    if (!/^[0-9a-f-]{36}$/i.test(playlistId)) return bad(res, 400, "audio_playlist_required");
+    const playlistResponse = await sb(`/rest/v1/playlists?select=id&id=eq.${encodeURIComponent(playlistId)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&limit=1`);
+    const playlist = playlistResponse.ok ? (await playlistResponse.json().catch(() => []))[0] : null;
+    if (!playlist) return bad(res, 404, "audio_playlist_not_found");
+    const response = await sb(
+      `/rest/v1/meta_audio_masters?select=*,meta_audio_snippets(*)&playlist_id=eq.${encodeURIComponent(playlist.id)}` +
+      `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&status=eq.ready&order=created_at.desc&meta_audio_snippets.order=start_seconds.asc&limit=50`
+    );
+    const text = await response.text();
+    if (!response.ok) return bad(res, 500, `audio_library_load_failed: ${text.slice(0, 500)}`);
+    return json(res, 200, { masters: JSON.parse(text || "[]") });
+  },
+
+  /* ---------- meta/audio-masters/upload-url (POST) ---------- */
+  "meta/audio-masters/upload-url": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const body = await readBody(req);
+    const playlistId = String(body.playlist_id || "");
+    const fileName = String(body.file_name || "").trim().slice(0, 240);
+    const title = String(body.title || fileName).replace(/\.[^.]+$/, "").trim().slice(0, 200);
+    const artist = String(body.artist || "").trim().slice(0, 200);
+    const mimeType = String(body.content_type || "").toLowerCase();
+    const bytes = Math.max(0, Number.parseInt(body.bytes, 10) || 0);
+    const allowedTypes = ["audio/mpeg", "audio/mp4", "audio/x-m4a", "audio/wav", "audio/x-wav"];
+    if (!/^[0-9a-f-]{36}$/i.test(playlistId)) return bad(res, 400, "audio_playlist_required");
+    if (!fileName || !title || !allowedTypes.includes(mimeType)) return bad(res, 400, "audio_master_file_invalid");
+    if (!bytes || bytes > 100 * 1024 * 1024) return bad(res, 413, "audio_master_too_large");
+    const playlistResponse = await sb(`/rest/v1/playlists?select=id&id=eq.${encodeURIComponent(playlistId)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&limit=1`);
+    const playlist = playlistResponse.ok ? (await playlistResponse.json().catch(() => []))[0] : null;
+    if (!playlist) return bad(res, 404, "audio_playlist_not_found");
+    const extension = mimeType === "audio/mpeg" ? "mp3" : mimeType.includes("wav") ? "wav" : "m4a";
+    const owner = String(ctx.bubble_user_id).replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80) || "admin";
+    const storagePath = `${owner}/audio-masters/${playlist.id}/${Date.now()}-${randomUUID()}.${extension}`;
+    const storage = supabaseServiceClient().storage.from("meta-ad-creatives");
+    const { data: signed, error: signedError } = await storage.createSignedUploadUrl(storagePath, { upsert: false });
+    if (signedError || !signed?.signedUrl) return bad(res, 502, `audio_upload_url_failed: ${String(signedError?.message || "unknown").slice(0, 300)}`);
+    const now = new Date().toISOString();
+    const masterResponse = await sb(`/rest/v1/meta_audio_masters`, {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify([{
+        playlist_id: playlist.id,
+        bubble_user_id: ctx.bubble_user_id,
+        title,
+        artist,
+        file_name: fileName,
+        mime_type: mimeType,
+        bytes,
+        storage_path: storagePath,
+        rights_status: ["owned", "licensed", "test_only", "unknown"].includes(body.rights_status) ? body.rights_status : "test_only",
+        status: "uploading",
+        updated_at: now,
+      }]),
+    });
+    const masterText = await masterResponse.text();
+    if (!masterResponse.ok) return bad(res, 500, `audio_master_save_failed: ${masterText.slice(0, 500)}`);
+    return json(res, 201, { master: JSON.parse(masterText || "[]")[0], upload_url: signed.signedUrl, token: signed.token || null });
+  },
+
+  /* ---------- meta/audio-masters/finalize (POST) ---------- */
+  "meta/audio-masters/finalize": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const body = await readBody(req);
+    const masterId = String(body.master_id || "");
+    const duration = Number(body.duration_seconds || 0);
+    if (!/^[0-9a-f-]{36}$/i.test(masterId) || !Number.isFinite(duration) || duration < 5 || duration > 7200) return bad(res, 400, "audio_master_finalize_invalid");
+    const masterResponse = await sb(`/rest/v1/meta_audio_masters?select=*&id=eq.${encodeURIComponent(masterId)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&limit=1`);
+    const master = masterResponse.ok ? (await masterResponse.json().catch(() => []))[0] : null;
+    if (!master) return bad(res, 404, "audio_master_not_found");
+    const pathParts = String(master.storage_path).split("/");
+    const fileName = pathParts.pop();
+    const directory = pathParts.join("/");
+    const storage = supabaseServiceClient().storage.from("meta-ad-creatives");
+    const { data: files, error: listError } = await storage.list(directory, { search: fileName, limit: 5 });
+    const uploaded = (files || []).find((file) => file.name === fileName);
+    if (listError || !uploaded) return bad(res, 409, "audio_master_upload_not_found");
+    const publicUrl = storage.getPublicUrl(master.storage_path).data.publicUrl;
+    const now = new Date().toISOString();
+    const update = await sb(`/rest/v1/meta_audio_masters?id=eq.${encodeURIComponent(master.id)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ source_url: publicUrl, duration_seconds: Math.round(duration * 1000) / 1000, status: "ready", metadata: { ...(master.metadata || {}), storage_size: Number(uploaded.metadata?.size || master.bytes) }, updated_at: now }),
+    });
+    const text = await update.text();
+    if (!update.ok) return bad(res, 500, `audio_master_finalize_failed: ${text.slice(0, 500)}`);
+    return json(res, 200, { master: JSON.parse(text || "[]")[0] });
+  },
+
+  /* ---------- meta/audio-snippets (POST) ---------- */
+  "meta/audio-snippets": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const body = await readBody(req);
+    const masterId = String(body.master_id || "");
+    if (!/^[0-9a-f-]{36}$/i.test(masterId)) return bad(res, 400, "audio_master_required");
+    const masterResponse = await sb(`/rest/v1/meta_audio_masters?select=*&id=eq.${encodeURIComponent(masterId)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&status=eq.ready&limit=1`);
+    const master = masterResponse.ok ? (await masterResponse.json().catch(() => []))[0] : null;
+    if (!master) return bad(res, 404, "audio_master_not_found");
+    const start = Math.max(0, Math.round(Number(body.start_seconds || 0) * 1000) / 1000);
+    const end = Math.round(Number(body.end_seconds || 0) * 1000) / 1000;
+    const duration = end - start;
+    const fadeIn = Math.max(0, Math.min(3, Math.round(Number(body.fade_in_seconds ?? 0.2) * 1000) / 1000));
+    const fadeOut = Math.max(0, Math.min(3, Math.round(Number(body.fade_out_seconds ?? 0.2) * 1000) / 1000));
+    if (duration < 5 || duration > 30 || end > Number(master.duration_seconds || 0) + 0.01 || fadeIn + fadeOut >= duration) return bad(res, 400, "audio_snippet_timing_invalid");
+    const title = String(body.title || `${master.title} · ${Math.round(start)}s`).trim().slice(0, 200);
+    if (!title) return bad(res, 400, "audio_snippet_title_required");
+    const now = new Date().toISOString();
+    const response = await sb(`/rest/v1/meta_audio_snippets`, {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify([{
+        master_id: master.id,
+        playlist_id: master.playlist_id,
+        project_id: master.project_id,
+        bubble_user_id: ctx.bubble_user_id,
+        title,
+        start_seconds: start,
+        end_seconds: end,
+        fade_in_seconds: fadeIn,
+        fade_out_seconds: fadeOut,
+        gain_db: Math.max(-24, Math.min(12, Number(body.gain_db || 0))),
+        metadata: { source: "campaign_waveform_editor" },
+        updated_at: now,
+      }]),
+    });
+    const text = await response.text();
+    if (!response.ok) return bad(res, 500, `audio_snippet_save_failed: ${text.slice(0, 500)}`);
+    return json(res, 201, { snippet: JSON.parse(text || "[]")[0] });
   },
 
   /* ---------- meta/creative-audio/upload (POST) ---------- */
@@ -3108,21 +3256,31 @@ const routes = {
     if (!phase) return bad(res, 404, "creative_experiment_phase_not_found");
     const requestedVideoIds = [...new Set((body.video_asset_ids || []).map(String).filter((id) => /^[0-9a-f-]{36}$/i.test(id)))].slice(0, 32);
     const requestedAudioIds = [...new Set((body.audio_track_ids || []).map(String).filter((id) => /^[0-9a-f-]{36}$/i.test(id)))].slice(0, 16);
+    const requestedSnippetIds = [...new Set((body.audio_snippet_ids || []).map(String).filter((id) => /^[0-9a-f-]{36}$/i.test(id)))].slice(0, 16);
     if (!requestedVideoIds.length) return bad(res, 400, "creative_matrix_video_required");
-    const [videosResponse, audioResponse, conceptsResponse] = await Promise.all([
+    const [videosResponse, audioResponse, snippetsResponse, conceptsResponse] = await Promise.all([
       sb(`/rest/v1/meta_creative_assets?select=*&project_id=eq.${encodeURIComponent(experiment.project_id)}&asset_type=eq.video&id=in.(${requestedVideoIds.join(",")})`),
       requestedAudioIds.length
         ? sb(`/rest/v1/meta_creative_audio_tracks?select=*,meta_creative_assets(*)&project_id=eq.${encodeURIComponent(experiment.project_id)}&id=in.(${requestedAudioIds.join(",")})`)
+        : Promise.resolve({ ok: true, json: async () => [] }),
+      requestedSnippetIds.length
+        ? sb(`/rest/v1/meta_audio_snippets?select=*,meta_audio_masters(*)&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&id=in.(${requestedSnippetIds.join(",")})`)
         : Promise.resolve({ ok: true, json: async () => [] }),
       sb(`/rest/v1/meta_creative_concepts?select=*&project_id=eq.${encodeURIComponent(experiment.project_id)}`),
     ]);
     const videos = videosResponse.ok ? await videosResponse.json().catch(() => []) : [];
     const audioTracks = audioResponse.ok ? await audioResponse.json().catch(() => []) : [];
+    const audioSnippets = snippetsResponse.ok ? await snippetsResponse.json().catch(() => []) : [];
     const concepts = conceptsResponse.ok ? await conceptsResponse.json().catch(() => []) : [];
     if (videos.length !== requestedVideoIds.length) return bad(res, 400, "creative_matrix_video_not_found");
     if (audioTracks.length !== requestedAudioIds.length) return bad(res, 400, "creative_matrix_audio_not_found");
+    if (audioSnippets.length !== requestedSnippetIds.length) return bad(res, 400, "creative_matrix_audio_snippet_not_found");
     const conceptById = new Map(concepts.map((concept) => [concept.id, concept]));
-    const audioChoices = audioTracks.length ? audioTracks : [null];
+    const audioChoices = audioSnippets.length
+      ? audioSnippets.map((snippet) => ({ kind: "snippet", ...snippet }))
+      : audioTracks.length
+        ? audioTracks.map((track) => ({ kind: "legacy_track", ...track }))
+        : [null];
     const now = new Date().toISOString();
     const variants = [];
     for (const video of videos) {
@@ -3133,13 +3291,18 @@ const routes = {
         const dna = {
           concept_id: concept.id,
           video_asset_id: video.id,
-          audio_track_id: audioTrack?.id || null,
+          audio_track_id: audioTrack?.kind === "legacy_track" ? audioTrack.id : null,
+          audio_snippet_id: audioTrack?.kind === "snippet" ? audioTrack.id : null,
           hook_text: String(savedEditor.hook_text || concept.hook || ""),
           template_id: String(savedEditor.template_id || "bold_center"),
           format: experiment.settings?.format || savedEditor.format || "9:16",
           video_start_seconds: Number(savedEditor.trim_start || 0),
           video_end_seconds: Number(savedEditor.trim_end || Math.min(Number(video.duration_seconds || 15), 15)),
-          song_start_seconds: Number(audioTrack?.default_start_seconds || 0),
+          song_start_seconds: Number(audioTrack?.start_seconds ?? audioTrack?.default_start_seconds ?? 0),
+          song_end_seconds: audioTrack?.kind === "snippet" ? Number(audioTrack.end_seconds) : null,
+          fade_in_seconds: audioTrack?.kind === "snippet" ? Number(audioTrack.fade_in_seconds || 0) : 0,
+          fade_out_seconds: audioTrack?.kind === "snippet" ? Number(audioTrack.fade_out_seconds || 0) : 0,
+          gain_db: audioTrack?.kind === "snippet" ? Number(audioTrack.gain_db || 0) : 0,
         };
         const dnaHash = createHash("sha256").update(JSON.stringify(dna)).digest("hex");
         variants.push({
@@ -3147,7 +3310,8 @@ const routes = {
           phase_id: phase.id,
           concept_id: concept.id,
           video_asset_id: video.id,
-          audio_track_id: audioTrack?.id || null,
+          audio_track_id: dna.audio_track_id || null,
+          audio_snippet_id: dna.audio_snippet_id || null,
           generation: phase.phase_number,
           label: `${concept.title} · ${audioTrack?.title || "No audio"}`.slice(0, 200),
           status: "draft",
@@ -3175,10 +3339,12 @@ const routes = {
     if (!variantsResponse.ok) return bad(res, 500, `creative_matrix_save_failed: ${variantsText.slice(0, 1000)}`);
     const created = JSON.parse(variantsText || "[]");
     const audioById = new Map(audioTracks.map((track) => [track.id, track]));
+    const snippetById = new Map(audioSnippets.map((snippet) => [snippet.id, snippet]));
     const jobs = created.map((variant) => {
       const concept = conceptById.get(variant.concept_id);
       const savedEditor = concept?.render_spec?.editor || {};
       const audioTrack = audioById.get(variant.audio_track_id);
+      const audioSnippet = snippetById.get(variant.audio_snippet_id);
       return {
         project_id: experiment.project_id,
         concept_id: variant.concept_id,
@@ -3197,7 +3363,12 @@ const routes = {
             trim_start: Number(variant.video_start_seconds),
             trim_end: Number(variant.video_end_seconds),
             audio_asset_id: audioTrack?.asset_id || null,
+            audio_snippet_id: audioSnippet?.id || null,
             song_start_seconds: Number(variant.song_start_seconds),
+            song_end_seconds: Number(audioSnippet?.end_seconds || 0) || null,
+            fade_in_seconds: Number(audioSnippet?.fade_in_seconds || 0),
+            fade_out_seconds: Number(audioSnippet?.fade_out_seconds || 0),
+            audio_gain_db: Number(audioSnippet?.gain_db || 0),
           },
         },
         updated_at: now,
@@ -3401,7 +3572,7 @@ const routes = {
     const groupRollup = (key) => {
       const groups = new Map();
       ranking.forEach(({ variant, summary }) => {
-        const id = variant[key] || "none";
+        const id = Array.isArray(key) ? key.map((field) => variant[field]).find(Boolean) || "none" : variant[key] || "none";
         const current = groups.get(id) || { id, impressions: 0, spend_minor: 0, outbound_clicks: 0, spotify_opens: 0, variants: 0 };
         current.impressions += summary.impressions;
         current.spend_minor += summary.spend_minor;
@@ -3426,7 +3597,7 @@ const routes = {
       eligible_variants: eligible.length,
       winner_ids: [...winnerIds],
       ranking: ranking.map((item, index) => ({ rank: index + 1, variant_id: item.variant.id, label: item.variant.label, eligible: item.eligible, confidence: item.confidence, score: item.raw_score, metrics: item.summary })).slice(0, 100),
-      audio_effects: groupRollup("audio_track_id"),
+      audio_effects: groupRollup(["audio_snippet_id", "audio_track_id"]),
       video_effects: groupRollup("video_asset_id"),
     };
     const phaseStatus = winnerIds.size ? "completed" : "ready";
@@ -3534,6 +3705,7 @@ const routes = {
           mutation_kind: mutation.kind,
           template_id: mutation.template_id || winner.template_id,
           audio_track_id: mutation.audio_track_id || winner.audio_track_id,
+          audio_snippet_id: winner.audio_snippet_id || null,
           video_start_seconds: videoStart,
           video_end_seconds: videoStart + duration,
           song_start_seconds: mutation.song_start_seconds ?? Number(winner.song_start_seconds || 0),
@@ -3546,6 +3718,7 @@ const routes = {
           concept_id: winner.concept_id,
           video_asset_id: winner.video_asset_id,
           audio_track_id: dna.audio_track_id || null,
+          audio_snippet_id: dna.audio_snippet_id || null,
           generation: nextPhaseNumber,
           label: `${winner.label} · ${mutation.kind.replaceAll("_", " ")}`.slice(0, 200),
           status: "draft",
@@ -3587,6 +3760,7 @@ const routes = {
             ...editor,
             asset_id: variant.video_asset_id,
             audio_asset_id: audioById.get(variant.audio_track_id)?.asset_id || null,
+            audio_snippet_id: variant.audio_snippet_id || null,
             template_id: variant.template_id,
             format: variant.format,
             hook_text: variant.hook_text,
@@ -4089,18 +4263,23 @@ const routes = {
     if (!job) return json(res, 200, { job: null });
     const assetId = String(job.render_spec?.editor?.asset_id || "");
     const audioAssetId = String(job.render_spec?.editor?.audio_asset_id || "");
-    const [projectResponse, conceptResponse, assetResponse, audioAssetResponse] = await Promise.all([
+    const audioSnippetId = String(job.render_spec?.editor?.audio_snippet_id || "");
+    const [projectResponse, conceptResponse, assetResponse, audioAssetResponse, audioSnippetResponse] = await Promise.all([
       sb(`/rest/v1/meta_creative_projects?select=*,playlists(name,image)&id=eq.${encodeURIComponent(job.project_id)}&limit=1`),
       sb(`/rest/v1/meta_creative_concepts?select=*&id=eq.${encodeURIComponent(job.concept_id)}&limit=1`),
       sb(`/rest/v1/meta_creative_assets?select=*&id=eq.${encodeURIComponent(assetId)}&asset_type=eq.video&limit=1`),
       audioAssetId
         ? sb(`/rest/v1/meta_creative_assets?select=*&id=eq.${encodeURIComponent(audioAssetId)}&asset_type=eq.audio&limit=1`)
         : Promise.resolve(null),
+      audioSnippetId
+        ? sb(`/rest/v1/meta_audio_snippets?select=*,meta_audio_masters(source_url,status)&id=eq.${encodeURIComponent(audioSnippetId)}&limit=1`)
+        : Promise.resolve(null),
     ]);
     const project = projectResponse.ok ? (await projectResponse.json().catch(() => []))[0] : null;
     const concept = conceptResponse.ok ? (await conceptResponse.json().catch(() => []))[0] : null;
     const asset = assetResponse.ok ? (await assetResponse.json().catch(() => []))[0] : null;
     const audioAsset = audioAssetResponse?.ok ? (await audioAssetResponse.json().catch(() => []))[0] : null;
+    const audioSnippet = audioSnippetResponse?.ok ? (await audioSnippetResponse.json().catch(() => []))[0] : null;
     if (!project || !concept || !asset?.source_url) {
       await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(job.id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "failed", error_code: "render_input_missing", error_message: "Render project, concept or video asset is missing", finished_at: now, updated_at: now }) });
       return bad(res, 409, "render_input_missing");
@@ -4117,10 +4296,14 @@ const routes = {
       await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(job.id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "failed", error_code: "audio_input_missing", error_message: "The selected audio asset is missing", finished_at: now, updated_at: now }) });
       return bad(res, 409, "audio_input_missing");
     }
+    if (audioSnippetId && (!audioSnippet?.meta_audio_masters?.source_url || audioSnippet.meta_audio_masters.status !== "ready")) {
+      await sb(`/rest/v1/meta_creative_render_jobs?id=eq.${encodeURIComponent(job.id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "failed", error_code: "audio_snippet_missing", error_message: "The selected audio snippet or master is missing", finished_at: now, updated_at: now }) });
+      return bad(res, 409, "audio_snippet_missing");
+    }
     if (job.render_spec?.variant_id) {
       await sb(`/rest/v1/meta_creative_variants?id=eq.${encodeURIComponent(job.render_spec.variant_id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ status: "rendering", updated_at: now }) });
     }
-    return json(res, 200, { job: { id: job.id, worker_id: identity, project_id: job.project_id, concept_id: job.concept_id, editor: job.render_spec.editor, format: project.format, playlist_name: project.playlists?.name || "", playlist_cover_url: project.playlists?.image || "", hook_text: concept.hook_text || job.render_spec.editor.hook_text, video_url: asset.source_url, audio_url: audioAsset?.source_url || "", song_start_seconds: Number(job.render_spec?.editor?.song_start_seconds || 0), storage_path: storagePath, upload_url: signedUpload.signedUrl } });
+    return json(res, 200, { job: { id: job.id, worker_id: identity, project_id: job.project_id, concept_id: job.concept_id, editor: job.render_spec.editor, format: project.format, playlist_name: project.playlists?.name || "", playlist_cover_url: project.playlists?.image || "", hook_text: concept.hook_text || job.render_spec.editor.hook_text, video_url: asset.source_url, audio_url: audioSnippet?.meta_audio_masters?.source_url || audioAsset?.source_url || "", song_start_seconds: Number(audioSnippet?.start_seconds ?? job.render_spec?.editor?.song_start_seconds ?? 0), song_end_seconds: audioSnippet ? Number(audioSnippet.end_seconds) : Number(job.render_spec?.editor?.song_end_seconds || 0) || null, fade_in_seconds: Number(audioSnippet?.fade_in_seconds ?? job.render_spec?.editor?.fade_in_seconds ?? 0), fade_out_seconds: Number(audioSnippet?.fade_out_seconds ?? job.render_spec?.editor?.fade_out_seconds ?? 0), audio_gain_db: Number(audioSnippet?.gain_db ?? job.render_spec?.editor?.audio_gain_db ?? 0), storage_path: storagePath, upload_url: signedUpload.signedUrl } });
   },
 
   /* ---------- meta/render-worker/complete (POST, private worker) ---------- */
@@ -4211,6 +4394,14 @@ const routes = {
     );
     const ownedPlaylist = playlistResponse.ok ? (await playlistResponse.json().catch(() => []))[0] : null;
     if (!ownedPlaylist) return bad(res, 404, "campaign_playlist_not_found");
+    if (input.audio_snippet_ids.length) {
+      const snippetsResponse = await sb(
+        `/rest/v1/meta_audio_snippets?select=id&playlist_id=eq.${encodeURIComponent(input.playlist_id)}` +
+        `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&id=in.(${input.audio_snippet_ids.join(",")})`
+      );
+      const snippets = snippetsResponse.ok ? await snippetsResponse.json().catch(() => []) : [];
+      if (snippets.length !== input.audio_snippet_ids.length) return bad(res, 400, "campaign_audio_snippet_not_found");
+    }
     const payload = {
       connection_id: connection.id,
       bubble_user_id: ctx.bubble_user_id,

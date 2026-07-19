@@ -189,6 +189,11 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     audio_url = str(job.get("audio_url") or "").strip()
     audio = workdir / "audio"
     song_start = max(0.0, float(job.get("song_start_seconds") or 0))
+    song_end = max(song_start, float(job.get("song_end_seconds") or 0))
+    audio_duration = min(duration, song_end - song_start) if song_end > song_start else duration
+    fade_in = min(max(0.0, float(job.get("fade_in_seconds") or 0)), max(0.0, audio_duration / 2 - 0.01))
+    fade_out = min(max(0.0, float(job.get("fade_out_seconds") or 0)), max(0.0, audio_duration / 2 - 0.01))
+    audio_gain_db = min(12.0, max(-24.0, float(job.get("audio_gain_db") or 0)))
     if audio_url:
         download(audio_url, audio)
     hook_fit_width = safe_width - (max(22, int(width * 0.04)) if template_id == "editorial_top" else 0)
@@ -281,9 +286,18 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
         )
     tail = ",".join(text_filters + ["format=yuv420p"])
     filters.append(f"[{current}]{tail}[out]")
+    if audio_url:
+        audio_filters = [f"atrim=duration={audio_duration:.3f}", "asetpts=PTS-STARTPTS"]
+        if abs(audio_gain_db) > 0.01:
+            audio_filters.append(f"volume={audio_gain_db:.2f}dB")
+        if fade_in > 0:
+            audio_filters.append(f"afade=t=in:st=0:d={fade_in:.3f}")
+        if fade_out > 0:
+            audio_filters.append(f"afade=t=out:st={max(0.0, audio_duration - fade_out):.3f}:d={fade_out:.3f}")
+        filters.append(f"[{audio_input_index}:a:0]{','.join(audio_filters)}[audioout]")
     command.extend(["-filter_complex", ";".join(filters), "-map", "[out]"])
     if audio_url:
-        command.extend(["-map", f"{audio_input_index}:a:0", "-c:a", "aac", "-b:a", "192k"])
+        command.extend(["-map", "[audioout]", "-c:a", "aac", "-b:a", "192k"])
     else:
         command.append("-an")
     command.extend([

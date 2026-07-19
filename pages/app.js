@@ -130,6 +130,130 @@ function IconButton({ children, className = "", tooltip, label, ...props }) {
   );
 }
 
+function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave, onToggle, busy }) {
+  const duration = Math.max(5, Number(master?.duration_seconds || 15));
+  const canvasRef = useRef(null);
+  const audioRef = useRef(null);
+  const [start, setStart] = useState(0);
+  const [end, setEnd] = useState(Math.min(15, duration));
+  const [fadeIn, setFadeIn] = useState(0.2);
+  const [fadeOut, setFadeOut] = useState(0.2);
+  const [title, setTitle] = useState("");
+  const [loop, setLoop] = useState(true);
+  const [playing, setPlaying] = useState(false);
+  const [waveformStatus, setWaveformStatus] = useState("loading");
+
+  useEffect(() => {
+    setStart(0);
+    setEnd(Math.min(15, duration));
+    setTitle("");
+    setPlaying(false);
+    setWaveformStatus("loading");
+    let cancelled = false;
+    async function drawWaveform() {
+      try {
+        const response = await fetch(master.source_url);
+        const bytes = await response.arrayBuffer();
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        const context = new AudioContextClass();
+        const decoded = await context.decodeAudioData(bytes.slice(0));
+        if (cancelled) return context.close();
+        const channel = decoded.getChannelData(0);
+        const canvas = canvasRef.current;
+        const width = Math.max(600, Math.round(canvas?.clientWidth || 900));
+        const height = 150;
+        canvas.width = width * window.devicePixelRatio;
+        canvas.height = height * window.devicePixelRatio;
+        const drawing = canvas.getContext("2d");
+        drawing.scale(window.devicePixelRatio, window.devicePixelRatio);
+        drawing.clearRect(0, 0, width, height);
+        drawing.fillStyle = "#111820";
+        drawing.fillRect(0, 0, width, height);
+        const bars = Math.min(450, Math.floor(width / 2));
+        const stride = Math.max(1, Math.floor(channel.length / bars));
+        drawing.fillStyle = "#8ea7ff";
+        for (let index = 0; index < bars; index += 1) {
+          let peak = 0;
+          const offset = index * stride;
+          for (let sample = 0; sample < stride; sample += Math.max(1, Math.floor(stride / 80))) peak = Math.max(peak, Math.abs(channel[offset + sample] || 0));
+          const barHeight = Math.max(2, peak * (height - 20));
+          drawing.fillRect((index / bars) * width, (height - barHeight) / 2, Math.max(1, width / bars - 1), barHeight);
+        }
+        setWaveformStatus("ready");
+        await context.close();
+      } catch {
+        if (!cancelled) setWaveformStatus("unavailable");
+      }
+    }
+    drawWaveform();
+    return () => { cancelled = true; };
+  }, [master.id, master.source_url, duration]);
+
+  function applyPreset(seconds) {
+    setEnd(Math.min(duration, start + seconds));
+  }
+
+  function seekFromWaveform(event) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const nextStart = Math.max(0, Math.min(duration - 5, ((event.clientX - rect.left) / rect.width) * duration));
+    setStart(Math.round(nextStart * 10) / 10);
+    setEnd(Math.min(duration, Math.round((nextStart + 15) * 10) / 10));
+  }
+
+  function handleTimeUpdate() {
+    const audio = audioRef.current;
+    if (!audio) return;
+    const snippetDuration = end - start;
+    const elapsed = audio.currentTime - start;
+    const remaining = end - audio.currentTime;
+    const fadeInGain = fadeIn > 0 ? Math.min(1, Math.max(0, elapsed / fadeIn)) : 1;
+    const fadeOutGain = fadeOut > 0 ? Math.min(1, Math.max(0, remaining / fadeOut)) : 1;
+    audio.volume = Math.min(fadeInGain, fadeOutGain);
+    if (audio.currentTime >= end || elapsed > snippetDuration + 0.1) {
+      if (loop) {
+        audio.currentTime = start;
+        audio.play().catch(() => null);
+      } else {
+        audio.pause();
+        setPlaying(false);
+      }
+    }
+  }
+
+  function togglePlayback() {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (playing) {
+      audio.pause();
+      setPlaying(false);
+    } else {
+      audio.currentTime = start;
+      audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+    }
+  }
+
+  const snippetDuration = Math.max(0, end - start);
+  const valid = snippetDuration >= 5 && snippetDuration <= 30 && fadeIn + fadeOut < snippetDuration;
+  return <div className="campaignAudioTrimmer">
+    <audio ref={audioRef} src={master.source_url} preload="metadata" onTimeUpdate={handleTimeUpdate} onEnded={() => setPlaying(false)} />
+    <div className="campaignWaveform" onClick={seekFromWaveform}>
+      <canvas ref={canvasRef} aria-label={`Waveform for ${master.title}`} />
+      <div className="campaignWaveformSelection" style={{ left: `${(start / duration) * 100}%`, width: `${(snippetDuration / duration) * 100}%` }} />
+      {waveformStatus !== "ready" ? <span>{waveformStatus === "loading" ? "Analyzing waveform…" : "Waveform unavailable — timing controls still work"}</span> : null}
+    </div>
+    <div className="campaignAudioPresets"><button onClick={togglePlayback}>{playing ? "Pause" : "Preview"}</button>{[8, 10, 15, 20, 30].map((seconds) => <button className={Math.abs(snippetDuration - seconds) < 0.05 ? "active" : "secondary"} key={seconds} onClick={() => applyPreset(seconds)}>{seconds}s</button>)}<label><input type="checkbox" checked={loop} onChange={(event) => setLoop(event.target.checked)} /> Loop</label></div>
+    <div className="metaFormGrid">
+      <label><span>Start</span><input type="number" min="0" max={Math.max(0, duration - 5)} step="0.1" value={start} onChange={(event) => { const value = Math.max(0, Math.min(duration - 5, Number(event.target.value) || 0)); setStart(value); if (end < value + 5) setEnd(Math.min(duration, value + 15)); }} /></label>
+      <label><span>End</span><input type="number" min={start + 5} max={Math.min(duration, start + 30)} step="0.1" value={end} onChange={(event) => setEnd(Math.max(start + 5, Math.min(duration, start + 30, Number(event.target.value) || start + 15)))} /></label>
+      <label><span>Fade in</span><input type="number" min="0" max="3" step="0.05" value={fadeIn} onChange={(event) => setFadeIn(Math.max(0, Math.min(3, Number(event.target.value) || 0)))} /></label>
+      <label><span>Fade out</span><input type="number" min="0" max="3" step="0.05" value={fadeOut} onChange={(event) => setFadeOut(Math.max(0, Math.min(3, Number(event.target.value) || 0)))} /></label>
+      <label className="metaFormWide"><span>Snippet name</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder={`${master.title} · Chorus`} /></label>
+    </div>
+    <div className="metaFormActions"><button disabled={busy || !valid} onClick={() => onSave({ master_id: master.id, title: title || `${master.title} · ${start.toFixed(1)}s`, start_seconds: start, end_seconds: end, fade_in_seconds: fadeIn, fade_out_seconds: fadeOut })}>Save snippet</button><small>{snippetDuration.toFixed(1)} seconds · click the waveform to move the 15-second window</small></div>
+    {snippets.length ? <div className="campaignSnippetList">{snippets.map((snippet) => <label className={selectedIds.includes(snippet.id) ? "selected" : ""} key={snippet.id}><input type="checkbox" checked={selectedIds.includes(snippet.id)} onChange={() => onToggle(snippet.id)} /><span><strong>{snippet.title}</strong><small>{Number(snippet.start_seconds).toFixed(1)}–{Number(snippet.end_seconds).toFixed(1)}s · fades {Number(snippet.fade_in_seconds).toFixed(2)}/{Number(snippet.fade_out_seconds).toFixed(2)}s</small></span></label>)}</div> : null}
+  </div>;
+}
+
 function normalizeSpotifyImageUrl(url) {
   if (!url) return "";
   const value = String(url).trim();
@@ -632,6 +756,10 @@ export default function PlaylistManager() {
   const [creativeProjects, setCreativeProjects] = useState([]);
   const [creativeExperiments, setCreativeExperiments] = useState([]);
   const [creativeAudioTracks, setCreativeAudioTracks] = useState([]);
+  const [creativeAudioSnippets, setCreativeAudioSnippets] = useState([]);
+  const [campaignAudioMasters, setCampaignAudioMasters] = useState([]);
+  const [campaignAudioMasterId, setCampaignAudioMasterId] = useState("");
+  const [campaignAudioUpload, setCampaignAudioUpload] = useState({ title: "", artist: "", rights_status: "test_only", file: null });
   const [creativeExperimentForm, setCreativeExperimentForm] = useState({ project_id: "", name: "" });
   const [creativeAudioForm, setCreativeAudioForm] = useState({ project_id: "", title: "", artist: "", rights_status: "test_only", default_start_seconds: "0", file: null });
   const [creativeMatrixSelections, setCreativeMatrixSelections] = useState({});
@@ -662,6 +790,8 @@ export default function PlaylistManager() {
     start_date: new Date(Date.now() + 86400000).toISOString().slice(0, 10),
     end_date: new Date(Date.now() + 15 * 86400000).toISOString().slice(0, 10),
     placement_mode: "automatic",
+    creative_notes: "",
+    audio_snippet_ids: [],
   });
   const [spotifyClientId, setSpotifyClientId] = useState("");
   const [spotifyClientSecret, setSpotifyClientSecret] = useState("");
@@ -2102,6 +2232,7 @@ export default function PlaylistManager() {
     if (data) {
       setCreativeExperiments(data.experiments || []);
       setCreativeAudioTracks(data.audio_tracks || []);
+      setCreativeAudioSnippets(data.audio_snippets || []);
     }
     return data;
   }
@@ -2159,7 +2290,7 @@ export default function PlaylistManager() {
       const result = await api("/api/meta/creative-experiments/matrix", {
         method: "POST",
         accessToken: accessToken(),
-        body: { experiment_id: experiment.id, phase_id: phase?.id, video_asset_ids: selection.videos, audio_track_ids: selection.audio },
+        body: { experiment_id: experiment.id, phase_id: phase?.id, video_asset_ids: selection.videos, audio_snippet_ids: selection.audio },
       });
       await Promise.all([loadCreativeExperiments(), loadCreativeProjects()]);
       return result;
@@ -2534,6 +2665,92 @@ export default function PlaylistManager() {
     });
   }
 
+  async function loadCampaignAudioLibrary(playlistId = metaDraftForm.playlist_id) {
+    if (!playlistId || !session?.access_token || !isAdmin) {
+      setCampaignAudioMasters([]);
+      setCampaignAudioMasterId("");
+      return null;
+    }
+    const data = await api(`/api/meta/audio-library?playlist_id=${encodeURIComponent(playlistId)}`, { accessToken: accessToken() }).catch((e) => {
+      setError(e.message || "Audio library failed.");
+      return null;
+    });
+    if (data) {
+      const masters = data.masters || [];
+      setCampaignAudioMasters(masters);
+      setCampaignAudioMasterId((current) => masters.some((master) => master.id === current) ? current : masters[0]?.id || "");
+    }
+    return data;
+  }
+
+  function audioFileDuration(file) {
+    return new Promise((resolve, reject) => {
+      const objectUrl = URL.createObjectURL(file);
+      const audio = new Audio();
+      audio.preload = "metadata";
+      audio.onloadedmetadata = () => {
+        const duration = Number(audio.duration);
+        URL.revokeObjectURL(objectUrl);
+        Number.isFinite(duration) && duration > 0 ? resolve(duration) : reject(new Error("Audio duration could not be read."));
+      };
+      audio.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        reject(new Error("Audio file could not be decoded."));
+      };
+      audio.src = objectUrl;
+    });
+  }
+
+  async function uploadCampaignAudioMaster() {
+    const file = campaignAudioUpload.file;
+    if (!file || !metaDraftForm.playlist_id) return;
+    await run("Audio master uploaded", async () => {
+      if (file.size > 100 * 1024 * 1024) throw new Error("Audio masters must be 100 MB or smaller.");
+      const inferredType = file.type || (file.name.toLowerCase().endsWith(".mp3") ? "audio/mpeg" : file.name.toLowerCase().endsWith(".wav") ? "audio/wav" : "audio/mp4");
+      if (!["audio/mpeg", "audio/mp4", "audio/x-m4a", "audio/wav", "audio/x-wav"].includes(inferredType)) throw new Error("Choose an MP3, M4A, or WAV file.");
+      const duration = await audioFileDuration(file);
+      const prepared = await api("/api/meta/audio-masters/upload-url", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: {
+          playlist_id: metaDraftForm.playlist_id,
+          file_name: file.name,
+          content_type: inferredType,
+          bytes: file.size,
+          title: campaignAudioUpload.title,
+          artist: campaignAudioUpload.artist,
+          rights_status: campaignAudioUpload.rights_status,
+        },
+      });
+      const uploadResponse = await fetch(prepared.upload_url, { method: "PUT", headers: { "Content-Type": inferredType, "x-upsert": "false" }, body: file });
+      if (!uploadResponse.ok) throw new Error(`Direct audio upload failed (${uploadResponse.status}).`);
+      await api("/api/meta/audio-masters/finalize", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { master_id: prepared.master.id, duration_seconds: duration },
+      });
+      setCampaignAudioUpload({ title: "", artist: "", rights_status: "test_only", file: null });
+      const library = await loadCampaignAudioLibrary(metaDraftForm.playlist_id);
+      if (library?.masters?.length) setCampaignAudioMasterId(library.masters[0].id);
+      return library;
+    });
+  }
+
+  async function saveCampaignAudioSnippet(input) {
+    await run("Audio snippet saved", async () => {
+      await api("/api/meta/audio-snippets", { method: "POST", accessToken: accessToken(), body: input });
+      return loadCampaignAudioLibrary(metaDraftForm.playlist_id);
+    });
+  }
+
+  function toggleCampaignAudioSnippet(snippetId) {
+    setMetaDraftForm((current) => {
+      const selected = current.audio_snippet_ids || [];
+      const next = selected.includes(snippetId) ? selected.filter((id) => id !== snippetId) : selected.length < 8 ? [...selected, snippetId] : selected;
+      return { ...current, audio_snippet_ids: next };
+    });
+  }
+
   function selectMetaCampaignPlaylist(selectedId) {
     const selected = playlists.find((item) => item.id === selectedId);
     setMetaDraftForm((current) => ({
@@ -2543,7 +2760,11 @@ export default function PlaylistManager() {
       destination_url: selected?.playlist_id ? `https://open.spotify.com/playlist/${selected.playlist_id}` : current.destination_url,
       image_url: selected?.image || current.image_url,
       headline: selected ? `Discover ${selected.name}`.slice(0, 255) : current.headline,
+      audio_snippet_ids: [],
     }));
+    setCampaignAudioMasters([]);
+    setCampaignAudioMasterId("");
+    if (selectedId) loadCampaignAudioLibrary(selectedId);
   }
 
   async function uploadMetaCreative(event) {
@@ -3866,16 +4087,8 @@ export default function PlaylistManager() {
           </section>
 
           <section className="dashboardPanel">
-            <div className="panelHeader"><div><h2>Song snippets</h2><p>Upload short MP3, M4A or WAV excerpts you have the right to use. A 15–30 second MP3 normally stays well below the 3 MB limit.</p></div><span className="jobStatus jobStatus--pending">{creativeAudioTracks.length}</span></div>
-            <div className="metaFormGrid">
-              <label><span>Creative project</span><select value={creativeAudioForm.project_id} onChange={(event) => setCreativeAudioForm((current) => ({ ...current, project_id: event.target.value }))}><option value="">Select a project</option>{creativeProjects.map((project) => <option value={project.id} key={project.id}>{project.name}</option>)}</select></label>
-              <label><span>Audio file</span><input type="file" accept=".mp3,.m4a,.wav,audio/mpeg,audio/mp4,audio/wav" onChange={(event) => setCreativeAudioForm((current) => ({ ...current, file: event.target.files?.[0] || null }))} /></label>
-              <label><span>Song title</span><input value={creativeAudioForm.title} onChange={(event) => setCreativeAudioForm((current) => ({ ...current, title: event.target.value }))} /></label>
-              <label><span>Artist</span><input value={creativeAudioForm.artist} onChange={(event) => setCreativeAudioForm((current) => ({ ...current, artist: event.target.value }))} /></label>
-              <label><span>Rights</span><select value={creativeAudioForm.rights_status} onChange={(event) => setCreativeAudioForm((current) => ({ ...current, rights_status: event.target.value }))}><option value="owned">Owned</option><option value="licensed">Licensed</option><option value="test_only">Test only</option><option value="unknown">Unknown</option></select></label>
-              <label><span>Default song start (seconds)</span><input type="number" min="0" step="0.1" value={creativeAudioForm.default_start_seconds} onChange={(event) => setCreativeAudioForm((current) => ({ ...current, default_start_seconds: event.target.value }))} /></label>
-            </div>
-            <div className="metaFormActions"><button disabled={busy || !creativeAudioForm.project_id || !creativeAudioForm.file} onClick={uploadCreativeAudio}>Upload snippet</button></div>
+            <div className="panelHeader"><div><h2>Campaign audio library</h2><p>Audio masters and reusable snippets are now prepared directly in the Campaign Creator. Experiments automatically see snippets belonging to the same playlist.</p></div><span className="jobStatus jobStatus--pending">{creativeAudioSnippets.length}</span></div>
+            <div className="metaFormActions"><button onClick={() => openAdsSection("new")}>Open Campaign Creator</button></div>
           </section>
 
           <div className="creativeProjectList">
@@ -3885,7 +4098,7 @@ export default function PlaylistManager() {
               const activePhase = phases.find((item) => item.phase_number === experiment.current_phase) || phases[0];
               const variants = activePhase?.meta_creative_variants || [];
               const videos = (project?.meta_creative_assets || []).filter((asset) => asset.asset_type === "video");
-              const tracks = creativeAudioTracks.filter((track) => track.project_id === experiment.project_id);
+              const tracks = creativeAudioSnippets.filter((snippet) => snippet.playlist_id === project?.playlist_id);
               const selection = creativeMatrixSelections[experiment.id] || { videos: [], audio: [] };
               const matrixSize = selection.videos.length * Math.max(1, selection.audio.length);
               const evaluation = activePhase?.config?.evaluation;
@@ -3904,7 +4117,7 @@ export default function PlaylistManager() {
                     const concept = (project?.meta_creative_concepts || []).find((item) => item.id === video.concept_id);
                     return <label key={video.id}><input type="checkbox" checked={selection.videos.includes(video.id)} onChange={() => toggleCreativeMatrix(experiment.id, "videos", video.id)} /> <span>{concept?.title || "Video concept"}</span></label>;
                   })}{!videos.length ? <p>Assign video footage in Creative Studio first.</p> : null}</div></div>
-                  <div><h3>Song snippets</h3><div className="metaPermissionList">{tracks.map((track) => <label key={track.id}><input type="checkbox" checked={selection.audio.includes(track.id)} onChange={() => toggleCreativeMatrix(experiment.id, "audio", track.id)} /> <span>{track.title}{track.artist ? ` — ${track.artist}` : ""}</span></label>)}{!tracks.length ? <p>No song snippets uploaded for this project. Rendering without audio remains possible.</p> : null}</div></div>
+                  <div><h3>Song snippets</h3><div className="metaPermissionList">{tracks.map((track) => <label key={track.id}><input type="checkbox" checked={selection.audio.includes(track.id)} onChange={() => toggleCreativeMatrix(experiment.id, "audio", track.id)} /> <span>{track.title}{track.meta_audio_masters?.artist ? ` — ${track.meta_audio_masters.artist}` : ""} · {(Number(track.end_seconds) - Number(track.start_seconds)).toFixed(1)}s</span></label>)}{!tracks.length ? <p>No campaign snippets exist for this playlist. Create them in New campaign → Audio.</p> : null}</div></div>
                 </div>
                 <div className="metaFormActions"><button disabled={busy || !activePhase || !selection.videos.length || matrixSize > 128} onClick={() => createCreativeMatrix(experiment)}>Queue {matrixSize} renders</button><small>Duplicate DNA is skipped automatically. Maximum 128 combinations per batch.</small></div>
                 {variants.length ? <section>
@@ -4021,26 +4234,41 @@ export default function PlaylistManager() {
         {adsSection === "new" ?
         <section className="dashboardPanel metaDraftComposer">
           <div className="panelHeader">
-            <div><h2>New campaign</h2><p>Build a paused campaign package in three steps. Nothing is sent to Meta while completing this form.</p></div>
+            <div><h2>New campaign</h2><p>Choose the playlist, prepare reusable audio snippets, and build a paused campaign package.</p></div>
             <span className="metaReadOnlyBadge">Always PAUSED</span>
           </div>
           <div className="adsWizardSteps" aria-label="Campaign creation progress">
-            {["Destination", "Audience & budget", "Creative", "Delivery"].map((label, index) => <button key={label} className={adsWizardStep === index + 1 ? "active" : adsWizardStep > index + 1 ? "complete" : ""} onClick={() => setAdsWizardStep(index + 1)}><span>{index + 1}</span>{label}</button>)}
+            {["Campaign", "Audio", "Audience", "Creative", "Delivery"].map((label, index) => <button key={label} className={adsWizardStep === index + 1 ? "active" : adsWizardStep > index + 1 ? "complete" : ""} onClick={() => setAdsWizardStep(index + 1)}><span>{index + 1}</span>{label}</button>)}
           </div>
           <div className="metaDraftGrid">
             {adsWizardStep === 1 ? <>
               <label className="metaDraftWide"><span>Playlist</span><select value={metaDraftForm.playlist_id} onChange={(e) => selectMetaCampaignPlaylist(e.target.value)}><option value="">Select a playlist</option>{playlists.map((item) => <option key={item.id} value={item.id}>{item.name} · {formatNumber(item.followers)} followers</option>)}</select></label>
               <label className="metaDraftWide"><span>Campaign name</span><input value={metaDraftForm.name} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, name: e.target.value })} /></label>
               <label className="metaDraftWide"><span>Spotify destination URL</span><input type="url" value={metaDraftForm.destination_url} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, destination_url: e.target.value })} placeholder="https://open.spotify.com/playlist/..." /></label>
+              <label className="metaDraftWide"><span>Creative notes <small>optional guidance for the 8 creatives</small></span><textarea rows="3" value={metaDraftForm.creative_notes} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, creative_notes: e.target.value })} placeholder="Darker, urban, no obvious party footage. Hooks can be bold and experimental." /></label>
               {metaDraftForm.playlist_id ? <article className="adsSelectedPlaylist"><Artwork src={playlists.find((item) => item.id === metaDraftForm.playlist_id)?.image} alt="" size="lg" /><div><span>Campaign destination</span><strong>{playlists.find((item) => item.id === metaDraftForm.playlist_id)?.name}</strong><small>Spotify link and cover imported automatically</small></div></article> : null}
             </> : null}
             {adsWizardStep === 2 ? <>
+              <section className="campaignAudioStep metaDraftWide">
+                <div className="panelHeader"><div><h3>Audio masters & snippets</h3><p>Upload a full song once, then save several non-destructive 5–30 second regions. Fifteen seconds is the recommended default.</p></div><span className="jobStatus jobStatus--pending">{(metaDraftForm.audio_snippet_ids || []).length}/8 selected</span></div>
+                <div className="metaFormGrid campaignAudioUploadGrid">
+                  <label><span>Audio file</span><input type="file" accept=".mp3,.m4a,.wav,audio/mpeg,audio/mp4,audio/wav" onChange={(event) => setCampaignAudioUpload((current) => ({ ...current, file: event.target.files?.[0] || null }))} /></label>
+                  <label><span>Song title</span><input value={campaignAudioUpload.title} onChange={(event) => setCampaignAudioUpload((current) => ({ ...current, title: event.target.value }))} placeholder={campaignAudioUpload.file?.name?.replace(/\.[^.]+$/, "") || "Optional"} /></label>
+                  <label><span>Artist</span><input value={campaignAudioUpload.artist} onChange={(event) => setCampaignAudioUpload((current) => ({ ...current, artist: event.target.value }))} /></label>
+                  <label><span>Rights</span><select value={campaignAudioUpload.rights_status} onChange={(event) => setCampaignAudioUpload((current) => ({ ...current, rights_status: event.target.value }))}><option value="owned">Owned</option><option value="licensed">Licensed</option><option value="test_only">Test only</option><option value="unknown">Unknown</option></select></label>
+                </div>
+                <div className="metaFormActions"><button disabled={busy || !metaDraftForm.playlist_id || !campaignAudioUpload.file} onClick={uploadCampaignAudioMaster}>Upload master</button><small>Direct encrypted upload to project storage · MP3, M4A or WAV · maximum 100 MB</small></div>
+                {campaignAudioMasters.length ? <div className="campaignAudioMasterTabs">{campaignAudioMasters.map((master) => <button className={campaignAudioMasterId === master.id ? "active" : "secondary"} key={master.id} onClick={() => setCampaignAudioMasterId(master.id)}>{master.title}{master.artist ? ` · ${master.artist}` : ""}<small>{Number(master.duration_seconds || 0).toFixed(0)}s · {(master.meta_audio_snippets || []).length} snippets</small></button>)}</div> : <div className="creativeEmptyState"><strong>No audio uploaded for this playlist</strong><p>You can continue without audio or upload one or more masters now.</p></div>}
+                {campaignAudioMasters.filter((master) => master.id === campaignAudioMasterId).map((master) => <CampaignAudioTrimmer key={master.id} master={master} snippets={master.meta_audio_snippets || []} selectedIds={metaDraftForm.audio_snippet_ids || []} onSave={saveCampaignAudioSnippet} onToggle={toggleCampaignAudioSnippet} busy={busy} />)}
+              </section>
+            </> : null}
+            {adsWizardStep === 3 ? <>
               <label><span>Daily budget (EUR)</span><input type="number" min="1" step="1" value={metaDraftForm.daily_budget_eur} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, daily_budget_eur: e.target.value })} /></label>
               <label><span>Countries</span><input value={metaDraftForm.countries} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, countries: e.target.value })} placeholder="DE, AT, CH" /></label>
               <label><span>Minimum age</span><input type="number" min="13" max="65" value={metaDraftForm.age_min} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, age_min: e.target.value })} /></label>
               <label><span>Maximum age</span><input type="number" min="13" max="65" value={metaDraftForm.age_max} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, age_max: e.target.value })} /></label>
             </> : null}
-            {adsWizardStep === 3 ? <>
+            {adsWizardStep === 4 ? <>
               <label className="metaDraftWide"><span>Creative image URL</span><input type="url" value={metaDraftForm.image_url} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, image_url: e.target.value })} placeholder="https://.../cover.jpg" /></label>
               <label className="adsCreativeUpload metaDraftWide"><span>Or upload a custom image</span><input type="file" accept="image/jpeg,image/png,image/webp" disabled={busy} onChange={uploadMetaCreative} /><small>JPEG, PNG or WebP · maximum 3 MB · square images work best</small></label>
               <label className="metaDraftWide"><span>Headline</span><input value={metaDraftForm.headline} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, headline: e.target.value })} /></label>
@@ -4049,7 +4277,7 @@ export default function PlaylistManager() {
                 {[{ platform: "Instagram", identity: (metaWorkspace?.assets || []).find((asset) => asset.asset_type === "instagram_account" && asset.is_selected)?.name || "Instagram" }, { platform: "Facebook", identity: (metaWorkspace?.assets || []).find((asset) => asset.asset_type === "page" && asset.is_selected)?.name || "Facebook Page" }].map((preview) => <aside className="adsCreativePreview" key={preview.platform}><div className="adsPreviewIdentity"><span>{preview.platform} feed</span><strong>{preview.identity}</strong></div><p>{metaDraftForm.primary_text || "Your primary text"}</p>{metaDraftForm.image_url ? <img src={metaDraftForm.image_url} alt={`${preview.platform} campaign preview`} /> : <div className="adsCreativePlaceholder">Image preview</div>}<div className="adsPreviewLink"><div><small>OPEN.SPOTIFY.COM</small><strong>{metaDraftForm.headline || "Your headline"}</strong></div><b>Learn more</b></div></aside>)}
               </div>
             </> : null}
-            {adsWizardStep === 4 ? <>
+            {adsWizardStep === 5 ? <>
               <label><span>Start date</span><input type="date" min={new Date().toISOString().slice(0, 10)} value={metaDraftForm.start_date} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, start_date: e.target.value })} /></label>
               <label><span>End date</span><input type="date" min={metaDraftForm.start_date || new Date().toISOString().slice(0, 10)} value={metaDraftForm.end_date} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, end_date: e.target.value })} /></label>
               <fieldset className="adsPlacementChoices"><legend>Placements</legend>{[{ id: "automatic", title: "Advantage+ placements", text: "Meta distributes across Facebook and Instagram." }, { id: "feeds", title: "Feeds", text: "Facebook Feed and Instagram Feed only." }, { id: "stories_reels", title: "Stories & Reels", text: "Vertical placements on both platforms." }].map((option) => <label className={metaDraftForm.placement_mode === option.id ? "selected" : ""} key={option.id}><input type="radio" name="placement_mode" value={option.id} checked={metaDraftForm.placement_mode === option.id} onChange={(e) => setMetaDraftForm({ ...metaDraftForm, placement_mode: e.target.value })} /><span><strong>{option.title}</strong><small>{option.text}</small></span></label>)}</fieldset>
@@ -4058,7 +4286,7 @@ export default function PlaylistManager() {
           </div>
           <div className="metaFormActions adsWizardActions">
             <button disabled={busy || adsWizardStep === 1} onClick={() => setAdsWizardStep((step) => Math.max(1, step - 1))}>Back</button>
-            {adsWizardStep < 4 ? <button disabled={busy || (adsWizardStep === 1 && (!metaDraftForm.playlist_id || !metaDraftForm.destination_url)) || (adsWizardStep === 3 && !metaDraftForm.image_url)} onClick={() => setAdsWizardStep((step) => Math.min(4, step + 1))}>Continue</button> : <button disabled={busy || !metaWorkspace?.readiness?.publishing_ready || !metaDraftForm.start_date || !metaDraftForm.end_date || metaDraftForm.end_date <= metaDraftForm.start_date} onClick={saveMetaDraft}>Save campaign draft</button>}
+            {adsWizardStep < 5 ? <button disabled={busy || (adsWizardStep === 1 && (!metaDraftForm.playlist_id || !metaDraftForm.destination_url)) || (adsWizardStep === 4 && !metaDraftForm.image_url)} onClick={() => setAdsWizardStep((step) => Math.min(5, step + 1))}>Continue</button> : <button disabled={busy || !metaWorkspace?.readiness?.publishing_ready || !metaDraftForm.start_date || !metaDraftForm.end_date || metaDraftForm.end_date <= metaDraftForm.start_date} onClick={saveMetaDraft}>Save campaign draft</button>}
             <small>Objective and delivery status are locked to <b>Traffic</b> and <b>PAUSED</b>.</small>
           </div>
         </section>
@@ -7009,6 +7237,28 @@ export default function PlaylistManager() {
         }
         .adsCreativeUpload small { color: #7f8998; font-weight: 500; }
         .adsCreativeUpload input { padding: 7px 0; border: 0; background: transparent; }
+        .campaignAudioStep { display: grid; gap: 14px; }
+        .campaignAudioUploadGrid { padding: 14px; border: 1px solid #303744; border-radius: 9px; background: #11151b; }
+        .campaignAudioMasterTabs { display: flex; gap: 8px; overflow-x: auto; padding: 2px 0 7px; }
+        .campaignAudioMasterTabs button { display: grid; flex: 0 0 auto; gap: 3px; min-width: 170px; text-align: left; }
+        .campaignAudioMasterTabs button.active { color: #07140c; background: #8ea7ff; }
+        .campaignAudioMasterTabs small { color: inherit; opacity: .72; font-size: 9px; }
+        .campaignAudioTrimmer { display: grid; gap: 12px; padding: 14px; border: 1px solid rgba(142, 167, 255, .42); border-radius: 10px; background: rgba(91, 132, 255, .055); }
+        .campaignAudioTrimmer audio { display: none; }
+        .campaignWaveform { position: relative; height: 150px; overflow: hidden; border-radius: 8px; cursor: crosshair; background: #111820; }
+        .campaignWaveform canvas { display: block; width: 100%; height: 150px; }
+        .campaignWaveform > span { position: absolute; inset: 0; display: grid; place-items: center; color: #8290a3; font-size: 11px; }
+        .campaignWaveformSelection { position: absolute; top: 0; bottom: 0; z-index: 2; border: 1px solid #fff; border-radius: 4px; background: rgba(255, 255, 255, .12); box-shadow: 0 0 0 9999px rgba(3, 7, 12, .42); pointer-events: none; }
+        .campaignAudioPresets { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+        .campaignAudioPresets button { min-width: auto; padding: 7px 10px; }
+        .campaignAudioPresets button.active { color: #07140c; background: #8ea7ff; }
+        .campaignAudioPresets label { display: flex; align-items: center; gap: 6px; margin-left: auto; color: #aeb8c5; font-size: 11px; }
+        .campaignAudioPresets input, .campaignSnippetList input { width: auto; accent-color: #8ea7ff; }
+        .campaignSnippetList { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+        .campaignSnippetList label { display: flex; align-items: flex-start; gap: 9px; padding: 10px; border: 1px solid #303744; border-radius: 8px; background: #10151b; cursor: pointer; }
+        .campaignSnippetList label.selected { border-color: #8ea7ff; background: rgba(91, 132, 255, .12); }
+        .campaignSnippetList span { display: grid; gap: 3px; min-width: 0; }
+        .campaignSnippetList small { color: #7f8998; font-size: 9px; }
         .adsCreativePreviewGrid {
           grid-column: 1 / -1;
           display: grid;
