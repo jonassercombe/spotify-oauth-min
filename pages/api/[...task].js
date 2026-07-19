@@ -1071,7 +1071,8 @@ function coreStoryHookSeeds(notes) {
     .map((match) => normalizeOverlayHook(match[1]))
     .filter((value) => value.split(/\s+/).length >= 3);
   const coreSentence = source.match(/core story\s*:\s*([^.!?]+[.!?]?)/i)?.[1] || "";
-  const normalizedCore = normalizeOverlayHook(coreSentence);
+  const coreClause = coreSentence.split(/[,;—]/)[0].trim();
+  const normalizedCore = normalizeOverlayHook(coreClause);
   return [...new Set([...quoted, ...(normalizedCore.split(/\s+/).length >= 3 ? [normalizedCore] : [])])].slice(0, 3);
 }
 
