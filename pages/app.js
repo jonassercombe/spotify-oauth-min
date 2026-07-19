@@ -184,6 +184,7 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
   const duration = Math.max(5, Number(master?.duration_seconds || 15));
   const canvasRef = useRef(null);
   const audioRef = useRef(null);
+  const regionDragRef = useRef({ active: false, offsetPx: 0, pointerId: null });
   const [start, setStart] = useState(0);
   const [end, setEnd] = useState(Math.min(30, duration));
   const [fadeIn, setFadeIn] = useState(0.2);
@@ -191,6 +192,7 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
   const [title, setTitle] = useState("");
   const [loop, setLoop] = useState(true);
   const [playing, setPlaying] = useState(false);
+  const [draggingRegion, setDraggingRegion] = useState(false);
   const [waveformStatus, setWaveformStatus] = useState("loading");
 
   useEffect(() => {
@@ -239,12 +241,48 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
     return () => { cancelled = true; };
   }, [master.id, master.source_url, duration]);
 
-  function seekFromWaveform(event) {
-    const rect = event.currentTarget.getBoundingClientRect();
-    const nextStart = Math.max(0, Math.min(duration - 30, ((event.clientX - rect.left) / rect.width) * duration));
+  function setSnippetStart(nextValue) {
+    const nextStart = Math.max(0, Math.min(duration - 30, Number(nextValue) || 0));
     const roundedStart = Math.round(nextStart * 10) / 10;
     setStart(roundedStart);
     setEnd(Math.min(duration, roundedStart + 30));
+  }
+
+  function seekFromWaveform(event) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    setSnippetStart(((event.clientX - rect.left) / rect.width) * duration);
+  }
+
+  function startRegionDrag(event) {
+    const selectionRect = event.currentTarget.getBoundingClientRect();
+    regionDragRef.current = {
+      active: true,
+      offsetPx: event.clientX - selectionRect.left,
+      pointerId: event.pointerId,
+    };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    setDraggingRegion(true);
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  function moveRegionDrag(event) {
+    if (!regionDragRef.current.active || regionDragRef.current.pointerId !== event.pointerId) return;
+    const waveform = event.currentTarget.parentElement;
+    const rect = waveform.getBoundingClientRect();
+    const nextStart = ((event.clientX - rect.left - regionDragRef.current.offsetPx) / rect.width) * duration;
+    setSnippetStart(nextStart);
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  function endRegionDrag(event) {
+    if (regionDragRef.current.pointerId !== event.pointerId) return;
+    regionDragRef.current = { active: false, offsetPx: 0, pointerId: null };
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+    setDraggingRegion(false);
+    event.preventDefault();
+    event.stopPropagation();
   }
 
   function handleTimeUpdate() {
@@ -301,11 +339,30 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
     <div className="campaignWaveformWorkspace">
       <div className="campaignWaveformTopline">
         <span>Choose a moment</span>
-        <small>Click the waveform to move the selection</small>
+        <small>Drag the selection or click the waveform to reposition it</small>
       </div>
       <div className="campaignWaveform" onClick={seekFromWaveform}>
         <canvas ref={canvasRef} aria-label={`Waveform for ${master.title}`} />
-        <div className="campaignWaveformSelection" style={{ left: `${(start / duration) * 100}%`, width: `${(snippetDuration / duration) * 100}%` }}>
+        <div
+          className={`campaignWaveformSelection ${draggingRegion ? "dragging" : ""}`}
+          style={{ left: `${(start / duration) * 100}%`, width: `${(snippetDuration / duration) * 100}%` }}
+          role="slider"
+          tabIndex="0"
+          aria-label="Selected 30-second audio region"
+          aria-valuemin="0"
+          aria-valuemax={Math.max(0, duration - 30)}
+          aria-valuenow={start}
+          onPointerDown={startRegionDrag}
+          onPointerMove={moveRegionDrag}
+          onPointerUp={endRegionDrag}
+          onPointerCancel={endRegionDrag}
+          onClick={(event) => event.stopPropagation()}
+          onKeyDown={(event) => {
+            if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+            setSnippetStart(start + (event.key === "ArrowRight" ? 1 : -1) * (event.shiftKey ? 5 : 0.5));
+            event.preventDefault();
+          }}
+        >
           <i />
           <i />
         </div>
@@ -373,7 +430,9 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
       .campaignWaveform::before { content: ""; position: absolute; z-index: 1; inset: 0; background: repeating-linear-gradient(90deg, transparent 0, transparent calc(12.5% - 1px), rgba(255,255,255,.045) 12.5%); pointer-events: none; }
       .campaignWaveform canvas { display: block; width: 100%; height: 158px; margin-top: 5px; opacity: .92; }
       .campaignWaveform > span { position: absolute; inset: 0; display: grid; place-items: center; color: #8290a3; font-size: 11px; }
-      .campaignWaveformSelection { position: absolute; top: 7px; bottom: 25px; z-index: 2; border: 1px solid rgba(255,255,255,.92); border-radius: 6px; background: rgba(142,167,255,.13); box-shadow: 0 0 0 9999px rgba(3,7,12,.54), 0 0 24px rgba(142,167,255,.14); pointer-events: none; }
+      .campaignWaveformSelection { position: absolute; top: 7px; bottom: 25px; z-index: 2; border: 1px solid rgba(255,255,255,.92); border-radius: 6px; background: rgba(142,167,255,.13); box-shadow: 0 0 0 9999px rgba(3,7,12,.54), 0 0 24px rgba(142,167,255,.14); cursor: grab; touch-action: none; user-select: none; }
+      .campaignWaveformSelection:hover, .campaignWaveformSelection:focus-visible { border-color: #fff; background: rgba(142,167,255,.2); outline: none; }
+      .campaignWaveformSelection.dragging { cursor: grabbing; background: rgba(142,167,255,.24); box-shadow: 0 0 0 9999px rgba(3,7,12,.56), 0 0 30px rgba(142,167,255,.24); }
       .campaignWaveformSelection i { position: absolute; top: 50%; width: 5px; height: 31px; border-radius: 4px; background: #fff; transform: translateY(-50%); }
       .campaignWaveformSelection i:first-child { left: -3px; }
       .campaignWaveformSelection i:last-child { right: -3px; }
@@ -4791,7 +4850,7 @@ export default function PlaylistManager() {
                   </div>
                 </section>
                 {campaignAudioMasters.length ? <section className="campaignAudioMasterLibrary"><div><span>Audio masters</span><small>Choose a track to create or review snippets</small></div><div className="campaignAudioMasterTabs">{campaignAudioMasters.map((master, index) => <button className={campaignAudioMasterId === master.id ? "active" : "secondary"} key={master.id} onClick={() => setCampaignAudioMasterId(master.id)}><i>{index + 1}</i><span><strong>{master.title}</strong><small>{master.artist || "Unknown artist"} · {Math.floor(Number(master.duration_seconds || 0) / 60)}:{String(Math.round(Number(master.duration_seconds || 0) % 60)).padStart(2, "0")}</small></span><b>{(master.meta_audio_snippets || []).length} snippets</b></button>)}</div></section> : <div className="campaignAudioEmpty"><i>♪</i><div><strong>Your audio workspace is empty</strong><p>Upload a master above, or continue without audio and add sound later.</p></div></div>}
-                {campaignAudioMasters.filter((master) => master.id === campaignAudioMasterId).map((master) => <CampaignAudioTrimmer key={master.id} master={master} snippets={master.meta_audio_snippets || []} selectedIds={metaDraftForm.audio_snippet_ids || []} onSave={saveCampaignAudioSnippet} onToggle={toggleCampaignAudioSnippet} onDelete={deleteCampaignAudioSnippet} busy={busy} />)}
+                {campaignAudioMasters.filter((master) => master.id === campaignAudioMasterId).map((master) => <div className="campaignAudioEditorColumn" key={master.id}><CampaignAudioTrimmer master={master} snippets={master.meta_audio_snippets || []} selectedIds={metaDraftForm.audio_snippet_ids || []} onSave={saveCampaignAudioSnippet} onToggle={toggleCampaignAudioSnippet} onDelete={deleteCampaignAudioSnippet} busy={busy} /></div>)}
               </section>
             </> : null}
             {adsWizardStep === 3 ? <>
@@ -7820,6 +7879,8 @@ export default function PlaylistManager() {
         .adsCreativeUpload small { color: #7f8998; font-weight: 500; }
         .adsCreativeUpload input { padding: 7px 0; border: 0; background: transparent; }
         .campaignAudioStep { display: grid; gap: 22px; }
+        .campaignAudioStep.metaDraftWide { grid-column: 1 / -1; }
+        .campaignAudioEditorColumn { min-width: 0; }
         .campaignAudioIntro { display: flex; align-items: end; justify-content: space-between; gap: 28px; padding: 8px 2px 2px; }
         .campaignAudioIntro > div:first-child { max-width: 720px; }
         .campaignAudioIntro > div:first-child > span,
@@ -7863,6 +7924,43 @@ export default function PlaylistManager() {
         .campaignAudioMasterTabs button.active { border-color: rgba(142,167,255,.68); color: #f5f7fa; background: rgba(142,167,255,.11); box-shadow: inset 0 0 0 1px rgba(142,167,255,.1); }
         .campaignAudioMasterTabs button.active > i { color: #0a1018; background: #8ea7ff; }
         .campaignAudioMasterTabs small { color: #7c8796; font-size: 9px; }
+        @media (min-width: 1280px) {
+          .campaignAudioStep {
+            grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
+            align-items: start;
+          }
+          .campaignAudioIntro,
+          .campaignAudioUploader {
+            grid-column: 1 / -1;
+          }
+          .campaignAudioMasterLibrary {
+            grid-column: 1;
+            grid-row: 3;
+            position: sticky;
+            top: 20px;
+          }
+          .campaignAudioMasterLibrary > div:first-child {
+            align-items: flex-start;
+            flex-direction: column;
+            gap: 3px;
+          }
+          .campaignAudioMasterTabs {
+            display: grid;
+            overflow: visible;
+            padding: 1px 0;
+          }
+          .campaignAudioMasterTabs button {
+            width: 100%;
+            min-width: 0;
+          }
+          .campaignAudioEditorColumn {
+            grid-column: 2;
+            grid-row: 3;
+          }
+          .campaignAudioEmpty {
+            grid-column: 1 / -1;
+          }
+        }
         .campaignAudioEmpty { display: flex; align-items: center; gap: 16px; min-height: 94px; padding: 18px 20px; border: 1px dashed #37404c; border-radius: 12px; background: rgba(255,255,255,.012); }
         .campaignAudioEmpty > i { display: grid; place-items: center; width: 46px; height: 46px; border-radius: 50%; color: #8ea7ff; background: rgba(142,167,255,.09); font-size: 20px; font-style: normal; }
         .campaignAudioEmpty > div { display: grid; gap: 4px; }
