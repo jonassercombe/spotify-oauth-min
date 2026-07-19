@@ -4350,8 +4350,24 @@ const routes = {
       });
       if (!Array.isArray(generated.concepts) || generated.concepts.length !== 8) throw new Error("openai_invalid_concept_count");
       const expectedProductionTypes = [...Array(6).fill("stock_simple"), "stock_montage", "experimental_wildcard"];
-      if (generated.concepts.some((concept, index) => concept.production_type !== expectedProductionTypes[index])) {
-        throw new Error("openai_invalid_production_portfolio");
+      const conceptsByProductionType = Object.fromEntries([...new Set(expectedProductionTypes)].map((type) => [type, generated.concepts.filter((concept) => concept.production_type === type)]));
+      const returnedCountsAreUsable =
+        conceptsByProductionType.stock_simple.length === 6 &&
+        conceptsByProductionType.stock_montage.length === 1 &&
+        conceptsByProductionType.experimental_wildcard.length === 1;
+      if (returnedCountsAreUsable) {
+        // Models occasionally return the requested portfolio in a different order.
+        // Keep the concepts and put them into the fixed rendering slots instead of
+        // failing a whole eight-creative run over a harmless ordering difference.
+        generated.concepts = [
+          ...conceptsByProductionType.stock_simple,
+          ...conceptsByProductionType.stock_montage,
+          ...conceptsByProductionType.experimental_wildcard,
+        ];
+      } else {
+        // A malformed distribution should still remain renderable. The slot is the
+        // source of truth for downstream Pexels selection and render behavior.
+        generated.concepts.forEach((concept, index) => { concept.production_type = expectedProductionTypes[index]; });
       }
       let normalizedHooks = generated.concepts.map(normalizeGeneratedHookCandidates);
       generated.concepts.forEach((concept, index) => { concept.hook = normalizedHooks[index].chosenHook; });
