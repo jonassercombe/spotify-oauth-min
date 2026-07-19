@@ -61,6 +61,55 @@ function formatShortDate(value) {
   return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(d);
 }
 
+function campaignCreativeDna(concept = {}) {
+  const dna = concept.creative_dna || concept.render_spec?.creative_dna || concept.metadata?.creative_dna || {};
+  const values = [
+    ["Angle", dna.angle_type || dna.angle || concept.angle || concept.strategic_angle],
+    ["Hook", dna.hook_type || concept.hook_type],
+    ["Visual", [dna.visual_subject, dna.camera_energy].filter(Boolean).join(" · ") || dna.visual_style || dna.footage_mood || concept.production_type],
+    ["Layout", dna.template_id || concept.render_spec?.editor?.template_id],
+    ["Audio", dna.audio_energy || dna.audio_title || dna.song_title || dna.audio_snippet_id || concept.render_spec?.editor?.audio_snippet_id],
+  ];
+  return values
+    .filter(([, value]) => value !== null && value !== undefined && String(value).trim())
+    .map(([label, value]) => ({ label, value: String(value).replaceAll("_", " ") }))
+    .slice(0, 5);
+}
+
+function campaignCreativeQuality(render = {}, outputAsset = {}) {
+  const relatedReport = Array.isArray(render.meta_creative_render_quality_reports)
+    ? render.meta_creative_render_quality_reports[0]
+    : render.meta_creative_render_quality_reports;
+  const report = relatedReport || render.quality_report || render.metadata?.quality_report || outputAsset.quality_report || outputAsset.metadata?.quality_report || null;
+  if (!report || typeof report !== "object") return null;
+  const rawIssues = Array.isArray(report.issues)
+    ? report.issues
+    : Array.isArray(report.findings)
+      ? report.findings
+      : Array.isArray(report.warnings)
+        ? report.warnings
+        : Array.isArray(report.checks)
+          ? report.checks.filter((check) => check.severity !== "pass")
+          : [];
+  const issues = rawIssues.map((issue) => {
+    if (typeof issue === "string") return { message: issue, severity: "warning", fixable: false };
+    return {
+      message: issue.message || issue.title || issue.description || issue.issue || issue.finding || "Quality issue",
+      severity: issue.severity || issue.level || "warning",
+      fixable: Boolean(issue.auto_fixable ?? issue.fixable),
+    };
+  }).filter((issue) => issue.message);
+  const score = Number(report.score ?? report.overall_score ?? report.quality_score);
+  const status = String(report.status || report.verdict || (Number.isFinite(score) ? (score >= 80 ? "passed" : score >= 60 ? "review" : "failed") : issues.length ? "review" : "passed")).toLowerCase();
+  return {
+    ...report,
+    score: Number.isFinite(score) ? Math.round(score) : null,
+    status,
+    issues,
+    canAutoFix: Boolean(report.auto_fixable || report.auto_fix_available || report.can_auto_fix || report.fixable || issues.some((issue) => issue.fixable)),
+  };
+}
+
 function buildBackupSlots(backups = []) {
   const rows = [...(Array.isArray(backups) ? backups : [])]
     .filter((row) => row?.id && Number.isFinite(Date.parse(row.taken_at || "")))
@@ -2790,6 +2839,39 @@ export default function PlaylistManager() {
       const failed = latestJobs.filter((job) => ["failed", "cancelled"].includes(job.status)).length;
       setCampaignGeneration({ batch_id: batchId, stage: "rendering", completed, total, failed });
       if (latestJobs.length === concepts.length && completed + failed >= concepts.length) {
+        const pendingQaJobs = latestJobs.filter((job) =>
+          job.status === "completed" &&
+          !(Array.isArray(job.meta_creative_render_quality_reports)
+            ? job.meta_creative_render_quality_reports.length
+            : job.meta_creative_render_quality_reports)
+        );
+        if (pendingQaJobs.length) {
+          await setCampaignBatchStatus(batchId, "rendering", { stage: "quality", completed: 0, total: pendingQaJobs.length, failed: 0 });
+          setCampaignGeneration({ batch_id: batchId, stage: "quality", completed: 0, total: pendingQaJobs.length, failed: 0 });
+          let qaCursor = 0;
+          let qaCompleted = 0;
+          let qaFailed = 0;
+          const qaWorker = async () => {
+            while (qaCursor < pendingQaJobs.length) {
+              const qaJob = pendingQaJobs[qaCursor];
+              qaCursor += 1;
+              try {
+                await api("/api/meta/creative-renders/quality", {
+                  method: "POST",
+                  accessToken: accessToken(),
+                  body: { render_job_id: qaJob.id },
+                });
+                qaCompleted += 1;
+              } catch {
+                qaFailed += 1;
+              }
+              const qaProgress = { stage: "quality", completed: qaCompleted, total: pendingQaJobs.length, failed: qaFailed };
+              setCampaignGeneration({ batch_id: batchId, ...qaProgress });
+              await setCampaignBatchStatus(batchId, "rendering", qaProgress).catch(() => null);
+            }
+          };
+          await Promise.all([qaWorker(), qaWorker()]);
+        }
         await setCampaignBatchStatus(batchId, "review", { stage: "review", completed, total, failed });
         await loadCampaignCreativeBatches(metaDraftForm.playlist_id);
         setCampaignGeneration({ batch_id: batchId, stage: "review", completed, total, failed });
@@ -2906,6 +2988,22 @@ export default function PlaylistManager() {
   async function reviewCampaignCreative(batchId, conceptId, decision) {
     await run(decision === "approved" ? "Creative approved" : "Creative rejected", async () => {
       await api("/api/meta/campaign-creative-reviews", { method: "POST", accessToken: accessToken(), body: { batch_id: batchId, concept_id: conceptId, decision } });
+      return loadCampaignCreativeBatches(metaDraftForm.playlist_id);
+    });
+  }
+
+  async function runCampaignCreativeQuality(renderJobId, autoFix = false, batchId = "") {
+    if (!renderJobId) return;
+    await run(autoFix ? "Automatic quality fix started" : "Creative quality review complete", async () => {
+      const result = await api("/api/meta/creative-renders/quality", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { render_job_id: renderJobId, ...(autoFix ? { auto_fix: true } : {}) },
+      });
+      if (autoFix && result?.render_job?.id && batchId) {
+        setCampaignGeneration({ batch_id: batchId, stage: "rendering", completed: 0, total: 1, failed: 0 });
+        pollCampaignCreativeBatch(batchId);
+      }
       return loadCampaignCreativeBatches(metaDraftForm.playlist_id);
     });
   }
@@ -4459,7 +4557,7 @@ export default function PlaylistManager() {
                 </div>
                 {campaignGeneration ? <div className={`campaignGenerationProgress campaignGenerationProgress--${campaignGeneration.stage}`}>
                   <div><span style={{ width: `${Math.round((Number(campaignGeneration.completed || 0) / Math.max(1, Number(campaignGeneration.total || 8))) * 100)}%` }} /></div>
-                  <strong>{campaignGeneration.stage === "concepts" ? "Writing concepts" : campaignGeneration.stage === "media" ? "Directing footage" : campaignGeneration.stage === "rendering" ? "Rendering videos" : campaignGeneration.stage === "review" ? "Ready for review" : "Generation needs attention"}</strong>
+                  <strong>{campaignGeneration.stage === "concepts" ? "Writing and ranking hooks" : campaignGeneration.stage === "media" ? "Directing footage" : campaignGeneration.stage === "rendering" ? "Rendering videos" : campaignGeneration.stage === "quality" ? "Checking finished creatives" : campaignGeneration.stage === "review" ? "Ready for review" : "Generation needs attention"}</strong>
                   <small>{campaignGeneration.error || `${campaignGeneration.completed || 0} of ${campaignGeneration.total || 8} complete${campaignGeneration.failed ? ` · ${campaignGeneration.failed} failed` : ""}`}</small>
                 </div> : null}
                 <div className="campaignBatchList">
@@ -4476,9 +4574,27 @@ export default function PlaylistManager() {
                           const render = renders.filter((item) => item.concept_id === concept.id && item.status === "completed").sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0];
                           const outputAsset = assets.find((item) => item.id === render?.output_asset_id);
                           const decision = reviews.find((item) => item.concept_id === concept.id)?.decision || "pending";
+                          const creativeDna = campaignCreativeDna(concept);
+                          const quality = campaignCreativeQuality(render, outputAsset);
+                          const qualityLabel = quality ? (quality.status === "passed" || quality.status === "pass" ? "Quality passed" : quality.status === "failed" || quality.status === "fail" ? "Needs fixing" : "Review quality") : "Not checked";
                           return <article className={`campaignReviewCard campaignReviewCard--${decision}`} key={concept.id}>
                             {outputAsset?.source_url ? <video src={outputAsset.source_url} controls muted playsInline preload="metadata" /> : <div className="campaignReviewPlaceholder"><span>{render?.status || batch.status}</span></div>}
-                            <div><span>Concept {concept.position} · {decision}</span><h4>{concept.hook || concept.title}</h4><small>{concept.title}</small></div>
+                            <div className="campaignReviewIdentity"><span>Concept {concept.position} · {decision}</span><h4>{concept.hook || concept.title}</h4><small>{concept.title}</small></div>
+                            <div className={`campaignQuality campaignQuality--${quality?.status || "unchecked"}`}>
+                              <div className="campaignQualityHeader">
+                                <span>{qualityLabel}</span>
+                                {quality?.score !== null && quality?.score !== undefined ? <b>{quality.score}/100</b> : null}
+                              </div>
+                              {quality?.issues?.length ? <ul>{quality.issues.slice(0, 3).map((issue, index) => <li className={`campaignQualityIssue--${issue.severity}`} key={`${issue.message}-${index}`}>{issue.message}{issue.fixable ? <em>Auto-fixable</em> : null}</li>)}</ul> : quality ? <p>No blocking visual or technical issues found.</p> : <p>Run QA to check legibility, safe zones, pacing and technical output.</p>}
+                              <div className="campaignQualityActions">
+                                <button className="secondary" disabled={busy || !render?.id} onClick={() => runCampaignCreativeQuality(render?.id, false, batch.id)}>{quality ? "Retry QA" : "Run QA"}</button>
+                                {quality?.canAutoFix ? <button disabled={busy || !render?.id} onClick={() => runCampaignCreativeQuality(render?.id, true, batch.id)}>Fix automatically</button> : null}
+                              </div>
+                            </div>
+                            {creativeDna.length ? <details className="campaignCreativeDna">
+                              <summary>Creative DNA</summary>
+                              <dl>{creativeDna.map((item) => <div key={item.label}><dt>{item.label}</dt><dd>{item.value}</dd></div>)}</dl>
+                            </details> : null}
                             <div className="campaignReviewActions">
                               <button className={decision === "approved" ? "active" : ""} disabled={busy || !outputAsset?.source_url} onClick={() => reviewCampaignCreative(batch.id, concept.id, "approved")}>Approve</button>
                               <button className={decision === "rejected" ? "active" : "secondary"} disabled={busy} onClick={() => reviewCampaignCreative(batch.id, concept.id, "rejected")}>Reject</button>
@@ -7505,6 +7621,26 @@ export default function PlaylistManager() {
         .campaignReviewCard > div span { color: #7f8998; font-size: 9px; text-transform: uppercase; }
         .campaignReviewCard h4 { margin: 0; font-size: 13px; line-height: 1.3; }
         .campaignReviewCard small { color: #7f8998; font-size: 9px; }
+        .campaignQuality { display: grid; gap: 7px; padding: 9px; border: 1px solid #303744; border-radius: 8px; background: #10151b; }
+        .campaignQuality--passed, .campaignQuality--pass { border-color: rgba(24,224,111,.34); background: rgba(24,224,111,.045); }
+        .campaignQuality--failed, .campaignQuality--fail { border-color: rgba(255,104,104,.42); background: rgba(255,104,104,.055); }
+        .campaignQuality--review, .campaignQuality--warning { border-color: rgba(255,191,79,.38); background: rgba(255,191,79,.04); }
+        .campaignQualityHeader { display: flex !important; align-items: center; justify-content: space-between; gap: 8px; }
+        .campaignQualityHeader span { color: #aeb8c5 !important; font-weight: 900; letter-spacing: .04em; }
+        .campaignQualityHeader b { color: #f4f6f8; font-size: 10px; }
+        .campaignQuality ul { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+        .campaignQuality li { display: grid; gap: 2px; padding-left: 9px; border-left: 2px solid #ffbf4f; color: #c8ced7; font-size: 9px; line-height: 1.35; }
+        .campaignQuality li.campaignQualityIssue--error, .campaignQuality li.campaignQualityIssue--critical { border-left-color: #ff6868; }
+        .campaignQuality li em { color: #8ea7ff; font-size: 8px; font-style: normal; font-weight: 800; text-transform: uppercase; }
+        .campaignQuality p { margin: 0; color: #7f8998; font-size: 9px; line-height: 1.4; }
+        .campaignQualityActions { display: flex !important; gap: 5px; }
+        .campaignQualityActions button { flex: 1; min-width: 0; padding: 6px 5px; font-size: 9px; }
+        .campaignCreativeDna { padding: 8px 9px; border: 1px solid #2b323c; border-radius: 8px; background: rgba(255,255,255,.018); }
+        .campaignCreativeDna summary { color: #8ea7ff; cursor: pointer; font-size: 9px; font-weight: 900; letter-spacing: .05em; text-transform: uppercase; }
+        .campaignCreativeDna dl { display: grid; gap: 5px; margin: 8px 0 0; }
+        .campaignCreativeDna dl div { display: grid; grid-template-columns: 45px minmax(0, 1fr); gap: 6px; }
+        .campaignCreativeDna dt { color: #697586; font-size: 8px; text-transform: uppercase; }
+        .campaignCreativeDna dd { margin: 0; overflow: hidden; color: #c8ced7; font-size: 9px; text-overflow: ellipsis; text-transform: capitalize; white-space: nowrap; }
         .campaignReviewActions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
         .campaignReviewActions button { min-width: 0; padding: 7px 5px; font-size: 9px; }
         .campaignReviewActions button.active { color: #06120b; background: #18e06f; }

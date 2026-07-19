@@ -12,6 +12,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import base64
 from pathlib import Path
 
 
@@ -144,6 +145,28 @@ def probe_duration(path: Path) -> float:
         timeout=30,
     )
     return max(0.1, float(result.stdout.strip()))
+
+
+def extract_qa_frames(video: Path, duration: float, workdir: Path) -> list[dict]:
+    """Return three bounded JPEGs spanning the finished composition for post-render Vision QA."""
+    frames: list[dict] = []
+    timestamps = [min(duration * ratio, max(0.0, duration - 0.08)) for ratio in (0.08, 0.38, 0.82)]
+    for index, timestamp in enumerate(timestamps):
+        target = workdir / f"qa-{index}.jpg"
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", f"{timestamp:.3f}", "-i", str(video), "-frames:v", "1",
+                "-vf", "scale=360:-2", "-q:v", "8", str(target),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        encoded = base64.b64encode(target.read_bytes()).decode("ascii")
+        frames.append({"timestamp_seconds": round(timestamp, 3), "mime_type": "image/jpeg", "base64": encoded})
+    return frames
 
 
 def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
@@ -318,7 +341,8 @@ def process_one() -> bool:
         with tempfile.TemporaryDirectory(prefix="playlistpilot-render-") as tmp:
             output, duration, width, height = render(job, Path(tmp))
             upload(str(job["upload_url"]), output)
-            api("complete", {"job_id": job["id"], "worker_id": WORKER_ID, "duration_seconds": duration, "width": width, "height": height, "bytes": output.stat().st_size})
+            qa_frames = extract_qa_frames(output, duration, Path(tmp))
+            api("complete", {"job_id": job["id"], "worker_id": WORKER_ID, "duration_seconds": duration, "width": width, "height": height, "bytes": output.stat().st_size, "qa_frames": qa_frames})
         LOG.info("completed job %s", job["id"])
     except Exception as error:
         message = str(error)

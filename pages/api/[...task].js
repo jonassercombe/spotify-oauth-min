@@ -878,18 +878,59 @@ function normalizeMetaCreativeProjectInput(body = {}) {
 }
 
 const CREATIVE_CONCEPT_FIELDS = [
-  "title", "production_type", "hook", "angle", "story", "primary_emotion", "visual_direction", "footage_criteria", "north_star_story",
+  "title", "production_type", "hook", "hook_candidates", "hook_choice_rationale", "angle", "story", "primary_emotion", "visual_direction", "footage_criteria", "north_star_story",
   "visual_search_terms", "text_design_direction", "audio_direction", "cta",
-  "hypothesis", "rationale",
+  "hypothesis", "rationale", "creative_dna",
 ];
 
 function creativeBriefSchema() {
   const stringField = { type: "string" };
   const stringArray = { type: "array", items: stringField };
+  const scoreField = { type: "integer", minimum: 1, maximum: 10 };
+  const hookCandidate = {
+    type: "object",
+    additionalProperties: false,
+    required: ["text", "clarity", "scroll_stop", "playlist_fit", "originality", "visual_fit", "total", "rationale"],
+    properties: {
+      text: stringField,
+      clarity: scoreField,
+      scroll_stop: scoreField,
+      playlist_fit: scoreField,
+      originality: scoreField,
+      visual_fit: scoreField,
+      total: { type: "integer", minimum: 5, maximum: 50 },
+      rationale: stringField,
+    },
+  };
+  const creativeDna = {
+    type: "object",
+    additionalProperties: false,
+    required: ["angle_type", "hook_type", "human_moment", "audience_state", "visual_subject", "visual_action", "setting", "lighting", "camera_energy", "composition", "text_layout", "audio_energy", "cta_intent", "experiment_level"],
+    properties: {
+      angle_type: stringField,
+      hook_type: stringField,
+      human_moment: stringField,
+      audience_state: stringField,
+      visual_subject: stringField,
+      visual_action: stringField,
+      setting: stringField,
+      lighting: stringField,
+      camera_energy: stringField,
+      composition: stringField,
+      text_layout: stringField,
+      audio_energy: stringField,
+      cta_intent: stringField,
+      experiment_level: { type: "string", enum: ["safe", "creative", "wildcard"] },
+    },
+  };
   const conceptProperties = Object.fromEntries(CREATIVE_CONCEPT_FIELDS.map((field) => [
     field,
     field === "production_type"
       ? { type: "string", enum: ["stock_simple", "stock_montage", "experimental_wildcard"] }
+      : field === "hook_candidates"
+        ? { type: "array", items: hookCandidate, minItems: 4, maxItems: 6 }
+        : field === "creative_dna"
+          ? creativeDna
       : field === "visual_search_terms"
         ? { ...stringArray, minItems: 2, maxItems: 2 }
         : field === "footage_criteria"
@@ -926,6 +967,25 @@ function creativeBriefSchema() {
   };
 }
 
+function normalizeGeneratedHookCandidates(concept = {}) {
+  const candidates = (Array.isArray(concept.hook_candidates) ? concept.hook_candidates : []).slice(0, 6).map((candidate) => {
+    const scores = Object.fromEntries(["clarity", "scroll_stop", "playlist_fit", "originality", "visual_fit"].map((key) => [
+      key,
+      Math.max(1, Math.min(10, Number.parseInt(candidate?.[key], 10) || 1)),
+    ]));
+    return {
+      text: String(candidate?.text || "").trim().slice(0, 38),
+      ...scores,
+      total: Object.values(scores).reduce((sum, score) => sum + score, 0),
+      rationale: String(candidate?.rationale || "").trim().slice(0, 500),
+    };
+  }).filter((candidate) => candidate.text);
+  if (candidates.length < 4) throw new Error("openai_insufficient_hook_candidates");
+  const eligible = candidates.filter((candidate) => candidate.clarity >= 7 && candidate.playlist_fit >= 7 && candidate.visual_fit >= 7);
+  const ranked = (eligible.length ? eligible : candidates).slice().sort((a, b) => b.total - a.total);
+  return { candidates, chosenHook: ranked[0].text };
+}
+
 function extractOpenAIText(payload) {
   if (typeof payload?.output_text === "string" && payload.output_text.trim()) return payload.output_text;
   for (const item of payload?.output || []) {
@@ -960,10 +1020,13 @@ async function generateCreativeBriefWithOpenAI({ project, playlist, tracks }) {
 
 All user-facing copy must be in ${languageName}. Every concept must contain:
 - a strategic angle;
-- an overlay-ready hook of at most 6 words and 38 characters;
+- 4–6 materially different overlay-ready hook_candidates, each at most 6 words and 38 characters;
+- integer scores from 1–10 for every hook candidate on clarity, scroll_stop, playlist_fit, originality, and visual_fit; total must equal the sum of those five scores;
+- hook as the selected candidate text. Choose it using minimum gates of clarity >= 7, playlist_fit >= 7, and visual_fit >= 7, then rank eligible candidates by total. Use hook_choice_rationale to explain the decision briefly;
 - visual_direction as ONE executable sentence describing footage that can realistically be found on Pexels;
 - footage_criteria with 5–7 concrete things that are directly visible in frames (subject, action, setting, light, composition, camera energy, usable negative space);
 - exactly two concise English Pexels search queries in visual_search_terms;
+- creative_dna with compact, reusable labels for angle type, hook type, human moment, audience state, visible subject/action/setting, lighting, camera energy, composition, text layout, audio energy, CTA intent, and experiment level;
 - north_star_story as an optional ambitious idea. Use an empty string when it adds no value. This is inspiration only and must never be required for the stock clip to succeed.
 
 For stock_simple, one continuous stock clip must be sufficient. For stock_montage, describe 2–4 independently searchable shots that can be cut together. For experimental_wildcard, allow an emotionally defensible contrast or pattern interrupt, but keep the stock treatment findable. The story field explains the ad idea, but must not imply that every beat will appear in the selected footage. Avoid generic playlist clichés and duplicate angles. Each concept needs a concrete human moment and a testable hypothesis.`;
@@ -1178,6 +1241,71 @@ Format: ${project.format}`,
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function creativeRenderQaSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["overall_score", "technical_pass", "creative_pass", "auto_fixable", "summary", "checks", "suggested_fixes"],
+    properties: {
+      overall_score: { type: "integer", minimum: 0, maximum: 100 },
+      technical_pass: { type: "boolean" },
+      creative_pass: { type: "boolean" },
+      auto_fixable: { type: "boolean" },
+      summary: { type: "string", maxLength: 500 },
+      checks: {
+        type: "array",
+        minItems: 1,
+        maxItems: 12,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["key", "label", "score", "severity", "finding"],
+          properties: {
+            key: { type: "string", enum: ["text_legibility", "safe_zone", "contrast", "hook_clarity", "footage_hook_fit", "artwork_visibility", "transitions", "native_social_feel", "black_frames", "composition"] },
+            label: { type: "string", maxLength: 80 },
+            score: { type: "integer", minimum: 0, maximum: 100 },
+            severity: { type: "string", enum: ["pass", "warning", "fail"] },
+            finding: { type: "string", maxLength: 300 },
+          },
+        },
+      },
+      suggested_fixes: { type: "array", maxItems: 8, items: { type: "string", maxLength: 240 } },
+    },
+  };
+}
+
+async function analyzeCreativeRenderWithOpenAI({ job, asset, concept, frameUrls }) {
+  const content = [{
+    type: "input_text",
+    text: `Review these representative frames from a finished vertical playlist advertisement. Be strict about technical defects, but do not punish bold, experimental, or unconventional creative choices merely for being unusual.
+
+Judge visible evidence only. Check text legibility and clipping, social-platform safe-zone margins, contrast, whether the hook is understandable immediately, footage-to-hook relationship, playlist artwork visibility, visual continuity across frames, native-social feel, black/blank frames, and overall composition. A creative concern may be a warning; reserve fail for a material delivery or comprehension problem. technical_pass must be false for clipping, unreadable text, unsafe placement, blank frames, or broken composition. auto_fixable should be true only when a deterministic layout/render adjustment is likely to solve the issue.
+
+Hook: ${concept.hook}
+Angle: ${concept.angle}
+Visual direction: ${concept.visual_direction}
+Creative DNA: ${JSON.stringify(concept.creative_dna || job.render_spec?.creative_dna || {})}
+Format: ${job.render_spec?.editor?.format || "9:16"}
+Rendered asset: ${asset.source_url}`,
+  }];
+  frameUrls.slice(0, 4).forEach((url) => content.push({ type: "input_image", image_url: url, detail: "high" }));
+  const model = process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || "gpt-5.6";
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${need("OPENAI_API_KEY")}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model,
+      input: [{ role: "user", content }],
+      text: { format: { type: "json_schema", name: "creative_render_quality", strict: true, schema: creativeRenderQaSchema() } },
+      max_output_tokens: 3000,
+      store: false,
+    }),
+  });
+  const parsed = await parseJsonSafe(response);
+  if (!response.ok) throw new Error(`openai_${response.status}: ${parsed.json?.error?.message || parsed.text.slice(0, 500)}`);
+  return { model, report: JSON.parse(extractOpenAIText(parsed.json)) };
 }
 
 async function loadOwnedCreativeConcept(conceptId, connectionId, bubbleUserId) {
@@ -3172,7 +3300,7 @@ const routes = {
       const playlistFilter = /^[0-9a-f-]{36}$/i.test(playlistId) ? `&playlist_id=eq.${encodeURIComponent(playlistId)}` : "";
       const response = await sb(
         `/rest/v1/meta_campaign_creative_batches?select=*,meta_campaign_creative_reviews(*),` +
-        `meta_creative_projects(*,playlists(name,image),meta_creative_concepts(*),meta_creative_assets(*),meta_creative_render_jobs(*))` +
+        `meta_creative_projects(*,playlists(name,image),meta_creative_concepts(*),meta_creative_assets(*),meta_creative_render_jobs(*,meta_creative_render_quality_reports(*)))` +
         `&connection_id=eq.${encodeURIComponent(connection.id)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}` +
         `${playlistFilter}&order=created_at.desc&limit=30`
       );
@@ -4009,13 +4137,14 @@ const routes = {
       if (generated.concepts.some((concept, index) => concept.production_type !== expectedProductionTypes[index])) {
         throw new Error("openai_invalid_production_portfolio");
       }
+      const normalizedHooks = generated.concepts.map(normalizeGeneratedHookCandidates);
       const now = new Date().toISOString();
       const rows = generated.concepts.map((concept, index) => ({
         project_id: project.id,
         position: index + 1,
         title: String(concept.title || "").slice(0, 200),
         production_type: concept.production_type,
-        hook: String(concept.hook || "").slice(0, 200),
+        hook: normalizedHooks[index].chosenHook,
         angle: String(concept.angle || "").slice(0, 500),
         story: String(concept.story || "").slice(0, 2000),
         primary_emotion: String(concept.primary_emotion || "").slice(0, 200),
@@ -4027,8 +4156,22 @@ const routes = {
         audio_direction: String(concept.audio_direction || "").slice(0, 1000),
         cta: String(concept.cta || "").slice(0, 200),
         hypothesis: String(concept.hypothesis || "").slice(0, 1000),
+        creative_dna: Object.fromEntries(Object.entries(concept.creative_dna || {}).map(([key, value]) => [
+          String(key).slice(0, 100),
+          String(value || "").slice(0, 500),
+        ])),
         status: "concept",
-        render_spec: { rationale: String(concept.rationale || "").slice(0, 1000), source: "openai", format: project.format },
+        render_spec: {
+          rationale: String(concept.rationale || "").slice(0, 1000),
+          hook_candidates: normalizedHooks[index].candidates,
+          hook_choice_rationale: String(concept.hook_choice_rationale || "").slice(0, 1000),
+          creative_dna: Object.fromEntries(Object.entries(concept.creative_dna || {}).map(([key, value]) => [
+            String(key).slice(0, 100),
+            String(value || "").slice(0, 500),
+          ])),
+          source: "openai",
+          format: project.format,
+        },
         updated_at: now,
       }));
       const conceptsResponse = await sb(`/rest/v1/meta_creative_concepts?on_conflict=project_id,position`, {
@@ -4424,6 +4567,135 @@ const routes = {
     return json(res, 200, { job, provider_status: job.status, done: ["completed", "failed", "cancelled"].includes(job.status) });
   },
 
+  /* ---------- meta/creative-renders/quality (POST, admin) ---------- */
+  "meta/creative-renders/quality": async (req, res) => {
+    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const body = await readBody(req);
+    const jobId = String(body.render_job_id || "").trim();
+    if (!/^[0-9a-f-]{36}$/i.test(jobId)) return bad(res, 400, "creative_render_job_required");
+    const jobResponse = await sb(`/rest/v1/meta_creative_render_jobs?select=*&id=eq.${encodeURIComponent(jobId)}&status=eq.completed&limit=1`);
+    const job = jobResponse.ok ? (await jobResponse.json().catch(() => []))[0] : null;
+    if (!job?.output_asset_id) return bad(res, 409, "completed_creative_render_required");
+    const [projectResponse, conceptResponse, assetResponse] = await Promise.all([
+      sb(`/rest/v1/meta_creative_projects?select=*&id=eq.${encodeURIComponent(job.project_id)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&limit=1`),
+      sb(`/rest/v1/meta_creative_concepts?select=*&id=eq.${encodeURIComponent(job.concept_id)}&limit=1`),
+      sb(`/rest/v1/meta_creative_assets?select=*&id=eq.${encodeURIComponent(job.output_asset_id)}&limit=1`),
+    ]);
+    const project = projectResponse.ok ? (await projectResponse.json().catch(() => []))[0] : null;
+    const concept = conceptResponse.ok ? (await conceptResponse.json().catch(() => []))[0] : null;
+    const asset = assetResponse.ok ? (await assetResponse.json().catch(() => []))[0] : null;
+    if (!project || !concept || !asset) return bad(res, 404, "creative_render_not_found");
+    if (body.auto_fix === true) {
+      const reportResponse = await sb(`/rest/v1/meta_creative_render_quality_reports?select=*&render_job_id=eq.${encodeURIComponent(job.id)}&limit=1`);
+      const previousReport = reportResponse.ok ? (await reportResponse.json().catch(() => []))[0] : null;
+      if (!previousReport?.auto_fixable) return bad(res, 409, "creative_render_quality_not_auto_fixable");
+      const problemKeys = new Set((previousReport.checks || [])
+        .filter((check) => ["warning", "fail"].includes(check?.severity))
+        .map((check) => check.key));
+      const editor = { ...(job.render_spec?.editor || concept.render_spec?.editor || {}) };
+      if (problemKeys.has("contrast") || problemKeys.has("text_legibility")) {
+        editor.overlay_opacity = Math.max(0.42, Number(editor.overlay_opacity || 0));
+      }
+      if (problemKeys.has("safe_zone") || problemKeys.has("composition")) {
+        editor.hook_position = "center";
+        editor.text_align = "center";
+        editor.template_id = "bold_center";
+      }
+      if (problemKeys.has("artwork_visibility")) editor.show_cover = true;
+      const fixedSpec = {
+        ...(job.render_spec || {}),
+        editor,
+        template: { id: editor.template_id || job.render_spec?.template?.id || "bold_center", name: creativeTemplate(editor.template_id).name },
+        quality_fix: {
+          source_render_job_id: job.id,
+          source_report_id: previousReport.id,
+          applied_checks: [...problemKeys],
+          applied_at: new Date().toISOString(),
+        },
+      };
+      const queuedResponse = await sb(`/rest/v1/meta_creative_render_jobs`, {
+        method: "POST",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify([{
+          project_id: job.project_id,
+          concept_id: job.concept_id,
+          status: "queued",
+          priority: 90,
+          render_spec: fixedSpec,
+        }]),
+      });
+      const queuedText = await queuedResponse.text();
+      if (!queuedResponse.ok) return bad(res, 500, `creative_quality_fix_queue_failed: ${queuedText.slice(0, 500)}`);
+      await Promise.all([
+        sb(`/rest/v1/meta_creative_concepts?id=eq.${encodeURIComponent(concept.id)}`, {
+          method: "PATCH",
+          headers: { Prefer: "return=minimal" },
+          body: JSON.stringify({ render_spec: { ...(concept.render_spec || {}), editor }, status: "render_queued", updated_at: new Date().toISOString() }),
+        }),
+        sb(`/rest/v1/meta_creative_projects?id=eq.${encodeURIComponent(project.id)}`, {
+          method: "PATCH",
+          headers: { Prefer: "return=minimal" },
+          body: JSON.stringify({ status: "rendering", current_step: 5, updated_at: new Date().toISOString() }),
+        }),
+      ]);
+      return json(res, 201, { auto_fix_queued: true, render_job: JSON.parse(queuedText || "[]")[0] });
+    }
+    const frameUrls = Array.isArray(asset.metadata?.qa_frame_urls) ? asset.metadata.qa_frame_urls.filter((url) => /^https:\/\//.test(String(url))).slice(0, 4) : [];
+    if (frameUrls.length < 2) return bad(res, 409, "creative_render_qa_frames_missing");
+    const now = new Date().toISOString();
+    const baseRow = {
+      render_job_id: job.id,
+      output_asset_id: asset.id,
+      project_id: project.id,
+      concept_id: concept.id,
+      status: "pending",
+      frame_urls: frameUrls,
+      error_message: null,
+      updated_at: now,
+    };
+    const pendingResponse = await sb(`/rest/v1/meta_creative_render_quality_reports?on_conflict=render_job_id`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify([baseRow]),
+    });
+    if (!pendingResponse.ok) return bad(res, 500, "creative_render_quality_save_failed");
+    try {
+      const analyzed = await analyzeCreativeRenderWithOpenAI({ job, asset, concept, frameUrls });
+      const report = analyzed.report;
+      const status = !report.technical_pass ? "failed" : (!report.creative_pass || report.overall_score < 75 ? "warning" : "passed");
+      const updateResponse = await sb(`/rest/v1/meta_creative_render_quality_reports?render_job_id=eq.${encodeURIComponent(job.id)}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify({
+          status,
+          overall_score: report.overall_score,
+          technical_pass: report.technical_pass,
+          creative_pass: report.creative_pass,
+          auto_fixable: report.auto_fixable,
+          checks: report.checks,
+          summary: report.summary,
+          suggested_fixes: report.suggested_fixes,
+          model: analyzed.model,
+          analyzed_at: now,
+          updated_at: now,
+        }),
+      });
+      const rows = updateResponse.ok ? await updateResponse.json().catch(() => []) : [];
+      if (!updateResponse.ok || !rows[0]) return bad(res, 500, "creative_render_quality_update_failed");
+      return json(res, 200, { quality_report: rows[0] });
+    } catch (error) {
+      const message = String(error?.message || error).slice(0, 1000);
+      await sb(`/rest/v1/meta_creative_render_quality_reports?render_job_id=eq.${encodeURIComponent(job.id)}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({ status: "error", error_message: message, updated_at: new Date().toISOString() }),
+      });
+      return bad(res, 502, message);
+    }
+  },
+
   /* ---------- meta/render-worker/claim (POST, private worker) ---------- */
   "meta/render-worker/claim": async (req, res) => {
     if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
@@ -4505,7 +4777,25 @@ const routes = {
     const publicUrl = `${need("SUPABASE_URL")}/storage/v1/object/public/meta-ad-creatives/${storagePath.split("/").map(encodeURIComponent).join("/")}`;
     const now = new Date().toISOString();
     const template = creativeTemplate(job.render_spec?.template?.id || job.render_spec?.editor?.template_id);
-    const assetInsert = await sb(`/rest/v1/meta_creative_assets`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify([{ project_id: job.project_id, concept_id: job.concept_id, asset_type: "render", source: "render_worker", provider_id: job.id, source_url: publicUrl, storage_path: storagePath, mime_type: "video/mp4", duration_seconds: Math.max(0, Number(body.duration_seconds || 0)) || null, width: Math.max(0, Number.parseInt(body.width, 10) || 0) || null, height: Math.max(0, Number.parseInt(body.height, 10) || 0) || null, metadata: { provider: "playlistpilot_ffmpeg", worker_id: identity, bytes: Math.max(0, Number(body.bytes || 0)) || null, template_id: template.id, template_name: template.name, batch_id: job.render_spec?.batch_id || null }, updated_at: now }]) });
+    const suppliedFrames = Array.isArray(body.qa_frames) ? body.qa_frames.slice(0, 4) : [];
+    const encodedBytes = suppliedFrames.reduce((sum, frame) => sum + String(frame?.base64 || "").length, 0);
+    if (encodedBytes > 2_500_000) return bad(res, 413, "render_qa_frames_too_large");
+    const storage = supabaseServiceClient().storage.from("meta-ad-creatives");
+    const qaFrameUrls = [];
+    const qaFrameTimestamps = [];
+    for (let index = 0; index < suppliedFrames.length; index += 1) {
+      const frame = suppliedFrames[index];
+      const encoded = String(frame?.base64 || "");
+      if (!encoded || frame?.mime_type !== "image/jpeg" || !/^[A-Za-z0-9+/=]+$/.test(encoded)) continue;
+      const framePath = `${owner}/renders/${job.id}/qa-${index}.jpg`;
+      const uploadResult = await storage.upload(framePath, Buffer.from(encoded, "base64"), { contentType: "image/jpeg", cacheControl: "31536000", upsert: true });
+      // QA frames improve review quality, but a thumbnail upload must never turn
+      // an otherwise valid MP4 render into a failed job.
+      if (uploadResult.error) continue;
+      qaFrameUrls.push(storage.getPublicUrl(framePath).data.publicUrl);
+      qaFrameTimestamps.push(Math.max(0, Number(frame.timestamp_seconds || 0)));
+    }
+    const assetInsert = await sb(`/rest/v1/meta_creative_assets`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify([{ project_id: job.project_id, concept_id: job.concept_id, asset_type: "render", source: "render_worker", provider_id: job.id, source_url: publicUrl, storage_path: storagePath, mime_type: "video/mp4", duration_seconds: Math.max(0, Number(body.duration_seconds || 0)) || null, width: Math.max(0, Number.parseInt(body.width, 10) || 0) || null, height: Math.max(0, Number.parseInt(body.height, 10) || 0) || null, metadata: { provider: "playlistpilot_ffmpeg", worker_id: identity, bytes: Math.max(0, Number(body.bytes || 0)) || null, template_id: template.id, template_name: template.name, batch_id: job.render_spec?.batch_id || null, qa_frame_urls: qaFrameUrls, qa_frame_timestamps: qaFrameTimestamps }, updated_at: now }]) });
     const assetText = await assetInsert.text();
     if (!assetInsert.ok) return bad(res, 500, `creative_render_asset_save_failed: ${assetText.slice(0, 500)}`);
     const outputAsset = JSON.parse(assetText || "[]")[0];
