@@ -968,12 +968,13 @@ function creativeBriefSchema() {
       brief: {
         type: "object",
         additionalProperties: false,
-        required: ["title", "description", "mood_summary", "audience_summary", "use_cases", "core_angles", "extracted_artists", "extracted_tracks"],
+        required: ["title", "description", "mood_summary", "audience_summary", "creative_world", "use_cases", "core_angles", "extracted_artists", "extracted_tracks"],
         properties: {
           title: stringField,
           description: stringField,
           mood_summary: stringField,
           audience_summary: stringField,
+          creative_world: stringField,
           use_cases: stringArray,
           core_angles: stringArray,
           extracted_artists: stringArray,
@@ -1074,6 +1075,7 @@ async function generateCreativeBriefWithOpenAI({ project, playlist, tracks, prio
     playlist: {
       name: playlist.name || project.name,
       description: playlist.description || "",
+      cover_image_present: Boolean(playlist.image),
       followers: Number(playlist.followers || 0),
       tracks_total: Number(playlist.tracks_total || tracks.length),
     },
@@ -1092,6 +1094,7 @@ async function generateCreativeBriefWithOpenAI({ project, playlist, tracks, prio
     description: project.brief.description,
     mood_summary: project.brief.mood_summary,
     audience_summary: project.brief.audience_summary,
+    creative_world: project.brief.creative_world || "",
     use_cases: project.brief.use_cases,
     core_angles: project.brief.core_angles,
     extracted_artists: project.brief.extracted_artists,
@@ -1110,7 +1113,11 @@ All user-facing copy must be in ${languageName}. Every concept must contain:
 - creative_dna with compact, reusable labels for angle type, hook type, human moment, audience state, visible subject/action/setting, lighting, camera energy, composition, text layout, audio energy, CTA intent, and experiment level;
 - north_star_story as an optional ambitious idea. Use an empty string when it adds no value. This is inspiration only and must never be required for the stock clip to succeed.
 
-For stock_simple, one continuous stock clip must be sufficient. For stock_montage, describe 2–4 independently searchable shots that can be cut together. For experimental_wildcard, allow an emotionally defensible contrast or pattern interrupt, but keep the stock treatment findable. The story field explains the ad idea, but must not imply that every beat will appear in the selected footage. Avoid generic playlist clichés and duplicate angles. Never use follower counts, track counts, positions, or other playlist metadata numbers as hooks or turn them into metaphors. Each concept needs a concrete human moment and a testable hypothesis.`;
+Creative range is a primary quality criterion, not an optional embellishment. First derive a concise creative_world from the playlist name, description and cover-art presence: a memorable metaphorical universe that can inspire visual jokes, playful language and visual search. A distinctive name such as “Indie Music From Another Planet” should yield a world such as “ordinary life, slightly extraterrestrial”, rather than being reduced to generic listening footage. For a name with a rich metaphorical world, at least 3 of the 8 concepts must explore that world through three different mechanisms (for example: a witty line, an uncanny everyday object, a cinematic environment, or a visual contrast). These must remain Pexels-findable; do not require literal CGI or a full sci-fi storyline.
+
+Across the eight concepts, use at least 2 non-human-first visual subjects (object, texture, light, landscape, architecture, machine, food, signage or abstract motion) and at least 1 playful or humorous hook. A person wearing headphones is allowed but must not be the default visual answer, and must appear as the primary subject in no more than 4 concepts. Prefer metaphor, visual tension, odd specificity, pattern interruption and surprising but defensible pairings over generic “night city / person listening to music” footage. Search queries must expose the actual distinct visual idea, not merely the playlist's mood.
+
+For stock_simple, one continuous stock clip must be sufficient. For stock_montage, describe 2–4 independently searchable shots that can be cut together. For experimental_wildcard, allow an emotionally defensible contrast or pattern interrupt, but keep the stock treatment findable. The story field explains the ad idea, but must not imply that every beat will appear in the selected footage. Avoid generic playlist clichés and duplicate angles. Never use follower counts, track counts, positions, or other playlist metadata numbers as hooks or turn them into metaphors. Each concept needs a concrete human, sensory or visual moment and a testable hypothesis.`;
   const user = cachedBrief
     ? `Use the cached playlist analysis below and create only a fresh concept portfolio. Do not repeat the playlist analysis. The primary ad format is ${project.format}. Treat creative_notes as optional campaign direction. creative_memory contains recent concepts that must not be paraphrased or recreated. In explore mode, maximize distance from their hooks, angles, human moments, settings, visible actions, and search terms.\n\n${JSON.stringify({ cached_playlist_analysis: cachedBrief, ...source })}`
     : `Analyze this playlist snapshot and create the creative brief and concept portfolio. The primary ad format is ${project.format}. Treat creative_notes as optional campaign direction, never as factual playlist metadata.\n\n${JSON.stringify(source)}`;
@@ -1164,7 +1171,7 @@ async function generateCreativeReplacementsWithOpenAI({ project, playlist, prior
       reasoning: { effort: "low" },
       input: [{
         role: "system",
-        content: `You replace duplicate paid-social concepts for a Spotify playlist. Return exactly ${slots.length} complete concepts in the supplied slot order. Preserve each required production_type. Every replacement must be materially different from creative_memory and accepted_concepts in strategic angle, hook mechanism, human moment, visible action, setting and search terms. A synonym or paraphrase is not novel. Hooks must be at most 6 words and 44 characters and must not use playlist metadata numbers.`,
+        content: `You replace duplicate paid-social concepts for a Spotify playlist. Return exactly ${slots.length} complete concepts in the supplied slot order. Preserve each required production_type. Every replacement must be materially different from creative_memory and accepted_concepts in strategic angle, hook mechanism, human moment, visible action, setting and search terms. A synonym or paraphrase is not novel. Hooks must be at most 6 words and 44 characters and must not use playlist metadata numbers. Treat creative_world as a usable creative universe: favor a fresh visual joke, uncanny object, abstract texture, environment or surprising contrast when it fits. Do not default to a person wearing headphones.`,
       }, {
         role: "user",
         content: JSON.stringify({
@@ -1172,6 +1179,7 @@ async function generateCreativeReplacementsWithOpenAI({ project, playlist, prior
             title: project.brief?.title || playlist.name,
             mood_summary: project.brief?.mood_summary || "",
             audience_summary: project.brief?.audience_summary || "",
+            creative_world: project.brief?.creative_world || "",
             creative_notes: project.brief?.creative_notes || "",
           },
           slot_plan: slotPlan,
@@ -3539,6 +3547,7 @@ const routes = {
             description: cachedAnalysis.description || "",
             mood_summary: cachedAnalysis.mood_summary || "",
             audience_summary: cachedAnalysis.audience_summary || "",
+            creative_world: cachedAnalysis.creative_world || "",
             use_cases: cachedAnalysis.use_cases || [],
             core_angles: cachedAnalysis.core_angles || [],
             extracted_artists: cachedAnalysis.extracted_artists || [],
