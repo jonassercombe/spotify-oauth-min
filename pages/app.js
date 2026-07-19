@@ -180,7 +180,7 @@ function IconButton({ children, className = "", tooltip, label, ...props }) {
   );
 }
 
-function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave, onToggle, busy }) {
+function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave, onToggle, onDelete, busy }) {
   const duration = Math.max(5, Number(master?.duration_seconds || 15));
   const canvasRef = useRef(null);
   const audioRef = useRef(null);
@@ -346,7 +346,10 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
         <i>{String(index + 1).padStart(2, "0")}</i>
         <span><strong>{snippet.title}</strong><small>{eligible ? `${formatAudioTime(snippet.start_seconds)}–${formatAudioTime(snippet.end_seconds)} in master` : "Legacy snippet · create a new 30s version"}</small></span>
         <em>{snippetLength.toFixed(1)}s</em>
-        <button disabled={!eligible} className={selected ? "selected" : ""} onClick={() => onToggle(snippet.id)}>{selected ? <><Check aria-hidden="true" /> Selected</> : eligible ? "Use snippet" : "Not eligible"}</button>
+        <div className="campaignSnippetActions">
+          <button disabled={!eligible} className={selected ? "selected" : ""} onClick={() => onToggle(snippet.id)}>{selected ? <><Check aria-hidden="true" /> Selected</> : eligible ? "Use snippet" : "Not eligible"}</button>
+          <button className="delete" aria-label={`Delete ${snippet.title}`} title="Delete snippet" onClick={() => onDelete(snippet)}><Trash2 aria-hidden="true" /></button>
+        </div>
       </article>;
     })}</div></section> : null}
     <style jsx>{`
@@ -419,9 +422,12 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
       .campaignSnippetList strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .campaignSnippetList small { color: #7f8998; font-size: 9px; }
       .campaignSnippetList article > em { min-width: 45px; color: #9aa5b3; font-size: 10px; font-style: normal; text-align: right; }
-      .campaignSnippetList article > button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-width: 94px; padding: 7px 9px; border: 1px solid #394351; border-radius: 8px; color: #aeb7c3; background: #171e26; }
-      .campaignSnippetList article > button.selected { border-color: rgba(142,167,255,.46); color: #dbe1ff; background: rgba(142,167,255,.12); }
-      .campaignSnippetList article > button :global(svg) { width: 12px; height: 12px; }
+      .campaignSnippetActions { display: flex; align-items: center; gap: 6px; }
+      .campaignSnippetActions button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-width: 94px; padding: 7px 9px; border: 1px solid #394351; border-radius: 8px; color: #aeb7c3; background: #171e26; }
+      .campaignSnippetActions button.selected { border-color: rgba(142,167,255,.46); color: #dbe1ff; background: rgba(142,167,255,.12); }
+      .campaignSnippetActions button.delete { min-width: 32px; width: 32px; padding: 7px; color: #a97979; }
+      .campaignSnippetActions button.delete:hover { border-color: rgba(255,112,112,.5); color: #ff9191; background: rgba(255,112,112,.08); }
+      .campaignSnippetActions button :global(svg) { width: 12px; height: 12px; }
       @media (max-width: 720px) {
         .campaignAudioTrimmer { padding: 16px; }
         .campaignTrimmerHeader { grid-template-columns: auto minmax(0,1fr); }
@@ -436,7 +442,8 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
         .campaignSaveSnippet { width: 100%; }
         .campaignSnippetList article { grid-template-columns: auto minmax(0,1fr) auto; }
         .campaignSnippetList article > em { display: none; }
-        .campaignSnippetList article > button { grid-column: 2 / -1; width: 100%; }
+        .campaignSnippetActions { grid-column: 2 / -1; width: 100%; }
+        .campaignSnippetActions button:first-child { flex: 1; }
       }
     `}</style>
   </div>;
@@ -2993,6 +3000,29 @@ export default function PlaylistManager() {
     });
   }
 
+  async function deleteCampaignAudioSnippet(snippet) {
+    if (typeof window !== "undefined" && !window.confirm(`Delete “${snippet.title}”? This cannot be undone.`)) return;
+    await run("Audio snippet deleted", async () => {
+      try {
+        await api("/api/meta/audio-snippets", {
+          method: "DELETE",
+          accessToken: accessToken(),
+          body: { snippet_id: snippet.id },
+        });
+      } catch (deleteError) {
+        if (String(deleteError.message || "").includes("audio_snippet_in_use")) {
+          throw new Error("This snippet is already used by a rendered creative and cannot be deleted.");
+        }
+        throw deleteError;
+      }
+      setMetaDraftForm((current) => ({
+        ...current,
+        audio_snippet_ids: (current.audio_snippet_ids || []).filter((id) => id !== snippet.id),
+      }));
+      return loadCampaignAudioLibrary(metaDraftForm.playlist_id);
+    });
+  }
+
   function toggleCampaignAudioSnippet(snippetId) {
     setMetaDraftForm((current) => {
       const selected = current.audio_snippet_ids || [];
@@ -4761,7 +4791,7 @@ export default function PlaylistManager() {
                   </div>
                 </section>
                 {campaignAudioMasters.length ? <section className="campaignAudioMasterLibrary"><div><span>Audio masters</span><small>Choose a track to create or review snippets</small></div><div className="campaignAudioMasterTabs">{campaignAudioMasters.map((master, index) => <button className={campaignAudioMasterId === master.id ? "active" : "secondary"} key={master.id} onClick={() => setCampaignAudioMasterId(master.id)}><i>{index + 1}</i><span><strong>{master.title}</strong><small>{master.artist || "Unknown artist"} · {Math.floor(Number(master.duration_seconds || 0) / 60)}:{String(Math.round(Number(master.duration_seconds || 0) % 60)).padStart(2, "0")}</small></span><b>{(master.meta_audio_snippets || []).length} snippets</b></button>)}</div></section> : <div className="campaignAudioEmpty"><i>♪</i><div><strong>Your audio workspace is empty</strong><p>Upload a master above, or continue without audio and add sound later.</p></div></div>}
-                {campaignAudioMasters.filter((master) => master.id === campaignAudioMasterId).map((master) => <CampaignAudioTrimmer key={master.id} master={master} snippets={master.meta_audio_snippets || []} selectedIds={metaDraftForm.audio_snippet_ids || []} onSave={saveCampaignAudioSnippet} onToggle={toggleCampaignAudioSnippet} busy={busy} />)}
+                {campaignAudioMasters.filter((master) => master.id === campaignAudioMasterId).map((master) => <CampaignAudioTrimmer key={master.id} master={master} snippets={master.meta_audio_snippets || []} selectedIds={metaDraftForm.audio_snippet_ids || []} onSave={saveCampaignAudioSnippet} onToggle={toggleCampaignAudioSnippet} onDelete={deleteCampaignAudioSnippet} busy={busy} />)}
               </section>
             </> : null}
             {adsWizardStep === 3 ? <>

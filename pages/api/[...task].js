@@ -3248,10 +3248,32 @@ const routes = {
 
   /* ---------- meta/audio-snippets (POST) ---------- */
   "meta/audio-snippets": async (req, res) => {
-    if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+    if (!["POST", "DELETE"].includes(req.method)) return bad(res, 405, "method_not_allowed");
     const ctx = await requireAdminContext(req, res);
     if (!ctx) return;
     const body = await readBody(req);
+    if (req.method === "DELETE") {
+      const snippetId = String(body.snippet_id || "");
+      if (!/^[0-9a-f-]{36}$/i.test(snippetId)) return bad(res, 400, "audio_snippet_required");
+      const snippetResponse = await sb(
+        `/rest/v1/meta_audio_snippets?select=id,title&id=eq.${encodeURIComponent(snippetId)}` +
+        `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&limit=1`
+      );
+      const snippet = snippetResponse.ok ? (await snippetResponse.json().catch(() => []))[0] : null;
+      if (!snippet) return bad(res, 404, "audio_snippet_not_found");
+      const usageResponse = await sb(`/rest/v1/meta_creative_variants?select=id&audio_snippet_id=eq.${encodeURIComponent(snippet.id)}&limit=1`);
+      const usage = usageResponse.ok ? await usageResponse.json().catch(() => []) : [];
+      if (usage.length) return bad(res, 409, "audio_snippet_in_use");
+      const deleted = await sb(
+        `/rest/v1/meta_audio_snippets?id=eq.${encodeURIComponent(snippet.id)}` +
+        `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}`,
+        { method: "DELETE", headers: { Prefer: "return=representation" } }
+      );
+      const text = await deleted.text();
+      if (!deleted.ok) return bad(res, 500, `audio_snippet_delete_failed: ${text.slice(0, 500)}`);
+      if (!(JSON.parse(text || "[]")[0])) return bad(res, 404, "audio_snippet_not_found");
+      return json(res, 200, { deleted_id: snippet.id });
+    }
     const masterId = String(body.master_id || "");
     if (!/^[0-9a-f-]{36}$/i.test(masterId)) return bad(res, 400, "audio_master_required");
     const masterResponse = await sb(`/rest/v1/meta_audio_masters?select=*&id=eq.${encodeURIComponent(masterId)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&status=eq.ready&limit=1`);
