@@ -999,7 +999,7 @@ function extractOpenAIText(payload) {
 
 async function generateCreativeBriefWithOpenAI({ project, playlist, tracks }) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 110000);
+  const timeout = setTimeout(() => controller.abort(), 95000);
   const languageName = project.language === "de" ? "German" : "English";
   const source = {
     playlist: {
@@ -1042,7 +1042,11 @@ For stock_simple, one continuous stock clip must be sufficient. For stock_montag
       body: JSON.stringify({
         model: process.env.OPENAI_MODEL || "gpt-5.6",
         input: [{ role: "system", content: system }, { role: "user", content: user }],
-        text: { format: { type: "json_schema", name: "playlist_creative_brief", strict: true, schema: creativeBriefSchema() } },
+        reasoning: { effort: "low" },
+        text: {
+          verbosity: "low",
+          format: { type: "json_schema", name: "playlist_creative_brief", strict: true, schema: creativeBriefSchema() },
+        },
         max_output_tokens: 8000,
         store: false,
       }),
@@ -3182,7 +3186,7 @@ const routes = {
     const allowedTypes = ["audio/mpeg", "audio/mp4", "audio/x-m4a", "audio/wav", "audio/x-wav"];
     if (!/^[0-9a-f-]{36}$/i.test(playlistId)) return bad(res, 400, "audio_playlist_required");
     if (!fileName || !title || !allowedTypes.includes(mimeType)) return bad(res, 400, "audio_master_file_invalid");
-    if (!bytes || bytes > 100 * 1024 * 1024) return bad(res, 413, "audio_master_too_large");
+    if (!bytes || bytes > 50 * 1024 * 1024) return bad(res, 413, "audio_master_too_large");
     const playlistResponse = await sb(`/rest/v1/playlists?select=id&id=eq.${encodeURIComponent(playlistId)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&limit=1`);
     const playlist = playlistResponse.ok ? (await playlistResponse.json().catch(() => []))[0] : null;
     if (!playlist) return bad(res, 404, "audio_playlist_not_found");

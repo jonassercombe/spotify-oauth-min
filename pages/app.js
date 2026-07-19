@@ -3021,7 +3021,7 @@ export default function PlaylistManager() {
     const file = campaignAudioUpload.file;
     if (!file || !metaDraftForm.playlist_id) return;
     await run("Audio master uploaded", async () => {
-      if (file.size > 100 * 1024 * 1024) throw new Error("Audio masters must be 100 MB or smaller.");
+      if (file.size > 50 * 1024 * 1024) throw new Error("Audio masters must be 50 MB or smaller.");
       const inferredType = file.type || (file.name.toLowerCase().endsWith(".mp3") ? "audio/mpeg" : file.name.toLowerCase().endsWith(".wav") ? "audio/wav" : "audio/mp4");
       if (!["audio/mpeg", "audio/mp4", "audio/x-m4a", "audio/wav", "audio/x-wav"].includes(inferredType)) throw new Error("Choose an MP3, M4A, or WAV file.");
       const duration = await audioFileDuration(file);
@@ -4844,7 +4844,7 @@ export default function PlaylistManager() {
                     <i>＋</i>
                     <span>{campaignAudioUpload.file ? "Ready to upload" : "Add an audio master"}</span>
                     <strong>{campaignAudioUpload.file?.name || "Choose MP3, M4A or WAV"}</strong>
-                    <small>{campaignAudioUpload.file ? `${(campaignAudioUpload.file.size / 1024 / 1024).toFixed(1)} MB · click to replace` : "Full songs up to 100 MB · stored securely"}</small>
+                    <small>{campaignAudioUpload.file ? `${(campaignAudioUpload.file.size / 1024 / 1024).toFixed(1)} MB · click to replace` : "Full songs up to 50 MB · stored securely"}</small>
                   </label>
                   <div className="campaignAudioMetadata">
                     <div className="campaignAudioMetadataHeading"><span>Track details</span><small>Optional now, useful when comparing audio performance later</small></div>
@@ -4868,7 +4868,9 @@ export default function PlaylistManager() {
                 {campaignGeneration ? <div className={`campaignGenerationProgress campaignGenerationProgress--${campaignGeneration.stage}`}>
                   <div><span style={{ width: `${Math.round((Number(campaignGeneration.completed || 0) / Math.max(1, Number(campaignGeneration.total || 8))) * 100)}%` }} /></div>
                   <strong>{campaignGeneration.stage === "concepts" ? "Writing and ranking hooks" : campaignGeneration.stage === "media" ? "Directing footage" : campaignGeneration.stage === "rendering" ? "Rendering videos" : campaignGeneration.stage === "quality" ? "Checking finished creatives" : campaignGeneration.stage === "review" ? "Ready for review" : "Generation needs attention"}</strong>
-                  <small>{campaignGeneration.error || `${campaignGeneration.completed || 0} of ${campaignGeneration.total || 8} complete${campaignGeneration.failed ? ` · ${campaignGeneration.failed} failed` : ""}`}</small>
+                  <small>{campaignGeneration.error || (campaignGeneration.stage === "concepts"
+                    ? "Generating all eight as one ranked set · usually 30–90 seconds"
+                    : `${campaignGeneration.completed || 0} of ${campaignGeneration.total || 8} complete${campaignGeneration.failed ? ` · ${campaignGeneration.failed} failed` : ""}`)}</small>
                 </div> : null}
                 <div className="campaignBatchList">
                   {campaignCreativeBatches.map((batch) => {
