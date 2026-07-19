@@ -630,6 +630,11 @@ export default function PlaylistManager() {
   });
   const [metaDrafts, setMetaDrafts] = useState([]);
   const [creativeProjects, setCreativeProjects] = useState([]);
+  const [creativeExperiments, setCreativeExperiments] = useState([]);
+  const [creativeAudioTracks, setCreativeAudioTracks] = useState([]);
+  const [creativeExperimentForm, setCreativeExperimentForm] = useState({ project_id: "", name: "" });
+  const [creativeAudioForm, setCreativeAudioForm] = useState({ project_id: "", title: "", artist: "", rights_status: "test_only", default_start_seconds: "0", file: null });
+  const [creativeMatrixSelections, setCreativeMatrixSelections] = useState({});
   const [creativeProjectForm, setCreativeProjectForm] = useState({ playlist_id: "", name: "", language: "en", format: "9:16" });
   const [openCreativeProjectId, setOpenCreativeProjectId] = useState("");
   const [creativeMediaSearches, setCreativeMediaSearches] = useState({});
@@ -674,7 +679,7 @@ export default function PlaylistManager() {
   useEffect(() => {
     if (typeof window === "undefined") return undefined;
     const syncAdsHash = () => {
-      const match = window.location.hash.match(/^#ads\/(overview|campaigns|creatives|library|new|settings)$/);
+      const match = window.location.hash.match(/^#ads\/(overview|campaigns|creatives|experiments|library|new|settings)$/);
       if (match) {
         setView("ads");
         setAdsSection(match[1]);
@@ -927,6 +932,7 @@ export default function PlaylistManager() {
     loadMetaWorkspace();
     loadMetaDrafts();
     loadCreativeProjects();
+    loadCreativeExperiments();
   }, [userContext?.linked, isAdmin, view]);
 
   useEffect(() => {
@@ -2083,6 +2089,79 @@ export default function PlaylistManager() {
     });
     if (data) setCreativeProjects(data.projects || []);
     return data;
+  }
+
+  async function loadCreativeExperiments() {
+    if (!session?.access_token || !isAdmin) return null;
+    const data = await api("/api/meta/creative-experiments", { accessToken: accessToken() }).catch((e) => {
+      if (!String(e.message || "").includes("not_configured")) setError(e.message || "Creative experiments failed.");
+      return null;
+    });
+    if (data) {
+      setCreativeExperiments(data.experiments || []);
+      setCreativeAudioTracks(data.audio_tracks || []);
+    }
+    return data;
+  }
+
+  async function createCreativeExperiment() {
+    await run("Experiment created", async () => {
+      await api("/api/meta/creative-experiments", { method: "POST", accessToken: accessToken(), body: creativeExperimentForm });
+      setCreativeExperimentForm({ project_id: "", name: "" });
+      return loadCreativeExperiments();
+    });
+  }
+
+  async function uploadCreativeAudio() {
+    const file = creativeAudioForm.file;
+    if (!file) return;
+    await run("Song snippet uploaded", async () => {
+      if (file.size > 3 * 1024 * 1024) throw new Error("Song snippets must be 3 MB or smaller.");
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(new Error("Audio file could not be read."));
+        reader.readAsDataURL(file);
+      });
+      await api("/api/meta/creative-audio/upload", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: {
+          project_id: creativeAudioForm.project_id,
+          title: creativeAudioForm.title,
+          artist: creativeAudioForm.artist,
+          rights_status: creativeAudioForm.rights_status,
+          default_start_seconds: creativeAudioForm.default_start_seconds,
+          file_name: file.name,
+          content_type: file.type,
+          data_base64: dataUrl.split(",")[1] || "",
+        },
+      });
+      setCreativeAudioForm({ project_id: creativeAudioForm.project_id, title: "", artist: "", rights_status: "test_only", default_start_seconds: "0", file: null });
+      return loadCreativeExperiments();
+    });
+  }
+
+  function toggleCreativeMatrix(experimentId, kind, id) {
+    setCreativeMatrixSelections((current) => {
+      const selection = current[experimentId] || { videos: [], audio: [] };
+      const values = selection[kind].includes(id) ? selection[kind].filter((item) => item !== id) : [...selection[kind], id];
+      return { ...current, [experimentId]: { ...selection, [kind]: values } };
+    });
+  }
+
+  async function createCreativeMatrix(experiment) {
+    const phase = (experiment.meta_creative_experiment_phases || []).find((item) => item.phase_number === experiment.current_phase) || experiment.meta_creative_experiment_phases?.[0];
+    const selection = creativeMatrixSelections[experiment.id] || { videos: [], audio: [] };
+    await run("Render matrix queued", async () => {
+      const result = await api("/api/meta/creative-experiments/matrix", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { experiment_id: experiment.id, phase_id: phase?.id, video_asset_ids: selection.videos, audio_track_ids: selection.audio },
+      });
+      await Promise.all([loadCreativeExperiments(), loadCreativeProjects()]);
+      return result;
+    });
   }
 
   function selectCreativePlaylist(selectedId) {
@@ -3552,7 +3631,7 @@ export default function PlaylistManager() {
         </div>
 
         <nav className="adsWorkspaceNav" aria-label="Ads Manager sections">
-          {[{ id: "overview", label: "Overview" }, { id: "campaigns", label: "Campaigns" }, { id: "creatives", label: "Creative Studio" }, { id: "library", label: "Creative Library" }, { id: "new", label: "New campaign" }, { id: "settings", label: "Settings" }].map((item) => (
+          {[{ id: "overview", label: "Overview" }, { id: "campaigns", label: "Campaigns" }, { id: "creatives", label: "Creative Studio" }, { id: "experiments", label: "Experiments" }, { id: "library", label: "Creative Library" }, { id: "new", label: "New campaign" }, { id: "settings", label: "Settings" }].map((item) => (
             <button key={item.id} className={adsSection === item.id ? "active" : ""} onClick={() => openAdsSection(item.id)}>{item.label}</button>
           ))}
         </nav>
@@ -3716,6 +3795,65 @@ export default function PlaylistManager() {
             </div>
           </section>
         </div>
+        </> : null}
+
+        {adsSection === "experiments" ? <>
+          <section className="dashboardPanel">
+            <div className="panelHeader">
+              <div><span className="metaReadOnlyBadge">Creative evolution</span><h2>Experiments</h2><p>Build a controlled video × song matrix, measure it in Meta, then promote winners into the next phase.</p></div>
+              <button disabled={busy} onClick={loadCreativeExperiments}>Refresh</button>
+            </div>
+            <div className="metaFormGrid">
+              <label><span>Creative project</span><select value={creativeExperimentForm.project_id} onChange={(event) => setCreativeExperimentForm((current) => ({ ...current, project_id: event.target.value }))}><option value="">Select a project</option>{creativeProjects.map((project) => <option value={project.id} key={project.id}>{project.name}</option>)}</select></label>
+              <label><span>Experiment name</span><input value={creativeExperimentForm.name} onChange={(event) => setCreativeExperimentForm((current) => ({ ...current, name: event.target.value }))} placeholder="Summer playlist — exploration" /></label>
+            </div>
+            <div className="metaFormActions"><button disabled={busy || !creativeExperimentForm.project_id} onClick={createCreativeExperiment}>Create Phase 1 experiment</button></div>
+          </section>
+
+          <section className="dashboardPanel">
+            <div className="panelHeader"><div><h2>Song snippets</h2><p>Upload short MP3, M4A or WAV excerpts you have the right to use. A 15–30 second MP3 normally stays well below the 3 MB limit.</p></div><span className="jobStatus jobStatus--pending">{creativeAudioTracks.length}</span></div>
+            <div className="metaFormGrid">
+              <label><span>Creative project</span><select value={creativeAudioForm.project_id} onChange={(event) => setCreativeAudioForm((current) => ({ ...current, project_id: event.target.value }))}><option value="">Select a project</option>{creativeProjects.map((project) => <option value={project.id} key={project.id}>{project.name}</option>)}</select></label>
+              <label><span>Audio file</span><input type="file" accept=".mp3,.m4a,.wav,audio/mpeg,audio/mp4,audio/wav" onChange={(event) => setCreativeAudioForm((current) => ({ ...current, file: event.target.files?.[0] || null }))} /></label>
+              <label><span>Song title</span><input value={creativeAudioForm.title} onChange={(event) => setCreativeAudioForm((current) => ({ ...current, title: event.target.value }))} /></label>
+              <label><span>Artist</span><input value={creativeAudioForm.artist} onChange={(event) => setCreativeAudioForm((current) => ({ ...current, artist: event.target.value }))} /></label>
+              <label><span>Rights</span><select value={creativeAudioForm.rights_status} onChange={(event) => setCreativeAudioForm((current) => ({ ...current, rights_status: event.target.value }))}><option value="owned">Owned</option><option value="licensed">Licensed</option><option value="test_only">Test only</option><option value="unknown">Unknown</option></select></label>
+              <label><span>Default song start (seconds)</span><input type="number" min="0" step="0.1" value={creativeAudioForm.default_start_seconds} onChange={(event) => setCreativeAudioForm((current) => ({ ...current, default_start_seconds: event.target.value }))} /></label>
+            </div>
+            <div className="metaFormActions"><button disabled={busy || !creativeAudioForm.project_id || !creativeAudioForm.file} onClick={uploadCreativeAudio}>Upload snippet</button></div>
+          </section>
+
+          <div className="creativeProjectList">
+            {creativeExperiments.map((experiment) => {
+              const project = creativeProjects.find((item) => item.id === experiment.project_id);
+              const phases = experiment.meta_creative_experiment_phases || [];
+              const activePhase = phases.find((item) => item.phase_number === experiment.current_phase) || phases[0];
+              const variants = activePhase?.meta_creative_variants || [];
+              const videos = (project?.meta_creative_assets || []).filter((asset) => asset.asset_type === "video");
+              const tracks = creativeAudioTracks.filter((track) => track.project_id === experiment.project_id);
+              const selection = creativeMatrixSelections[experiment.id] || { videos: [], audio: [] };
+              const matrixSize = selection.videos.length * Math.max(1, selection.audio.length);
+              return <article className="dashboardPanel" key={experiment.id}>
+                <div className="panelHeader"><div><span className="metaReadOnlyBadge">Phase {activePhase?.phase_number || 1} · {activePhase?.phase_type || "explore"}</span><h2>{experiment.name}</h2><p>{activePhase?.hypothesis}</p></div><span className={`jobStatus jobStatus--${activePhase?.status === "completed" ? "done" : "pending"}`}>{activePhase?.status || experiment.status}</span></div>
+                <div className="metricGrid metricGrid--primary">
+                  <article><span className="metricLabel">Videos</span><strong className="metricValue">{selection.videos.length}</strong><small className="metricMeta">selected inputs</small></article>
+                  <article><span className="metricLabel">Songs</span><strong className="metricValue">{selection.audio.length}</strong><small className="metricMeta">selected snippets</small></article>
+                  <article><span className="metricLabel">Matrix</span><strong className="metricValue">{matrixSize}</strong><small className="metricMeta">new render combinations</small></article>
+                  <article><span className="metricLabel">Variants</span><strong className="metricValue">{variants.length}</strong><small className="metricMeta">{variants.filter((variant) => variant.status === "ready").length} ready</small></article>
+                </div>
+                <div className="metaSetupGrid">
+                  <div><h3>Video concepts</h3><div className="metaPermissionList">{videos.map((video) => {
+                    const concept = (project?.meta_creative_concepts || []).find((item) => item.id === video.concept_id);
+                    return <label key={video.id}><input type="checkbox" checked={selection.videos.includes(video.id)} onChange={() => toggleCreativeMatrix(experiment.id, "videos", video.id)} /> <span>{concept?.title || "Video concept"}</span></label>;
+                  })}{!videos.length ? <p>Assign video footage in Creative Studio first.</p> : null}</div></div>
+                  <div><h3>Song snippets</h3><div className="metaPermissionList">{tracks.map((track) => <label key={track.id}><input type="checkbox" checked={selection.audio.includes(track.id)} onChange={() => toggleCreativeMatrix(experiment.id, "audio", track.id)} /> <span>{track.title}{track.artist ? ` — ${track.artist}` : ""}</span></label>)}{!tracks.length ? <p>No song snippets uploaded for this project. Rendering without audio remains possible.</p> : null}</div></div>
+                </div>
+                <div className="metaFormActions"><button disabled={busy || !activePhase || !selection.videos.length || matrixSize > 128} onClick={() => createCreativeMatrix(experiment)}>Queue {matrixSize} renders</button><small>Duplicate DNA is skipped automatically. Maximum 128 combinations per batch.</small></div>
+                {variants.length ? <div className="metaPermissionList">{variants.map((variant) => <span key={variant.id}>{variant.label} · {variant.status}</span>)}</div> : null}
+              </article>;
+            })}
+            {!creativeExperiments.length ? <section className="dashboardPanel creativeEmptyState"><strong>No experiments yet</strong><p>Create one from a project whose concepts already have selected footage.</p></section> : null}
+          </div>
         </> : null}
 
         {adsSection === "library" ? <section className="dashboardPanel creativeLibrary">

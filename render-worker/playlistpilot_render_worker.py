@@ -186,6 +186,11 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     cta_file = workdir / "cta.txt"
     playlist_file = workdir / "playlist.txt"
     download(str(job["video_url"]), source)
+    audio_url = str(job.get("audio_url") or "").strip()
+    audio = workdir / "audio"
+    song_start = max(0.0, float(job.get("song_start_seconds") or 0))
+    if audio_url:
+        download(audio_url, audio)
     hook_fit_width = safe_width - (max(22, int(width * 0.04)) if template_id == "editorial_top" else 0)
     fitted_hook, hook_font_size, hook_line_spacing = fit_text(
         hook, hook_fit_width, safe_height, max(34, int(width * template["font_ratio"])), max(24, int(width * 0.038))
@@ -207,6 +212,9 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     if show_cover:
         download(str(job["playlist_cover_url"]), cover)
         command.extend(["-loop", "1", "-i", str(cover)])
+    audio_input_index = 2 if show_cover else 1
+    if audio_url:
+        command.extend(["-ss", f"{song_start:.3f}", "-i", str(audio)])
 
     filters = [f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},drawbox=x=0:y=0:w=iw:h=ih:color=black@{overlay:.3f}:t=fill[base]"]
     current = "base"
@@ -273,9 +281,14 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
         )
     tail = ",".join(text_filters + ["format=yuv420p"])
     filters.append(f"[{current}]{tail}[out]")
+    command.extend(["-filter_complex", ";".join(filters), "-map", "[out]"])
+    if audio_url:
+        command.extend(["-map", f"{audio_input_index}:a:0", "-c:a", "aac", "-b:a", "192k"])
+    else:
+        command.append("-an")
     command.extend([
-        "-filter_complex", ";".join(filters), "-map", "[out]", "-an", "-t", f"{duration:.3f}",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-movflags", "+faststart", "-threads", "2", str(output),
+        "-t", f"{duration:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-movflags", "+faststart", "-threads", "2", str(output),
     ])
     subprocess.run(command, check=True, capture_output=True, text=True, timeout=600)
     return output, min(duration, probe_duration(output)), width, height
