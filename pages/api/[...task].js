@@ -1065,6 +1065,14 @@ function normalizeOverlayHook(value) {
   return words.join(" ");
 }
 
+function coreStoryHookSeeds(notes) {
+  const source = String(notes || "");
+  const quoted = [...source.matchAll(/[“"]([^”"]+)[”"]/g)]
+    .map((match) => normalizeOverlayHook(match[1]))
+    .filter((value) => value.split(/\s+/).length >= 3);
+  return [...new Set(quoted)].slice(0, 3);
+}
+
 function extractOpenAIText(payload) {
   if (typeof payload?.output_text === "string" && payload.output_text.trim()) return payload.output_text;
   for (const item of payload?.output || []) {
@@ -4453,6 +4461,28 @@ const routes = {
           // rather than failing the entire eight-creative batch.
         }
       }
+      const pinnedCoreHooks = coreStoryHookSeeds(project.brief?.creative_notes);
+      const pinnedCoreSlots = new Set();
+      if (pinnedCoreHooks.length) {
+        const eligibleSlots = creativeDeck.recipes
+          .map((recipe, index) => ({ recipe, index }))
+          .filter(({ recipe }) => recipe.risk_level !== "wildcard" && recipe.workflow === "concept_first")
+          .map(({ index }) => index);
+        pinnedCoreHooks.slice(0, Math.min(3, eligibleSlots.length)).forEach((hook, hookIndex) => {
+          const index = eligibleSlots[hookIndex];
+          const existingCandidates = normalizedHooks[index]?.candidates || [];
+          normalizedHooks[index] = {
+            ...(normalizedHooks[index] || {}),
+            chosenHook: hook,
+            candidates: [
+              { text: hook, clarity: 10, scroll_stop: 8, playlist_fit: 10, originality: 8, visual_fit: 8, total: 44, rationale: "Pinned from the authored campaign core story." },
+              ...existingCandidates.filter((candidate) => candidate.text !== hook),
+            ].slice(0, 6),
+          };
+          generated.concepts[index].hook = hook;
+          pinnedCoreSlots.add(index);
+        });
+      }
       const now = new Date().toISOString();
       const rows = generated.concepts.map((concept, index) => ({
         project_id: project.id,
@@ -4489,6 +4519,7 @@ const routes = {
           novelty_score: Number(concept.novelty_score || 0),
           novelty_mode: noveltyMode,
           memory_concepts: priorConcepts.length,
+          core_story_pinned: pinnedCoreSlots.has(index),
           creative_deck: creativeDeck.recipes[index],
         },
         updated_at: now,
