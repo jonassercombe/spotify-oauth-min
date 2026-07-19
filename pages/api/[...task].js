@@ -1085,7 +1085,7 @@ async function generateCreativeBriefWithOpenAI({ project, playlist, tracks, prio
     })),
     creative_notes: String(project.brief?.creative_notes || "").slice(0, 2000),
     novelty_mode: String(project.brief?.novelty_mode || "balanced"),
-    creative_memory: priorConcepts.slice(0, 48).map(creativeMemoryItem),
+    creative_memory: priorConcepts.slice(0, 32).map(creativeMemoryItem),
   };
   const cachedBrief = project.brief?.mood_summary ? {
     title: project.brief.title,
@@ -1115,7 +1115,9 @@ For stock_simple, one continuous stock clip must be sufficient. For stock_montag
     ? `Use the cached playlist analysis below and create only a fresh concept portfolio. Do not repeat the playlist analysis. The primary ad format is ${project.format}. Treat creative_notes as optional campaign direction. creative_memory contains recent concepts that must not be paraphrased or recreated. In explore mode, maximize distance from their hooks, angles, human moments, settings, visible actions, and search terms.\n\n${JSON.stringify({ cached_playlist_analysis: cachedBrief, ...source })}`
     : `Analyze this playlist snapshot and create the creative brief and concept portfolio. The primary ad format is ${project.format}. Treat creative_notes as optional campaign direction, never as factual playlist metadata.\n\n${JSON.stringify(source)}`;
   try {
-    const model = process.env.OPENAI_MODEL || "gpt-5.6";
+    const model = cachedBrief
+      ? process.env.OPENAI_CONCEPT_MODEL || process.env.OPENAI_VISION_MODEL || "gpt-5.4-mini"
+      : process.env.OPENAI_MODEL || "gpt-5.6";
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       signal: controller.signal,
