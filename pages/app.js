@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Head from "next/head";
 import { useRouter } from "next/router";
-import { ArrowDown, ArrowUp, GripVertical, ListEnd, Lock, Settings, Shuffle, TimerReset, Trash2, Unlock, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Check, GripVertical, ListEnd, Lock, Music2, Pause, Play, Settings, SlidersHorizontal, Shuffle, TimerReset, Trash2, Unlock, X } from "lucide-react";
 import { Turnstile } from "@marsidev/react-turnstile";
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { getSupabaseBrowserClient } from "../lib/supabaseBrowser";
@@ -283,55 +283,73 @@ function CampaignAudioTrimmer({ master, snippets = [], selectedIds = [], onSave,
 
   const snippetDuration = Math.max(0, end - start);
   const valid = snippetDuration >= 5 && snippetDuration <= 30 && fadeIn + fadeOut < snippetDuration;
+  const formatAudioTime = (seconds) => {
+    const safeSeconds = Math.max(0, Number(seconds || 0));
+    return `${Math.floor(safeSeconds / 60)}:${String(Math.floor(safeSeconds % 60)).padStart(2, "0")}`;
+  };
   return <div className="campaignAudioTrimmer">
     <audio ref={audioRef} src={master.source_url} preload="metadata" onTimeUpdate={handleTimeUpdate} onEnded={() => setPlaying(false)} />
     <header className="campaignTrimmerHeader">
-      <div>
-        <span>Now editing</span>
+      <div className="campaignTrimmerTrackIcon"><Music2 aria-hidden="true" /></div>
+      <div className="campaignTrimmerTrack">
         <strong>{master.title}</strong>
-        <small>{master.artist || "Unknown artist"} · {Math.floor(duration / 60)}:{String(Math.round(duration % 60)).padStart(2, "0")} master</small>
+        <small>{master.artist || "Unknown artist"} <i /> {formatAudioTime(duration)} master</small>
       </div>
       <div className="campaignTrimmerSelection">
-        <span>Selected region</span>
-        <strong>{snippetDuration.toFixed(1)}s</strong>
-        <small>{start.toFixed(1)}s → {end.toFixed(1)}s</small>
+        <strong>{snippetDuration.toFixed(1)} sec</strong>
+        <small>{formatAudioTime(start)}–{formatAudioTime(end)}</small>
       </div>
     </header>
-    <div className="campaignAudioWorkbench">
-      <div className="campaignWaveformWorkspace">
-        <div className="campaignWaveformTopline">
-          <span>Waveform</span>
-          <small>Click anywhere to move the selected window</small>
-        </div>
-        <div className="campaignWaveform" onClick={seekFromWaveform}>
-          <canvas ref={canvasRef} aria-label={`Waveform for ${master.title}`} />
-          <div className="campaignWaveformSelection" style={{ left: `${(start / duration) * 100}%`, width: `${(snippetDuration / duration) * 100}%` }}>
-            <i />
-            <i />
-          </div>
-          <div className="campaignWaveformTimes"><span>0:00</span><span>{Math.floor(duration / 2 / 60)}:{String(Math.round((duration / 2) % 60)).padStart(2, "0")}</span><span>{Math.floor(duration / 60)}:{String(Math.round(duration % 60)).padStart(2, "0")}</span></div>
-          {waveformStatus !== "ready" ? <span>{waveformStatus === "loading" ? "Analyzing waveform…" : "Waveform unavailable — timing controls still work"}</span> : null}
-        </div>
-        <div className="campaignAudioPresets">
-          <button className="campaignPreviewButton" onClick={togglePlayback}><b>{playing ? "Ⅱ" : "▶"}</b>{playing ? "Pause preview" : "Preview selection"}</button>
-          <div><span>Length</span>{[8, 10, 15, 20, 30].map((seconds) => <button className={Math.abs(snippetDuration - seconds) < 0.05 ? "active" : "secondary"} key={seconds} onClick={() => applyPreset(seconds)}>{seconds}s</button>)}</div>
-          <label><input type="checkbox" checked={loop} onChange={(event) => setLoop(event.target.checked)} /><span>Loop preview</span></label>
-        </div>
+    <div className="campaignWaveformWorkspace">
+      <div className="campaignWaveformTopline">
+        <span>Choose a moment</span>
+        <small>Click the waveform to move the selection</small>
       </div>
-      <aside className="campaignTrimInspector">
-        <div className="campaignTrimInspectorHeading"><span>Snippet settings</span><small>Fine-tune and save this region</small></div>
+      <div className="campaignWaveform" onClick={seekFromWaveform}>
+        <canvas ref={canvasRef} aria-label={`Waveform for ${master.title}`} />
+        <div className="campaignWaveformSelection" style={{ left: `${(start / duration) * 100}%`, width: `${(snippetDuration / duration) * 100}%` }}>
+          <i />
+          <i />
+        </div>
+        <div className="campaignWaveformTimes"><span>0:00</span><span>{formatAudioTime(duration / 2)}</span><span>{formatAudioTime(duration)}</span></div>
+        {waveformStatus !== "ready" ? <span>{waveformStatus === "loading" ? "Analyzing waveform…" : "Waveform unavailable — timing controls still work"}</span> : null}
+      </div>
+      <div className="campaignAudioTransport">
+        <button className={`campaignPreviewButton ${playing ? "playing" : ""}`} onClick={togglePlayback}>
+          {playing ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}
+          <span>{playing ? "Pause" : "Preview"}</span>
+        </button>
+        <div className="campaignLengthPresets"><span>Length</span>{[8, 10, 15, 20, 30].map((seconds) => <button className={Math.abs(snippetDuration - seconds) < 0.05 ? "active" : ""} key={seconds} onClick={() => applyPreset(seconds)}>{seconds}s</button>)}</div>
+        <label className="campaignLoopToggle"><input type="checkbox" checked={loop} onChange={(event) => setLoop(event.target.checked)} /><span>Loop</span></label>
+      </div>
+    </div>
+    <details className="campaignTrimFineTune">
+      <summary><span><SlidersHorizontal aria-hidden="true" /> Fine-tune timing & fades</span><small>{start.toFixed(1)}s–{end.toFixed(1)}s · {fadeIn.toFixed(1)}s / {fadeOut.toFixed(1)}s fades</small></summary>
+      <div>
         <div className="campaignTimingGrid">
           <label><span>Start</span><div><input type="number" min="0" max={Math.max(0, duration - 5)} step="0.1" value={start} onChange={(event) => { const value = Math.max(0, Math.min(duration - 5, Number(event.target.value) || 0)); setStart(value); if (end < value + 5) setEnd(Math.min(duration, value + 15)); }} /><b>s</b></div></label>
           <label><span>End</span><div><input type="number" min={start + 5} max={Math.min(duration, start + 30)} step="0.1" value={end} onChange={(event) => setEnd(Math.max(start + 5, Math.min(duration, start + 30, Number(event.target.value) || start + 15)))} /><b>s</b></div></label>
           <label><span>Fade in</span><div><input type="number" min="0" max="3" step="0.05" value={fadeIn} onChange={(event) => setFadeIn(Math.max(0, Math.min(3, Number(event.target.value) || 0)))} /><b>s</b></div></label>
           <label><span>Fade out</span><div><input type="number" min="0" max="3" step="0.05" value={fadeOut} onChange={(event) => setFadeOut(Math.max(0, Math.min(3, Number(event.target.value) || 0)))} /><b>s</b></div></label>
         </div>
-        <label className="campaignSnippetName"><span>Snippet name</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder={`${master.title} · Chorus`} /></label>
+      </div>
+    </details>
+    <div className="campaignSnippetComposer">
+      <label className="campaignSnippetName"><span>Snippet name <small>optional</small></span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder={`${master.title} · Chorus`} /></label>
+      <div>
         <button className="campaignSaveSnippet" disabled={busy || !valid} onClick={() => onSave({ master_id: master.id, title: title || `${master.title} · ${start.toFixed(1)}s`, start_seconds: start, end_seconds: end, fade_in_seconds: fadeIn, fade_out_seconds: fadeOut })}>Save as new snippet</button>
-        <small className={valid ? "campaignTrimHint" : "campaignTrimHint invalid"}>{valid ? "Ready to save · non-destructive edit" : "Choose a region between 5 and 30 seconds"}</small>
-      </aside>
+        <small className={valid ? "campaignTrimHint" : "campaignTrimHint invalid"}>{valid ? "Original audio stays untouched" : "Choose 5–30 seconds"}</small>
+      </div>
     </div>
-    {snippets.length ? <section className="campaignSavedSnippets"><div><span>Saved snippets</span><small>Select up to eight for creative generation · {selectedIds.length} selected</small></div><div className="campaignSnippetList">{snippets.map((snippet) => <label className={selectedIds.includes(snippet.id) ? "selected" : ""} key={snippet.id}><input type="checkbox" checked={selectedIds.includes(snippet.id)} onChange={() => onToggle(snippet.id)} /><span><strong>{snippet.title}</strong><small>{Number(snippet.start_seconds).toFixed(1)}–{Number(snippet.end_seconds).toFixed(1)}s · {Number(snippet.end_seconds - snippet.start_seconds).toFixed(1)} sec</small></span><b>{selectedIds.includes(snippet.id) ? "Selected" : "Use"}</b></label>)}</div></section> : null}
+    {snippets.length ? <section className="campaignSavedSnippets"><div><div><span>Saved snippets</span><small>Choose the moments to test in your creatives</small></div><b>{selectedIds.length} of 8 selected</b></div><div className="campaignSnippetList">{snippets.map((snippet, index) => {
+      const selected = selectedIds.includes(snippet.id);
+      return <article className={selected ? "selected" : ""} key={snippet.id}>
+        <i>{String(index + 1).padStart(2, "0")}</i>
+        <span><strong>{snippet.title}</strong><small>{formatAudioTime(snippet.start_seconds)}–{formatAudioTime(snippet.end_seconds)} in master</small></span>
+        <em>{Number(snippet.end_seconds - snippet.start_seconds).toFixed(1)}s</em>
+        <button className={selected ? "selected" : ""} onClick={() => onToggle(snippet.id)}>{selected ? <><Check aria-hidden="true" /> Selected</> : "Use snippet"}</button>
+      </article>;
+    })}</div></section> : null}
   </div>;
 }
 
@@ -7663,60 +7681,79 @@ export default function PlaylistManager() {
         .campaignAudioEmpty > i { display: grid; place-items: center; width: 46px; height: 46px; border-radius: 50%; color: #8ea7ff; background: rgba(142,167,255,.09); font-size: 20px; font-style: normal; }
         .campaignAudioEmpty > div { display: grid; gap: 4px; }
         .campaignAudioEmpty p { margin: 0; color: #778291; }
-        .campaignAudioTrimmer { display: grid; gap: 18px; padding: 20px; border: 1px solid #343d49; border-radius: 14px; background: linear-gradient(160deg, rgba(142,167,255,.045), transparent 40%), #0e1319; box-shadow: 0 20px 52px rgba(0,0,0,.18); }
+        .campaignAudioTrimmer { display: grid; gap: 20px; padding: 22px; border: 1px solid #343d49; border-radius: 16px; background: linear-gradient(145deg, rgba(142,167,255,.045), transparent 35%), #0e1319; box-shadow: 0 20px 52px rgba(0,0,0,.18); }
         .campaignAudioTrimmer audio { display: none; }
-        .campaignTrimmerHeader { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding-bottom: 15px; border-bottom: 1px solid #292f38; }
-        .campaignTrimmerHeader > div:first-child { display: grid; gap: 3px; min-width: 0; }
-        .campaignTrimmerHeader > div:first-child strong { overflow: hidden; color: #f4f7fa; font-size: 17px; text-overflow: ellipsis; white-space: nowrap; }
-        .campaignTrimmerHeader > div:first-child small { color: #75808f; }
-        .campaignTrimmerSelection { display: grid; min-width: 132px; text-align: right; }
-        .campaignTrimmerSelection span { color: #687383; font-size: 8px; text-transform: uppercase; }
-        .campaignTrimmerSelection strong { margin: 2px 0; color: #8ea7ff; font-size: 19px; }
-        .campaignTrimmerSelection small { color: #8c96a3; }
-        .campaignAudioWorkbench { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(280px, .45fr); gap: 16px; align-items: stretch; }
-        .campaignWaveformWorkspace { display: grid; align-content: start; gap: 10px; min-width: 0; }
+        .campaignTrimmerHeader { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 13px; }
+        .campaignTrimmerTrackIcon { display: grid; place-items: center; width: 40px; height: 40px; border: 1px solid rgba(142,167,255,.26); border-radius: 11px; color: #9fb1ff; background: rgba(142,167,255,.09); }
+        .campaignTrimmerTrackIcon svg { width: 18px; height: 18px; }
+        .campaignTrimmerTrack { display: grid; gap: 4px; min-width: 0; }
+        .campaignTrimmerTrack strong { overflow: hidden; color: #f4f7fa; font-size: 15px; text-overflow: ellipsis; white-space: nowrap; }
+        .campaignTrimmerTrack small { display: flex; align-items: center; gap: 7px; color: #75808f; }
+        .campaignTrimmerTrack small i { width: 3px; height: 3px; border-radius: 50%; background: #505b69; }
+        .campaignTrimmerSelection { display: grid; gap: 2px; min-width: 112px; padding: 8px 11px; border: 1px solid #303846; border-radius: 10px; background: #11171e; text-align: right; }
+        .campaignTrimmerSelection strong { color: #edf1f7; font-size: 13px; }
+        .campaignTrimmerSelection small { color: #7f8997; font-size: 9px; }
+        .campaignWaveformWorkspace { display: grid; gap: 10px; min-width: 0; }
         .campaignWaveformTopline { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
-        .campaignWaveformTopline span { color: #cbd2dc; font-size: 10px; font-weight: 800; }
-        .campaignWaveformTopline small { color: #687383; }
-        .campaignWaveform { position: relative; height: 178px; overflow: hidden; border: 1px solid #28313d; border-radius: 10px; cursor: crosshair; background: #0a1016; }
+        .campaignWaveformTopline span { color: #dce2ea; font-size: 11px; font-weight: 800; }
+        .campaignWaveformTopline small { color: #717c8b; }
+        .campaignWaveform { position: relative; height: 190px; overflow: hidden; border: 1px solid #2d3642; border-radius: 12px; cursor: crosshair; background: #090f15; box-shadow: inset 0 1px 10px rgba(0,0,0,.2); }
         .campaignWaveform::before { content: ""; position: absolute; z-index: 1; inset: 0; background: repeating-linear-gradient(90deg, transparent 0, transparent calc(12.5% - 1px), rgba(255,255,255,.045) 12.5%); pointer-events: none; }
-        .campaignWaveform canvas { display: block; width: 100%; height: 150px; margin-top: 5px; opacity: .92; }
+        .campaignWaveform canvas { display: block; width: 100%; height: 158px; margin-top: 5px; opacity: .92; }
         .campaignWaveform > span { position: absolute; inset: 0; display: grid; place-items: center; color: #8290a3; font-size: 11px; }
-        .campaignWaveformSelection { position: absolute; top: 6px; bottom: 24px; z-index: 2; border: 1px solid rgba(255,255,255,.94); border-radius: 5px; background: rgba(142,167,255,.14); box-shadow: 0 0 0 9999px rgba(3, 7, 12, .5), 0 0 20px rgba(142,167,255,.12); pointer-events: none; }
+        .campaignWaveformSelection { position: absolute; top: 7px; bottom: 25px; z-index: 2; border: 1px solid rgba(255,255,255,.92); border-radius: 6px; background: rgba(142,167,255,.13); box-shadow: 0 0 0 9999px rgba(3,7,12,.54), 0 0 24px rgba(142,167,255,.14); pointer-events: none; }
         .campaignWaveformSelection i { position: absolute; top: 50%; width: 5px; height: 31px; border-radius: 4px; background: #fff; transform: translateY(-50%); }
         .campaignWaveformSelection i:first-child { left: -3px; }
         .campaignWaveformSelection i:last-child { right: -3px; }
         .campaignWaveformTimes { position: absolute; z-index: 3; right: 10px; bottom: 6px; left: 10px; display: flex; justify-content: space-between; color: #576372; font-size: 8px; pointer-events: none; }
-        .campaignAudioPresets { display: flex; align-items: center; gap: 10px; min-height: 42px; padding: 6px; border: 1px solid #2a323d; border-radius: 10px; background: #11161d; }
-        .campaignAudioPresets button { min-width: auto; padding: 7px 9px; border-color: transparent; color: #9ba5b2; background: transparent; }
-        .campaignAudioPresets button.active { color: #0b1017; background: #e8edff; }
-        .campaignAudioPresets .campaignPreviewButton { display: flex; align-items: center; gap: 7px; padding-right: 13px; color: #f3f6fa; background: #252d38; }
-        .campaignPreviewButton b { display: inline-grid; place-items: center; width: 18px; height: 18px; color: #8ea7ff; font-size: 9px; }
-        .campaignAudioPresets > div { display: flex; align-items: center; gap: 2px; }
-        .campaignAudioPresets > div > span { margin: 0 5px; color: #626e7d; font-size: 8px; font-weight: 900; text-transform: uppercase; }
-        .campaignAudioPresets label { display: flex; align-items: center; gap: 7px; margin-left: auto; padding-right: 8px; color: #aeb8c5; font-size: 10px; }
-        .campaignAudioPresets input, .campaignSnippetList input { width: auto; accent-color: #8ea7ff; }
-        .campaignTrimInspector { display: grid; align-content: start; gap: 13px; padding: 16px; border: 1px solid #2c3540; border-radius: 11px; background: #121820; }
-        .campaignTrimInspectorHeading { display: grid; gap: 3px; padding-bottom: 10px; border-bottom: 1px solid #2b323d; }
-        .campaignTrimInspectorHeading span { color: #edf1f6; font-size: 11px; font-weight: 800; }
-        .campaignTrimInspectorHeading small { color: #697586; }
-        .campaignTimingGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .campaignAudioTransport { display: flex; align-items: center; gap: 12px; min-height: 48px; padding: 6px; border: 1px solid #2b333e; border-radius: 11px; background: #11171e; }
+        .campaignPreviewButton { display: flex; align-items: center; gap: 8px; min-width: 106px; padding: 9px 13px; border-color: #394352; color: #f4f6fa; background: #252d38; }
+        .campaignPreviewButton.playing { border-color: rgba(142,167,255,.5); background: rgba(142,167,255,.13); }
+        .campaignPreviewButton svg { width: 14px; height: 14px; color: #a9b8ff; fill: currentColor; }
+        .campaignLengthPresets { display: flex; align-items: center; gap: 4px; }
+        .campaignLengthPresets > span { margin: 0 6px 0 3px; color: #697585; font-size: 8px; font-weight: 900; letter-spacing: .06em; text-transform: uppercase; }
+        .campaignLengthPresets button { min-width: auto; padding: 7px 10px; border-color: transparent; color: #8994a2; background: transparent; }
+        .campaignLengthPresets button:hover { color: #e2e7ed; background: #1d252f; }
+        .campaignLengthPresets button.active { color: #10151c; background: #e9edff; }
+        .campaignLoopToggle { display: flex; align-items: center; gap: 8px; margin-left: auto; padding: 0 10px; color: #a4aeba; font-size: 10px; }
+        .campaignLoopToggle input { width: auto; accent-color: #8ea7ff; }
+        .campaignTrimFineTune { overflow: hidden; border: 1px solid #2b333e; border-radius: 11px; background: #11171e; }
+        .campaignTrimFineTune summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 13px 15px; cursor: pointer; list-style: none; }
+        .campaignTrimFineTune summary::-webkit-details-marker { display: none; }
+        .campaignTrimFineTune summary > span { display: flex; align-items: center; gap: 8px; color: #c9d0da; font-size: 10px; font-weight: 800; }
+        .campaignTrimFineTune summary svg { width: 14px; height: 14px; color: #8ea7ff; }
+        .campaignTrimFineTune summary small { color: #6f7b8a; font-size: 9px; }
+        .campaignTrimFineTune[open] summary { border-bottom: 1px solid #29313b; }
+        .campaignTrimFineTune > div { padding: 14px; }
+        .campaignTimingGrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; }
         .campaignTimingGrid label, .campaignSnippetName { display: grid; gap: 5px; }
         .campaignTimingGrid label > div { position: relative; }
         .campaignTimingGrid input { padding-right: 24px; }
         .campaignTimingGrid label b { position: absolute; top: 50%; right: 9px; color: #596575; font-size: 9px; transform: translateY(-50%); }
-        .campaignSaveSnippet { width: 100%; margin-top: 2px; color: #09120d; background: #f4f7fa; }
-        .campaignTrimHint { color: #718b7d; font-size: 8px; text-align: center; text-transform: uppercase; }
+        .campaignSnippetComposer { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 12px; padding-top: 2px; }
+        .campaignSnippetName > span { display: flex; gap: 6px; align-items: center; }
+        .campaignSnippetName > span small { color: #576270; font-size: 8px; letter-spacing: 0; text-transform: none; }
+        .campaignSnippetComposer > div { display: grid; justify-items: end; gap: 5px; }
+        .campaignSaveSnippet { min-width: 190px; color: #09120d; background: #f4f7fa; }
+        .campaignTrimHint { color: #718b7d; font-size: 8px; }
         .campaignTrimHint.invalid { color: #b48282; }
-        .campaignSavedSnippets { display: grid; gap: 10px; padding-top: 4px; }
-        .campaignSnippetList { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-        .campaignSnippetList label { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 11px 12px; border: 1px solid #303744; border-radius: 9px; background: #10151b; cursor: pointer; }
-        .campaignSnippetList label.selected { border-color: rgba(142,167,255,.62); background: rgba(91, 132, 255, .1); }
+        .campaignSavedSnippets { display: grid; gap: 11px; padding-top: 4px; border-top: 1px solid #29313b; }
+        .campaignSavedSnippets > div:first-child { padding-top: 17px; }
+        .campaignSavedSnippets > div:first-child > div { display: grid; gap: 3px; }
+        .campaignSavedSnippets > div:first-child > div > span { color: #e5e9ef; font-size: 11px; font-weight: 800; }
+        .campaignSavedSnippets > div:first-child > b { padding: 6px 9px; border-radius: 8px; color: #aab8ff; background: rgba(142,167,255,.09); font-size: 8px; text-transform: uppercase; }
+        .campaignSnippetList { display: grid; gap: 7px; }
+        .campaignSnippetList article { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 12px; padding: 10px 11px; border: 1px solid #2c3440; border-radius: 10px; background: #10161c; }
+        .campaignSnippetList article.selected { border-color: rgba(142,167,255,.5); background: rgba(91,132,255,.075); }
+        .campaignSnippetList article > i { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 8px; color: #788493; background: #192029; font-size: 8px; font-style: normal; }
+        .campaignSnippetList article.selected > i { color: #aebcff; background: rgba(142,167,255,.12); }
         .campaignSnippetList span { display: grid; gap: 3px; min-width: 0; }
         .campaignSnippetList strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .campaignSnippetList small { color: #7f8998; font-size: 9px; }
-        .campaignSnippetList label > b { color: #657181; font-size: 8px; text-transform: uppercase; }
-        .campaignSnippetList label.selected > b { color: #aebeff; }
+        .campaignSnippetList article > em { min-width: 45px; color: #9aa5b3; font-size: 10px; font-style: normal; text-align: right; }
+        .campaignSnippetList article > button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-width: 94px; padding: 7px 9px; border-color: #394351; color: #aeb7c3; background: #171e26; }
+        .campaignSnippetList article > button.selected { border-color: rgba(142,167,255,.46); color: #dbe1ff; background: rgba(142,167,255,.12); }
+        .campaignSnippetList article > button svg { width: 12px; height: 12px; }
         .campaignGenerateStep { display: grid; gap: 18px; }
         .campaignGenerateHero { display: flex; align-items: center; justify-content: space-between; gap: 28px; padding: 26px; border: 1px solid rgba(142, 167, 255, .34); border-radius: 14px; background: radial-gradient(circle at 92% 10%, rgba(91,132,255,.22), transparent 42%), #11161d; }
         .campaignGenerateHero > div { max-width: 720px; }
@@ -10008,10 +10045,9 @@ export default function PlaylistManager() {
           .creativeMediaSearch > div:first-child { grid-template-columns: 1fr 1fr; }
           .creativeMediaSearch > div:first-child input { grid-column: 1 / -1; }
           .creativeEditor { grid-template-columns: 1fr; }
-          .campaignAudioWorkbench { grid-template-columns: 1fr; }
           .campaignAudioMetadata > div:nth-child(2) { grid-template-columns: 1fr 1fr; }
-          .campaignAudioPresets { flex-wrap: wrap; }
-          .campaignAudioPresets label { margin-left: 0; }
+          .campaignAudioTransport { flex-wrap: wrap; }
+          .campaignLoopToggle { margin-left: 0; }
           .creativeTemplateGrid { grid-template-columns: 1fr; }
           .creativeProjectMediaReview { grid-template-columns: 1fr; }
           .creativeBatchHeader { align-items: stretch; flex-direction: column; }
@@ -10177,15 +10213,21 @@ export default function PlaylistManager() {
             padding: 16px;
           }
           .campaignAudioMetadata > div:nth-child(2),
-          .campaignTimingGrid,
-          .campaignSnippetList {
+          .campaignTimingGrid {
             grid-template-columns: 1fr;
           }
-          .campaignAudioPresets > div {
+          .campaignAudioTransport { align-items: stretch; flex-direction: column; }
+          .campaignSnippetComposer { align-items: stretch; grid-template-columns: 1fr; }
+          .campaignLengthPresets {
             order: 3;
             width: 100%;
             overflow-x: auto;
           }
+          .campaignSnippetComposer > div { justify-items: stretch; }
+          .campaignSaveSnippet { width: 100%; }
+          .campaignSnippetList article { grid-template-columns: auto minmax(0, 1fr) auto; }
+          .campaignSnippetList article > em { display: none; }
+          .campaignSnippetList article > button { grid-column: 2 / -1; width: 100%; }
           .dashboardFocusGrid,
           .dashboardSplitGrid,
           .performanceHeroRow,
