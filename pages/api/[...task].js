@@ -3149,6 +3149,78 @@ const routes = {
   },
 
   /* ---------- meta/audio-library (GET) ---------- */
+  "meta/spotify-preview-check": async (req, res) => {
+    if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
+    const ctx = await requireAdminContext(req, res);
+    if (!ctx) return;
+    const playlistId = String(req.query.playlist_id || "");
+    if (!/^[0-9a-f-]{36}$/i.test(playlistId)) return bad(res, 400, "preview_playlist_required");
+
+    const playlistResponse = await sb(
+      `/rest/v1/playlists?select=id,playlist_id,name,connection_id&limit=1&id=eq.${encodeURIComponent(playlistId)}` +
+      `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}`
+    );
+    const playlist = playlistResponse.ok ? (await playlistResponse.json().catch(() => []))[0] : null;
+    if (!playlist?.playlist_id || !playlist?.connection_id) return bad(res, 404, "preview_playlist_not_found");
+
+    try {
+      const accessToken = await getAccessTokenFromConnection(playlist.connection_id);
+      const fields = "items(track(id,name,artists(name),external_ids(isrc),preview_url,external_urls(spotify)))";
+      const playlistItemsResponse = await fetch(
+        `https://api.spotify.com/v1/playlists/${encodeURIComponent(playlist.playlist_id)}/tracks?limit=8&offset=0&fields=${encodeURIComponent(fields)}`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      const playlistItemsPayload = await playlistItemsResponse.json().catch(() => ({}));
+      if (!playlistItemsResponse.ok) {
+        return bad(res, playlistItemsResponse.status, `spotify_preview_playlist_failed:${playlistItemsPayload?.error?.message || playlistItemsResponse.status}`);
+      }
+
+      const playlistTracks = (playlistItemsPayload.items || []).map((item) => item?.track).filter((track) => track?.id).slice(0, 8);
+      let trackLookupStatus = "not_run";
+      let lookupById = new Map();
+      if (playlistTracks.length) {
+        const trackLookupResponse = await fetch(
+          `https://api.spotify.com/v1/tracks?ids=${encodeURIComponent(playlistTracks.map((track) => track.id).join(","))}&market=from_token`,
+          { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+        trackLookupStatus = String(trackLookupResponse.status);
+        const trackLookupPayload = await trackLookupResponse.json().catch(() => ({}));
+        if (trackLookupResponse.ok) {
+          lookupById = new Map((trackLookupPayload.tracks || []).filter(Boolean).map((track) => [track.id, track]));
+        }
+      }
+
+      const tracks = playlistTracks.map((playlistTrack, index) => {
+        const lookupTrack = lookupById.get(playlistTrack.id);
+        const previewUrl = lookupTrack?.preview_url || playlistTrack.preview_url || null;
+        return {
+          position: index + 1,
+          id: playlistTrack.id,
+          title: lookupTrack?.name || playlistTrack.name || "Unknown track",
+          artist: (lookupTrack?.artists || playlistTrack.artists || []).map((artist) => artist?.name).filter(Boolean).join(", "),
+          isrc: lookupTrack?.external_ids?.isrc || playlistTrack.external_ids?.isrc || null,
+          spotify_url: lookupTrack?.external_urls?.spotify || playlistTrack.external_urls?.spotify || null,
+          preview_available: !!previewUrl,
+          preview_url: previewUrl,
+          preview_source: lookupTrack?.preview_url ? "track_lookup" : playlistTrack.preview_url ? "playlist_items" : null,
+        };
+      });
+
+      return json(res, 200, {
+        ok: true,
+        playlist: { id: playlist.id, spotify_id: playlist.playlist_id, name: playlist.name },
+        checked_count: tracks.length,
+        available_count: tracks.filter((track) => track.preview_available).length,
+        playlist_items_status: String(playlistItemsResponse.status),
+        track_lookup_status: trackLookupStatus,
+        tracks,
+      });
+    } catch (e) {
+      return bad(res, 500, `spotify_preview_check_failed:${String(e?.message || e)}`);
+    }
+  },
+
+  /* ---------- meta/audio-library (GET) ---------- */
   "meta/audio-library": async (req, res) => {
     if (req.method !== "GET") return bad(res, 405, "method_not_allowed");
     const ctx = await requireAdminContext(req, res);
