@@ -7191,7 +7191,7 @@ export default function PlaylistManager() {
         .adsConnectionSummary dd { margin: 0; text-align: right; }
         .adsWizardSteps {
           display: grid;
-          grid-template-columns: repeat(4, 1fr);
+          grid-template-columns: repeat(5, 1fr);
           gap: 8px;
           margin: 20px 0 6px;
         }
