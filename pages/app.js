@@ -2993,7 +2993,11 @@ export default function PlaylistManager() {
       return null;
     });
     if (data) {
-      const masters = data.masters || [];
+      const masters = [...(data.masters || [])].sort((left, right) => {
+        const leftIsCurrent = left.playlist_id === playlistId ? 1 : 0;
+        const rightIsCurrent = right.playlist_id === playlistId ? 1 : 0;
+        return rightIsCurrent - leftIsCurrent;
+      });
       const eligibleSnippetIds = new Set(masters.flatMap((master) => master.meta_audio_snippets || []).filter((snippet) => Math.abs(Number(snippet.end_seconds - snippet.start_seconds) - 30) < 0.05).map((snippet) => snippet.id));
       setCampaignAudioMasters(masters);
       setCampaignAudioMasterId((current) => masters.some((master) => master.id === current) ? current : masters[0]?.id || "");
@@ -4871,7 +4875,7 @@ export default function PlaylistManager() {
             {adsWizardStep === 2 ? <>
               <section className="campaignAudioStep metaDraftWide">
                 <div className="campaignAudioIntro">
-                  <div><span>Campaign soundtrack</span><h3>Build your audio variations</h3><p>Upload a song once, cut several reusable moments, and choose which snippets should enter the creative test.</p></div>
+                  <div><span>Campaign soundtrack</span><h3>Build your audio variations</h3><p>Upload a song once, cut several reusable moments, and choose which snippets should enter the creative test. Everything you add is saved to your personal audio library for future campaigns.</p></div>
                   <div className="campaignAudioSelectionCount"><strong>{(metaDraftForm.audio_snippet_ids || []).length}</strong><span>of 8 selected</span></div>
                 </div>
                 <section className="campaignAudioUploader">
@@ -4891,7 +4895,10 @@ export default function PlaylistManager() {
                     <button className="campaignUploadMasterButton" disabled={busy || !metaDraftForm.playlist_id || !campaignAudioUpload.file} onClick={uploadCampaignAudioMaster}>Upload and analyze master</button>
                   </div>
                 </section>
-                {campaignAudioMasters.length ? <section className="campaignAudioMasterLibrary"><div><span>Audio masters</span><small>Choose a track to create or review snippets</small></div><div className="campaignAudioMasterTabs">{campaignAudioMasters.map((master, index) => <button className={campaignAudioMasterId === master.id ? "active" : "secondary"} key={master.id} onClick={() => setCampaignAudioMasterId(master.id)}><i>{index + 1}</i><span><strong>{master.title}</strong><small>{master.artist || "Unknown artist"} · {Math.floor(Number(master.duration_seconds || 0) / 60)}:{String(Math.round(Number(master.duration_seconds || 0) % 60)).padStart(2, "0")}</small></span><b>{(master.meta_audio_snippets || []).length} snippets</b></button>)}</div></section> : <div className="campaignAudioEmpty"><i>♪</i><div><strong>Your audio workspace is empty</strong><p>Upload a master above, or continue without audio and add sound later.</p></div></div>}
+                {campaignAudioMasters.length ? <section className="campaignAudioMasterLibrary"><div><span>Your audio library</span><small>Masters and 30-second snippets are available in every campaign</small></div>{[
+                  { label: "Added for this playlist", masters: campaignAudioMasters.filter((master) => master.playlist_id === metaDraftForm.playlist_id) },
+                  { label: "From your other campaigns", masters: campaignAudioMasters.filter((master) => master.playlist_id !== metaDraftForm.playlist_id) },
+                ].filter((group) => group.masters.length).map((group) => <div className="campaignAudioLibraryGroup" key={group.label}><small className="campaignAudioLibraryGroupLabel">{group.label}</small><div className="campaignAudioMasterTabs">{group.masters.map((master) => <button className={campaignAudioMasterId === master.id ? "active" : "secondary"} key={master.id} onClick={() => setCampaignAudioMasterId(master.id)}><i>{campaignAudioMasters.indexOf(master) + 1}</i><span><strong>{master.title}</strong><small>{master.artist || "Unknown artist"} · {Math.floor(Number(master.duration_seconds || 0) / 60)}:{String(Math.round(Number(master.duration_seconds || 0) % 60)).padStart(2, "0")}{master.playlist_id !== metaDraftForm.playlist_id ? ` · ${master.playlists?.name || "Earlier campaign"}` : ""}</small></span><b>{(master.meta_audio_snippets || []).length} snippets</b></button>)}</div></div>)}</section> : <div className="campaignAudioEmpty"><i>♪</i><div><strong>Your audio library is empty</strong><p>Upload a master once and it will be available for every future campaign.</p></div></div>}
                 {campaignAudioMasters.filter((master) => master.id === campaignAudioMasterId).map((master) => <div className="campaignAudioEditorColumn" key={master.id}><CampaignAudioTrimmer master={master} snippets={master.meta_audio_snippets || []} selectedIds={metaDraftForm.audio_snippet_ids || []} onSave={saveCampaignAudioSnippet} onToggle={toggleCampaignAudioSnippet} onDelete={deleteCampaignAudioSnippet} busy={busy} /></div>)}
               </section>
             </> : null}
@@ -7974,6 +7981,9 @@ export default function PlaylistManager() {
         .campaignSavedSnippets > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
         .campaignAudioMasterLibrary > div:first-child small,
         .campaignSavedSnippets > div:first-child small { color: #75808f; }
+        .campaignAudioLibraryGroup { display: grid; gap: 6px; }
+        .campaignAudioLibraryGroup + .campaignAudioLibraryGroup { padding-top: 7px; border-top: 1px solid rgba(58,67,81,.72); }
+        .campaignAudioLibraryGroupLabel { color: #697586; font-size: 8px; font-weight: 900; letter-spacing: .1em; text-transform: uppercase; }
         .campaignAudioMasterTabs { display: flex; gap: 9px; overflow-x: auto; padding: 1px 0 7px; }
         .campaignAudioMasterTabs button { display: grid; grid-template-columns: auto minmax(130px, 1fr) auto; align-items: center; flex: 0 0 auto; gap: 10px; min-width: 265px; padding: 11px 13px; border-color: #303844; color: #dce2e9; background: #11161d; text-align: left; }
         .campaignAudioMasterTabs button > i { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 8px; color: #8ea7ff; background: rgba(142,167,255,.1); font-size: 10px; font-style: normal; }

@@ -3369,9 +3369,12 @@ const routes = {
     const playlistResponse = await sb(`/rest/v1/playlists?select=id&id=eq.${encodeURIComponent(playlistId)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&limit=1`);
     const playlist = playlistResponse.ok ? (await playlistResponse.json().catch(() => []))[0] : null;
     if (!playlist) return bad(res, 404, "audio_playlist_not_found");
+    // Audio belongs to the account, not to the campaign that originally uploaded it.
+    // playlist_id remains the origin context for older records and lets the UI make the
+    // current campaign's tracks easy to find first.
     const response = await sb(
-      `/rest/v1/meta_audio_masters?select=*,meta_audio_snippets(*)&playlist_id=eq.${encodeURIComponent(playlist.id)}` +
-      `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&status=eq.ready&order=created_at.desc&meta_audio_snippets.order=start_seconds.asc&limit=50`
+      `/rest/v1/meta_audio_masters?select=*,playlists(name),meta_audio_snippets(*)&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}` +
+      `&status=eq.ready&order=created_at.desc&meta_audio_snippets.order=start_seconds.asc&limit=100`
     );
     const text = await response.text();
     if (!response.ok) return bad(res, 500, `audio_library_load_failed: ${text.slice(0, 500)}`);
@@ -3571,8 +3574,8 @@ const routes = {
     const noveltyMode = ["balanced", "explore", "wildcard"].includes(String(body.novelty_mode || "")) ? String(body.novelty_mode) : "explore";
     if (audioSnippetIds.length) {
       const snippetsResponse = await sb(
-        `/rest/v1/meta_audio_snippets?select=id,start_seconds,end_seconds&playlist_id=eq.${encodeURIComponent(playlist.id)}` +
-        `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&id=in.(${audioSnippetIds.join(",")})`
+        `/rest/v1/meta_audio_snippets?select=id,start_seconds,end_seconds&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}` +
+        `&id=in.(${audioSnippetIds.join(",")})`
       );
       const snippets = snippetsResponse.ok ? await snippetsResponse.json().catch(() => []) : [];
       if (snippets.length !== audioSnippetIds.length) return bad(res, 400, "campaign_audio_snippet_not_found");
@@ -5306,8 +5309,8 @@ const routes = {
     if (!ownedPlaylist) return bad(res, 404, "campaign_playlist_not_found");
     if (input.audio_snippet_ids.length) {
       const snippetsResponse = await sb(
-        `/rest/v1/meta_audio_snippets?select=id,start_seconds,end_seconds&playlist_id=eq.${encodeURIComponent(input.playlist_id)}` +
-        `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&id=in.(${input.audio_snippet_ids.join(",")})`
+        `/rest/v1/meta_audio_snippets?select=id,start_seconds,end_seconds&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}` +
+        `&id=in.(${input.audio_snippet_ids.join(",")})`
       );
       const snippets = snippetsResponse.ok ? await snippetsResponse.json().catch(() => []) : [];
       if (snippets.length !== input.audio_snippet_ids.length) return bad(res, 400, "campaign_audio_snippet_not_found");
