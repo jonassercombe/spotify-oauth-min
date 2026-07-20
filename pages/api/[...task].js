@@ -4847,7 +4847,7 @@ const routes = {
     if (body.audio_snippet_id) {
       const snippetResponse = await sb(
         `/rest/v1/meta_audio_snippets?select=*&id=eq.${encodeURIComponent(String(body.audio_snippet_id))}` +
-        `&playlist_id=eq.${encodeURIComponent(owned.project.playlist_id)}&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&limit=1`
+        `&bubble_user_id=eq.${encodeURIComponent(ctx.bubble_user_id)}&limit=1`
       );
       const snippet = snippetResponse.ok ? (await snippetResponse.json().catch(() => []))[0] : null;
       if (!snippet) return bad(res, 404, "creative_audio_snippet_not_found");
