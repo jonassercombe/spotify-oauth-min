@@ -1039,8 +1039,10 @@ function normalizeGeneratedHookCandidates(concept = {}) {
       Math.max(1, Math.min(10, Number.parseInt(candidate?.[key], 10) || 1)),
     ]));
     const rawText = String(candidate?.text || "").replace(/\s+/g, " ").trim();
-    const words = rawText.split(" ").filter(Boolean);
-    while (words.join(" ").length > 58 && words.length > 1) words.pop();
+    const rawWords = rawText.split(" ").filter(Boolean);
+    // Do not crop model copy to fit a layout. Cropping is how a complete thought
+    // becomes a misleading fragment; discard it and select another candidate instead.
+    const words = rawWords.length <= 7 && rawText.length <= 44 ? rawWords : [];
     return {
       text: words.join(" "),
       ...scores,
@@ -1060,9 +1062,9 @@ function normalizeGeneratedHookCandidates(concept = {}) {
 }
 
 function normalizeOverlayHook(value) {
-  const words = String(value || "").replace(/\s+/g, " ").trim().split(" ").filter(Boolean).slice(0, 9);
-  while (words.join(" ").length > 58 && words.length > 1) words.pop();
-  return words.join(" ");
+  const normalized = String(value || "").replace(/\s+/g, " ").trim();
+  const words = normalized.split(" ").filter(Boolean);
+  return words.length <= 7 && normalized.length <= 44 ? normalized : "";
 }
 
 function coreStoryHookSeeds(notes) {
@@ -1131,7 +1133,7 @@ The portfolio profile is randomized per generation while maintaining a quality f
 
 All user-facing copy must be in ${languageName}. Every concept must contain:
 - a strategic angle;
-- 4–6 materially different overlay-ready hook_candidates, each at most 9 words and 58 characters;
+- 4–6 materially different overlay-ready hook_candidates, each at most 7 words and 44 characters;
 - integer scores from 1–10 for every hook candidate on clarity, scroll_stop, playlist_fit, originality, and visual_fit; total must equal the sum of those five scores;
 - hook as the selected candidate text. Choose it using minimum gates of clarity >= 7, playlist_fit >= 7, and visual_fit >= 7, then rank eligible candidates by total. Use hook_choice_rationale to explain the decision briefly;
 - visual_direction as ONE executable sentence describing footage that can realistically be found on Pexels;
@@ -1146,7 +1148,7 @@ Across the eight concepts, seek genuine range. A person wearing headphones is al
 
 The selected hook for each slot must follow its assigned creative_deck.hook_structure. Across the portfolio, do not use the same grammatical gimmick more than twice. In particular, avoid a run of anthropomorphic “the [object/place] has/chose/wants/sent…” lines. At least two accessible hooks must clearly communicate a playlist benefit, listening use-case, mood or invitation without a metaphor. creative_dna.hook_type must repeat the assigned structural label, not merely the tone. A hook may use a number only when that exact count is an intentional, visibly verifiable part of the planned shot; never invent a count for rhythm.
 
-Write the hook before imagining a specific Pexels clip. Apply the screen-off test: it must still make immediate sense, communicate a listener thought, identity, tension, use-case or playlist promise, and stay interesting if paired with three different plausible videos. The treatment may give that thought a setting; it must not become the reason the hook exists. Do not turn an outfit, thrift rack, train, bedroom, kitchen, phone, mirror, date, appliance or other stock-footage noun into the hook unless the slot is explicitly scene-led or wildcard. A scene can be a useful companion, but it is not the product message.
+Write the hook before imagining a specific Pexels clip. Apply the screen-off test: it must still make immediate sense, communicate a listener thought, identity, tension, use-case or playlist promise, and stay interesting if paired with three different plausible videos. The treatment may give that thought a setting; it must not become the reason the hook exists. Do not turn an outfit, thrift rack, train, bedroom, kitchen, phone, mirror, date, appliance or other stock-footage noun into the hook unless the slot is explicitly scene-led or wildcard. A scene can be a useful companion, but it is not the product message. Every candidate must be a complete, idiomatic ${languageName} phrase or sentence: never output a clipped word, unfinished thought, trailing fragment, or text that depends on being cut off on screen.
 
 Build a balanced hook portfolio, not eight mini-film captions: at least two selected hooks must make a clear discovery, freshness or playlist-benefit promise; at least two must let a listener recognize themselves; at least one must name a simple listening moment; and no more than one may depend on a specific visible scene. At least three selected hooks must have no concrete footage noun at all. For a title such as “indie pop for bored indie kids”, explore boredom, restless taste, discovery, anti-predictability and social music intelligence in varied language—rather than repeatedly describing whichever stock scenario is easiest to find. A hook can be playful, but should never require the viewer to decode a visual joke before understanding why the playlist matters.
 
