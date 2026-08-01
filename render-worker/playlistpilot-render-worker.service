@@ -9,6 +9,9 @@ User=codex
 Group=codex
 WorkingDirectory=/opt/playlistpilot-render-worker
 EnvironmentFile=/etc/playlistpilot-render-worker.env
+RuntimeDirectory=playlistpilot-render-worker
+RuntimeDirectoryMode=0750
+Environment=TMPDIR=/run/playlistpilot-render-worker
 ExecStart=/usr/bin/nice -n 10 /usr/bin/python3 /opt/playlistpilot-render-worker/playlistpilot_render_worker.py
 Restart=always
 RestartSec=10
