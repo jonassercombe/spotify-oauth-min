@@ -183,7 +183,11 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     clip_end = max(clip_start + 0.2, float(editor.get("trim_end", editor.get("clip_end", clip_start + 15)) or clip_start + 15))
     duration = min(30.0, max(10.0, clip_end - clip_start))
     hook_start = max(0.0, float(editor.get("hook_start") or 0))
-    hook_end = min(duration, max(hook_start + 0.2, float(editor.get("hook_end") or 4)))
+    # A hook that vanishes after one or two seconds feels like a rendering bug
+    # on mobile, even when the saved editor state asks for that timing. Keep the
+    # campaign thought readable long enough to register before the end card.
+    minimum_hook_end = min(duration, hook_start + min(4.8, max(3.8, duration * 0.44)))
+    hook_end = min(duration, max(minimum_hook_end, float(editor.get("hook_end") or 4)))
     hook_position = str(editor.get("hook_position") or "center")
     if template_id == "bold_center":
         position_zones = {"top": (0.19, 0.45, "top"), "center": (0.22, 0.54, "center"), "bottom": (0.53, 0.72, "center")}
@@ -291,14 +295,9 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     text_filters = []
     if hook:
         hook_alpha = fade_alpha(hook_start, hook_end)
-        if template_id == "minimal_bottom":
-            panel_pad = max(18, int(width * 0.035))
-            text_filters.append(
-                "drawbox="
-                f"x={max(0, safe_x - panel_pad)}:y={max(0, safe_top_px - panel_pad)}:"
-                f"w={min(width, safe_width + panel_pad * 2)}:h={min(height, safe_height + panel_pad * 2)}:"
-                f"color=black@0.18:t=fill:enable='between(t,{hook_start:.3f},{hook_end:.3f})'"
-            )
+        # Minimal bottom should feel like typography laid onto the footage, not
+        # a generic lower-third card. The drawtext shadow below is sufficient
+        # for contrast and avoids the large grey rectangle seen in review.
         if template_id == "editorial_top" and show_context_label:
             label_font_size = max(18, int(width * 0.030))
             label_y = max(int(height * 0.11), safe_top_px - max(30, int(height * 0.038)))
