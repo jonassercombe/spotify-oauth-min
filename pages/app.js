@@ -3178,6 +3178,7 @@ export default function PlaylistManager() {
         setCampaignGeneration({ batch_id: created.batch.id, stage: "media", completed: 0, total: 8, failed: 0 });
         const usedVideoIds = new Set();
         const usedVisualSignatures = new Set();
+        const usedDistinctiveSubjects = new Set();
         const usedHookMechanisms = new Set();
         const prepared = [];
         let cursor = 0;
@@ -3193,15 +3194,22 @@ export default function PlaylistManager() {
             });
             const recommendations = media.recommendations || [];
             const signature = (item) => String(item?.ai?.visual_signature || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+            const genericSubjects = new Set(["person", "people", "human", "man", "woman", "boy", "girl", "adult", "phone", "room", "street", "building", "hand", "hands"]);
+            const distinctiveSubjects = (item) => (Array.isArray(item?.ai?.visible_subjects) ? item.ai.visible_subjects : [])
+              .map((subject) => String(subject || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim())
+              .filter((subject) => subject && !genericSubjects.has(subject));
             const mechanism = (item) => String(item?.ai?.hook_mechanism || "").trim();
             const isDistinct = (item) => {
               const value = signature(item);
-              if (!value) return true;
-              return ![...usedVisualSignatures].some((used) => used === value || used.includes(value) || value.includes(used));
+              const signatureIsFresh = !value || ![...usedVisualSignatures].some((used) => used === value || used.includes(value) || value.includes(used));
+              const subjectsAreFresh = !distinctiveSubjects(item).some((subject) => usedDistinctiveSubjects.has(subject));
+              return signatureIsFresh && subjectsAreFresh;
             };
             const isFootageFirst = concept.render_spec?.creative_deck?.workflow === "footage_first";
             const hasFreshMechanism = (item) => !isFootageFirst || !mechanism(item) || !usedHookMechanisms.has(mechanism(item));
-            const video = recommendations.find((item) => item.ai?.production_ready && !usedVideoIds.has(item.id) && isDistinct(item) && hasFreshMechanism(item))
+            const directSupport = concept.render_spec?.creative_deck?.visual_role !== "lateral_support";
+            const supportsRole = (item) => !directSupport || ["literal", "emotional"].includes(item.ai?.match_type);
+            const video = recommendations.find((item) => item.ai?.production_ready && supportsRole(item) && !usedVideoIds.has(item.id) && isDistinct(item) && hasFreshMechanism(item))
               || recommendations.find((item) => !usedVideoIds.has(item.id) && isDistinct(item) && hasFreshMechanism(item))
               || recommendations.find((item) => item.ai?.production_ready && !usedVideoIds.has(item.id) && isDistinct(item))
               || recommendations.find((item) => !usedVideoIds.has(item.id) && isDistinct(item))
@@ -3211,6 +3219,7 @@ export default function PlaylistManager() {
             if (!video) throw new Error(`No usable footage found for ${concept.title}.`);
             usedVideoIds.add(video.id);
             if (signature(video)) usedVisualSignatures.add(signature(video));
+            distinctiveSubjects(video).forEach((subject) => usedDistinctiveSubjects.add(subject));
             if (isFootageFirst && mechanism(video)) usedHookMechanisms.add(mechanism(video));
             const selected = await api("/api/meta/creative-media/select", {
               method: "POST",
@@ -3226,14 +3235,20 @@ export default function PlaylistManager() {
         prepared.sort((left, right) => Number(left.concept.position || 0) - Number(right.concept.position || 0));
         const snippets = campaignAudioMasters.flatMap((master) => master.meta_audio_snippets || []).filter((snippet) => (metaDraftForm.audio_snippet_ids || []).includes(snippet.id));
         const contextLabelConceptId = prepared.find(({ concept }, index) => {
-          const templateId = concept.production_type === "stock_montage" ? "editorial_top" : concept.production_type === "experimental_wildcard" ? "bold_center" : CREATIVE_RENDER_TEMPLATES[index % CREATIVE_RENDER_TEMPLATES.length].id;
+          const recipeTemplate = concept.render_spec?.creative_deck?.typography;
+          const templateId = CREATIVE_RENDER_TEMPLATES.some((item) => item.id === recipeTemplate)
+            ? recipeTemplate
+            : concept.production_type === "stock_montage" ? "editorial_top" : concept.production_type === "experimental_wildcard" ? "bold_center" : CREATIVE_RENDER_TEMPLATES[index % CREATIVE_RENDER_TEMPLATES.length].id;
           return templateId === "editorial_top";
         })?.concept.id;
         const revealStyles = ["center_stack", "side_lockup", "compact_corner"];
         for (let index = 0; index < prepared.length; index += 1) {
           const { concept, video, asset } = prepared[index];
           const snippet = snippets.length ? snippets[index % snippets.length] : null;
-          const templateId = concept.production_type === "stock_montage" ? "editorial_top" : concept.production_type === "experimental_wildcard" ? "bold_center" : CREATIVE_RENDER_TEMPLATES[index % CREATIVE_RENDER_TEMPLATES.length].id;
+          const recipeTemplate = concept.render_spec?.creative_deck?.typography;
+          const templateId = CREATIVE_RENDER_TEMPLATES.some((item) => item.id === recipeTemplate)
+            ? recipeTemplate
+            : concept.production_type === "stock_montage" ? "editorial_top" : concept.production_type === "experimental_wildcard" ? "bold_center" : CREATIVE_RENDER_TEMPLATES[index % CREATIVE_RENDER_TEMPLATES.length].id;
           const template = CREATIVE_RENDER_TEMPLATES.find((item) => item.id === templateId) || CREATIVE_RENDER_TEMPLATES[0];
           const videoDuration = Math.min(15, Number(video.duration || asset.duration_seconds || 15));
           await api("/api/meta/creative-editor/save", {

@@ -1126,8 +1126,11 @@ async function generateHookPortfolioWithOpenAI({ project, playlist, tracks, prio
   const slotPlan = creativeDeck.recipes.map((recipe) => ({
     position: recipe.slot,
     mode: recipe.mode,
+    archetype: recipe.archetype,
     hook_focus: recipe.hook_focus,
     hook_structure: recipe.hook_structure,
+    story_job: recipe.story_job,
+    copy_voice: recipe.copy_voice,
   }));
   const source = {
     playlist: { name: playlist.name || project.name, description: playlist.description || "" },
@@ -1139,6 +1142,8 @@ async function generateHookPortfolioWithOpenAI({ project, playlist, tracks, prio
   const system = `You are the hook editor for paid social ads promoting a Spotify playlist. Create the copy before any footage is chosen. Return exactly one slot for every supplied position and preserve its assigned mode.
 
 All hooks must be complete, idiomatic ${languageName} lines of 2–11 words and no more than 68 characters. Never truncate a word or thought. Never use follower counts, track counts, chart positions, or other metadata as copy. A hook must still make sense over three different plausible videos; footage is not the subject unless the wildcard deliberately earns that exception.
+
+Each slot's story_job is its emotional purpose and is more important than novelty. Reliable hooks should sound like a sharp human thought, invitation or recognition—not a vague brand slogan, playlist category label or generic advertising claim. Preserve concrete, emotionally useful language from creative_notes whenever it fits the slot.
 
 The campaign notes are the authored emotional story. Preserve their strongest concise language and meaning. Do not bury them under random visual jokes.
 
@@ -1528,6 +1533,8 @@ When the creative recipe has workflow=footage_first, let the visible clip lead. 
 
 Use the visible footage criteria as the primary matching rubric. Only award a criterion when it is actually visible in the supplied frames. The optional North-Star story is inspiration and MUST NOT be treated as a list of required events. SAFE candidates communicate the premise immediately; CREATIVE candidates match the emotion or idea; WILDCARD candidates introduce a memorable but defensible contrast. Classify match_type as literal, emotional or contrast. Score scroll-stop potential and originality separately from concept fit, plus usable text space, visual quality, portrait suitability and commercial brand safety. Recommend the layout that preserves the subject. A clip does not need to depict every story beat. Set production_ready=false only for a material blocker: unusable quality/crop, brand-safety risk, accidental contradiction, or no defensible relationship to the hook and criteria. Use rejection_reason only for a material blocker; otherwise return an empty string.
 
+The creative recipe's quality_bar is binding. For direct_support, reject a merely random or aesthetically neutral object when the archetype calls for listener recognition, identity, a listening moment or an emotional shift. The clip must contribute a readable person, action, mood or environment in its first second. Do not award scores above 90 unless the footage is both visually excellent and unusually precise for this concept; ordinary usable stock should normally land between 65 and 84.
+
 Concept: ${concept.title}
 Production type: ${productionType}
 Hook: ${concept.hook}
@@ -1541,7 +1548,7 @@ Format: ${project.format}`,
   }];
   for (const candidate of candidates) {
     content.push({ type: "input_text", text: `Candidate video_id=${candidate.id}; duration=${candidate.duration}s; dimensions=${candidate.source_width}x${candidate.source_height}; discovered_by_query=${candidate.search_query || "unknown"}. The following images are preview frames from this candidate. A lateral-search candidate may win through an original, defensible association even when it is not literal.` });
-    for (const imageUrl of (candidate.preview_images?.length ? candidate.preview_images : [candidate.image]).filter(Boolean).slice(0, 1)) {
+    for (const imageUrl of (candidate.preview_images?.length ? candidate.preview_images : [candidate.image]).filter(Boolean).slice(0, 2)) {
       content.push({ type: "input_image", image_url: imageUrl, detail: "low" });
     }
   }

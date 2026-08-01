@@ -247,10 +247,18 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     if audio_url:
         command.extend(["-ss", f"{song_start:.3f}", "-i", str(audio)])
 
-    filters = [f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},drawbox=x=0:y=0:w=iw:h=ih:color=black@{overlay:.3f}:t=fill[base]"]
+    # Keep the footage alive. Contrast is created mostly through typography,
+    # shadow and local composition instead of flattening every clip under the
+    # same heavy full-frame shade.
+    applied_overlay = overlay * 0.78
+    filters = [f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},drawbox=x=0:y=0:w=iw:h=ih:color=black@{applied_overlay:.3f}:t=fill[base]"]
     current = "base"
     accent_color = "white"
-    reveal_start = min(duration, 4.0)
+    # The early renders felt more like small ads because the video and hook had
+    # time to establish a mood before branding arrived. Reserve only the final
+    # beat for the artwork lockup instead of turning half the video into an
+    # end-card.
+    reveal_start = min(duration, max(hook_end + 0.35, duration - 3.6))
     safe_bottom_ratio = 0.72 if height / width > 1.5 else 0.80
     cta_bottom = int(height * (1.0 - safe_bottom_ratio))
     if reveal_style == "center_stack":
@@ -283,6 +291,14 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     text_filters = []
     if hook:
         hook_alpha = fade_alpha(hook_start, hook_end)
+        if template_id == "minimal_bottom":
+            panel_pad = max(18, int(width * 0.035))
+            text_filters.append(
+                "drawbox="
+                f"x={max(0, safe_x - panel_pad)}:y={max(0, safe_top_px - panel_pad)}:"
+                f"w={min(width, safe_width + panel_pad * 2)}:h={min(height, safe_height + panel_pad * 2)}:"
+                f"color=black@0.18:t=fill:enable='between(t,{hook_start:.3f},{hook_end:.3f})'"
+            )
         if template_id == "editorial_top" and show_context_label:
             label_font_size = max(18, int(width * 0.030))
             label_y = max(int(height * 0.11), safe_top_px - max(30, int(height * 0.038)))
@@ -309,7 +325,7 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
             f"enable='between(t,{reveal_start:.3f},{duration:.3f})'"
         )
     if show_cta:
-        cta_start = max(0.0, duration - 4.5)
+        cta_start = reveal_start
         cta_end = max(cta_start + 0.5, duration - 0.18)
         cta_alpha = fade_alpha(cta_start, cta_end, 0.28)
         text_filters.append(
