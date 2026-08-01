@@ -1183,6 +1183,24 @@ For each slot write 4–6 genuinely different candidates, then select the strong
       }
       return { ...slot, candidates, selected_hook: selectedHook };
     });
+    const hookTokens = (value) => new Set(String(value || "").toLowerCase().replace(/[^a-z0-9äöüß]+/g, " ").split(" ").filter((token) => token.length > 2));
+    const hookSimilarity = (left, right) => {
+      const a = hookTokens(left);
+      const b = hookTokens(right);
+      const union = new Set([...a, ...b]);
+      if (!union.size) return 0;
+      return [...a].filter((token) => b.has(token)).length / union.size;
+    };
+    const acceptedHooks = [];
+    slots.forEach((slot) => {
+      const ordered = [slot.selected_hook, ...slot.candidates.filter((candidate) => candidate !== slot.selected_hook)];
+      const distinct = ordered.find((candidate) => acceptedHooks.every((previous) => hookSimilarity(candidate, previous) < 0.52));
+      if (distinct && distinct !== slot.selected_hook) {
+        slot.selected_hook = distinct;
+        slot.rationale = "Strong alternative selected to keep the eight-hook portfolio meaningfully distinct.";
+      }
+      acceptedHooks.push(slot.selected_hook);
+    });
     return { slots, payload: parsed.json, model };
   } finally {
     clearTimeout(timeout);
