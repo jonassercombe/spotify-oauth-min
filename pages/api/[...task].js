@@ -4539,7 +4539,14 @@ const routes = {
     const priorConceptsResponse = priorProjectIds.length
       ? await sb(`/rest/v1/meta_creative_concepts?select=hook,angle,visual_direction,visual_search_terms,creative_dna&project_id=in.(${priorProjectIds.join(",")})&order=created_at.desc&limit=64`)
       : null;
-    const priorConcepts = priorConceptsResponse?.ok ? await priorConceptsResponse.json().catch(() => []) : [];
+    const historicalConcepts = priorConceptsResponse?.ok ? await priorConceptsResponse.json().catch(() => []) : [];
+    // A forced rebuild must remember the portfolio it is replacing. Previously
+    // only other projects were supplied as memory, so repeated clicks could
+    // deterministically recreate the same eight hooks and scenes in-place.
+    const priorConcepts = [
+      ...(body.force === true ? existing : []),
+      ...historicalConcepts,
+    ].slice(0, 72);
 
     await sb(`/rest/v1/meta_creative_projects?id=eq.${encodeURIComponent(project.id)}`, {
       method: "PATCH",
