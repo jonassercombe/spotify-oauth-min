@@ -1005,6 +1005,35 @@ function creativeConceptPortfolioSchema(count = 8) {
   };
 }
 
+function creativeHookPortfolioSchema(count = 8) {
+  const stringField = { type: "string" };
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["slots"],
+    properties: {
+      slots: {
+        type: "array",
+        minItems: count,
+        maxItems: count,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["position", "mode", "selected_hook", "candidates", "emotional_job", "rationale"],
+          properties: {
+            position: { type: "integer", minimum: 1, maximum: count },
+            mode: { type: "string", enum: ["reliable", "creative", "wildcard"] },
+            selected_hook: stringField,
+            candidates: { type: "array", items: stringField, minItems: 4, maxItems: 6 },
+            emotional_job: stringField,
+            rationale: stringField,
+          },
+        },
+      },
+    },
+  };
+}
+
 function creativeMemoryItem(concept = {}) {
   return {
     hook: String(concept.hook || "").slice(0, 80),
@@ -1042,7 +1071,7 @@ function normalizeGeneratedHookCandidates(concept = {}) {
     const rawWords = rawText.split(" ").filter(Boolean);
     // Do not crop model copy to fit a layout. Cropping is how a complete thought
     // becomes a misleading fragment; discard it and select another candidate instead.
-    const words = rawWords.length <= 7 && rawText.length <= 44 ? rawWords : [];
+    const words = rawWords.length >= 2 && rawWords.length <= 11 && rawText.length <= 68 ? rawWords : [];
     return {
       text: words.join(" "),
       ...scores,
@@ -1064,7 +1093,7 @@ function normalizeGeneratedHookCandidates(concept = {}) {
 function normalizeOverlayHook(value) {
   const normalized = String(value || "").replace(/\s+/g, " ").trim();
   const words = normalized.split(" ").filter(Boolean);
-  return words.length <= 7 && normalized.length <= 44 ? normalized : "";
+  return words.length >= 2 && words.length <= 11 && normalized.length <= 68 ? normalized : "";
 }
 
 function coreStoryHookSeeds(notes) {
@@ -1089,7 +1118,73 @@ function extractOpenAIText(payload) {
   throw new Error(`openai_empty_response: ${payload?.status || "unknown"}`);
 }
 
-async function generateCreativeBriefWithOpenAI({ project, playlist, tracks, priorConcepts = [], creativeDeck }) {
+async function generateHookPortfolioWithOpenAI({ project, playlist, tracks, priorConcepts = [], creativeDeck }) {
+  const model = process.env.OPENAI_HOOK_MODEL || process.env.OPENAI_CONCEPT_MODEL || process.env.OPENAI_VISION_MODEL || "gpt-5.4-mini";
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 42000);
+  const languageName = project.language === "de" ? "German" : "English";
+  const slotPlan = creativeDeck.recipes.map((recipe) => ({
+    position: recipe.slot,
+    mode: recipe.mode,
+    hook_focus: recipe.hook_focus,
+    hook_structure: recipe.hook_structure,
+  }));
+  const source = {
+    playlist: { name: playlist.name || project.name, description: playlist.description || "" },
+    tracks: tracks.slice(0, 60).map((track) => ({ name: track.track_name || "", artists: track.artist_names || [] })),
+    creative_notes: String(project.brief?.creative_notes || "").slice(0, 2000),
+    recent_hooks: priorConcepts.map((concept) => concept.hook).filter(Boolean).slice(0, 48),
+    slot_plan: slotPlan,
+  };
+  const system = `You are the hook editor for paid social ads promoting a Spotify playlist. Create the copy before any footage is chosen. Return exactly one slot for every supplied position and preserve its assigned mode.
+
+All hooks must be complete, idiomatic ${languageName} lines of 2–11 words and no more than 68 characters. Never truncate a word or thought. Never use follower counts, track counts, chart positions, or other metadata as copy. A hook must still make sense over three different plausible videos; footage is not the subject unless the wildcard deliberately earns that exception.
+
+The campaign notes are the authored emotional story. Preserve their strongest concise language and meaning. Do not bury them under random visual jokes.
+
+- reliable: immediate emotion, identity, listening moment, invitation, or playlist benefit; natural language and no decoding required.
+- creative: the same clarity floor with one surprising verbal turn or metaphor.
+- wildcard: unusual, funny, polarizing, or strange, but still recognizably related to the playlist or listener.
+
+For each slot write 4–6 genuinely different candidates, then select the strongest. Across the portfolio include at least two audience/identity lines, two discovery or playlist-benefit lines, and one listening-use-case line. Vary sentence shapes. Avoid paraphrases of recent_hooks and avoid repeating the same noun, opening phrase, or gimmick. Do not force every hook to mention the playlist title. selected_hook must be copied exactly from candidates.`;
+  try {
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      signal: controller.signal,
+      headers: { Authorization: `Bearer ${need("OPENAI_API_KEY")}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        reasoning: { effort: "low" },
+        input: [{ role: "system", content: system }, { role: "user", content: JSON.stringify(source) }],
+        text: {
+          verbosity: "low",
+          format: { type: "json_schema", name: "playlist_hook_portfolio", strict: true, schema: creativeHookPortfolioSchema(slotPlan.length) },
+        },
+        max_output_tokens: 3000,
+        prompt_cache_key: "playlistpilot-hook-portfolio-v1",
+        store: false,
+      }),
+    });
+    const parsed = await parseJsonSafe(response);
+    if (!response.ok) throw new Error(`openai_${response.status}: ${parsed.json?.error?.message || parsed.text.slice(0, 500)}`);
+    const generated = JSON.parse(extractOpenAIText(parsed.json));
+    if (!Array.isArray(generated.slots) || generated.slots.length !== slotPlan.length) throw new Error("openai_invalid_hook_portfolio");
+    const slots = generated.slots.slice().sort((a, b) => a.position - b.position).map((slot, index) => {
+      const expected = slotPlan[index];
+      const candidates = [...new Set((slot.candidates || []).map(normalizeOverlayHook).filter(Boolean))];
+      const selectedHook = normalizeOverlayHook(slot.selected_hook);
+      if (slot.position !== expected.position || slot.mode !== expected.mode || candidates.length < 4 || !selectedHook || !candidates.includes(selectedHook)) {
+        throw new Error("openai_invalid_hook_portfolio");
+      }
+      return { ...slot, candidates, selected_hook: selectedHook };
+    });
+    return { slots, payload: parsed.json, model };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function generateCreativeBriefWithOpenAI({ project, playlist, tracks, priorConcepts = [], creativeDeck, hookPlan }) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 72000);
   const languageName = project.language === "de" ? "German" : "English";
@@ -1111,6 +1206,7 @@ async function generateCreativeBriefWithOpenAI({ project, playlist, tracks, prio
     novelty_mode: String(project.brief?.novelty_mode || "balanced"),
     creative_memory: priorConcepts.slice(0, 32).map(creativeMemoryItem),
     creative_deck: creativeDeck,
+    hook_plan: hookPlan,
   };
   const cachedBrief = project.brief?.mood_summary ? {
     title: project.brief.title,
@@ -1166,6 +1262,23 @@ Only scene-led and wildcard hooks may be built around a prop, room, street, appl
 Treat creative_notes as the campaign's authored CORE STORY, not as optional flavor. First infer its central emotional promise in one sentence internally. Two or three concepts must express that core story directly and recognizably in their hooks; these should usually be accessible or creative slots. The remaining concepts may interpret it through mood, humor, imagery or contrast, while the wildcard may depart from it. Preserve distinctive user-written language when it is concise and strong. For example, notes about feeling alien or born on the wrong planet should be allowed to yield lines such as “For those born on the wrong planet” or “For those who feel alien on Earth.” Do not replace every emotional story with an object joke.
 
 For stock_simple, one continuous stock clip must be sufficient. For stock_montage, describe 2–4 independently searchable shots that can be cut together. For experimental_wildcard, allow an emotionally defensible contrast or pattern interrupt, but keep the stock treatment findable. The story field explains the ad idea, but must not imply that every beat will appear in the selected footage. Avoid generic playlist clichés and duplicate angles. Never use follower counts, track counts, positions, or other playlist metadata numbers as hooks or turn them into metaphors. Each concept needs a concrete human, sensory or visual moment and a testable hypothesis.`;
+  const hookFirstSystem = `You are a performance creative director turning an approved hook portfolio into eight practical paid-social concepts for a Spotify playlist. ${cachedBrief ? "Use the cached playlist analysis" : "Create a concise evidence-based playlist brief"} and return exactly eight concepts: slots 1–6 stock_simple, slot 7 stock_montage, and slot 8 experimental_wildcard.
+
+The supplied hook_plan is binding. For each position, copy selected_hook exactly into hook and include its candidates as hook_candidates. Do not rewrite, shorten, improve, or adapt any hook around footage. The hook and campaign notes are the idea; footage only supports their emotion, identity, use-case, or promise.
+
+Use the matching creative_deck recipe as a loose visual provocation, not a checklist. reliable concepts should feel emotionally immediate and commercially useful. creative concepts may add one clear surprising connection. The wildcard may be strange or polarizing, but must still feel related to the playlist or listener. Do not make a reliable concept weird to satisfy a random visual ingredient.
+
+All user-facing copy must be in ${languageName}. For every concept:
+- hook must exactly equal the matching hook_plan.selected_hook;
+- provide 4–6 scored hook_candidates using the exact strings from hook_plan.candidates;
+- visual_direction is one executable Pexels treatment sentence;
+- footage_criteria contains 5–7 visible, searchable attributes;
+- visual_search_terms contains exactly two concise English Pexels queries;
+- stock_simple succeeds with one continuous clip; stock_montage uses 2–4 independently searchable shots;
+- creative_dna uses compact reusable labels and experiment_level matching reliable=safe, creative=creative, wildcard=wildcard;
+- the story may explain the idea, but must not promise a complex storyline the stock clip cannot deliver.
+
+Prefer footage with motion, emotion, composition, and text-safe negative space. Humans are allowed but not mandatory. Abstract textures, environments, objects, or visual contrasts are welcome when they genuinely support the hook. Avoid generic headphone footage and avoid inventing visual nouns that change what the hook means. Never use playlist metadata as creative copy.`;
   const user = cachedBrief
     ? `Use the cached playlist analysis below and create only a fresh concept portfolio. Do not repeat the playlist analysis. The primary ad format is ${project.format}. Treat creative_notes as the authored campaign core story while keeping them separate from factual playlist metadata. creative_memory contains recent concepts that must not be paraphrased or recreated. In explore mode, maximize distance from their hooks, angles, human moments, settings, visible actions, and search terms without losing the core story.\n\n${JSON.stringify({ cached_playlist_analysis: cachedBrief, ...source })}`
     : `Analyze this playlist snapshot and create the creative brief and concept portfolio. The primary ad format is ${project.format}. Treat creative_notes as the authored campaign core story, never as factual playlist metadata.\n\n${JSON.stringify(source)}`;
@@ -1182,14 +1295,14 @@ For stock_simple, one continuous stock clip must be sufficient. For stock_montag
       },
       body: JSON.stringify({
         model,
-        input: [{ role: "system", content: system }, { role: "user", content: user }],
+        input: [{ role: "system", content: hookFirstSystem }, { role: "user", content: user }],
         reasoning: { effort: "low" },
         text: {
           verbosity: "low",
           format: { type: "json_schema", name: cachedBrief ? "playlist_creative_concepts" : "playlist_creative_brief", strict: true, schema: cachedBrief ? creativeConceptPortfolioSchema() : creativeBriefSchema() },
         },
         max_output_tokens: cachedBrief ? 6500 : 8000,
-        prompt_cache_key: "playlistpilot-creative-strategy-v1",
+        prompt_cache_key: "playlistpilot-hook-first-concepts-v1",
         store: false,
       }),
     });
@@ -4411,7 +4524,27 @@ const routes = {
 
     try {
       const creativeDeck = buildCreativeDeck(`${project.id}:${Date.now()}:${randomUUID()}`, 8);
-      const generation = await generateCreativeBriefWithOpenAI({ project, playlist, tracks, priorConcepts, creativeDeck });
+      const hookPortfolio = await generateHookPortfolioWithOpenAI({ project, playlist, tracks, priorConcepts, creativeDeck });
+      await recordOpenAIUsage({
+        bubbleUserId: ctx.bubble_user_id,
+        projectId: project.id,
+        operation: "creative_hook_portfolio",
+        model: hookPortfolio.model,
+        payload: hookPortfolio.payload,
+        metadata: {
+          creative_deck_seed: creativeDeck.seed,
+          modes: hookPortfolio.slots.map((slot) => slot.mode),
+          memory_concepts: priorConcepts.length,
+        },
+      });
+      const generation = await generateCreativeBriefWithOpenAI({
+        project,
+        playlist,
+        tracks,
+        priorConcepts,
+        creativeDeck,
+        hookPlan: { slots: hookPortfolio.slots },
+      });
       const generated = generation.generated;
       await recordOpenAIUsage({
         bubbleUserId: ctx.bubble_user_id,
@@ -4423,29 +4556,35 @@ const routes = {
       });
       if (!Array.isArray(generated.concepts) || generated.concepts.length !== 8) throw new Error("openai_invalid_concept_count");
       const expectedProductionTypes = [...Array(6).fill("stock_simple"), "stock_montage", "experimental_wildcard"];
-      const conceptsByProductionType = Object.fromEntries([...new Set(expectedProductionTypes)].map((type) => [type, generated.concepts.filter((concept) => concept.production_type === type)]));
-      const returnedCountsAreUsable =
-        conceptsByProductionType.stock_simple.length === 6 &&
-        conceptsByProductionType.stock_montage.length === 1 &&
-        conceptsByProductionType.experimental_wildcard.length === 1;
-      if (returnedCountsAreUsable) {
-        // Models occasionally return the requested portfolio in a different order.
-        // Keep the concepts and put them into the fixed rendering slots instead of
-        // failing a whole eight-creative run over a harmless ordering difference.
-        generated.concepts = [
-          ...conceptsByProductionType.stock_simple,
-          ...conceptsByProductionType.stock_montage,
-          ...conceptsByProductionType.experimental_wildcard,
-        ];
-      } else {
-        // A malformed distribution should still remain renderable. The slot is the
-        // source of truth for downstream Pexels selection and render behavior.
-        generated.concepts.forEach((concept, index) => { concept.production_type = expectedProductionTypes[index]; });
-      }
+      // Position is now semantically bound to its approved hook. Never reorder
+      // concepts after generation; only normalize the render behavior per slot.
+      generated.concepts.forEach((concept, index) => { concept.production_type = expectedProductionTypes[index]; });
+      generated.concepts.forEach((concept, index) => {
+        const planned = hookPortfolio.slots[index];
+        concept.hook = planned.selected_hook;
+        concept.hook_candidates = planned.candidates.map((text) => {
+          const selected = text === planned.selected_hook;
+          const scores = selected
+            ? { clarity: 9, scroll_stop: 9, playlist_fit: 9, originality: 8, visual_fit: 9 }
+            : { clarity: 8, scroll_stop: 8, playlist_fit: 8, originality: 8, visual_fit: 8 };
+          return {
+            text,
+            ...scores,
+            total: Object.values(scores).reduce((sum, score) => sum + score, 0),
+            rationale: selected ? planned.rationale : "Alternative from the approved hook-first portfolio.",
+          };
+        });
+        concept.hook_choice_rationale = planned.rationale;
+        concept.creative_dna = {
+          ...(concept.creative_dna || {}),
+          hook_type: creativeDeck.recipes[index].hook_structure,
+          experiment_level: planned.mode === "reliable" ? "safe" : planned.mode,
+        };
+      });
       let normalizedHooks = generated.concepts.map(normalizeGeneratedHookCandidates);
       generated.concepts.forEach((concept, index) => { concept.hook = normalizedHooks[index].chosenHook; });
       const noveltyMode = ["balanced", "explore", "wildcard"].includes(project.brief?.novelty_mode) ? project.brief.novelty_mode : (priorConcepts.length ? "explore" : "balanced");
-      const threshold = noveltyMode === "wildcard" ? 0.40 : noveltyMode === "explore" ? 0.48 : 0.62;
+      const threshold = noveltyMode === "wildcard" ? 0.84 : noveltyMode === "explore" ? 0.88 : 0.92;
       const accepted = [];
       const duplicateSlots = [];
       generated.concepts.forEach((concept, index) => {
@@ -4455,7 +4594,9 @@ const routes = {
         if (comparisonPool.length && similarity >= threshold) duplicateSlots.push(index + 1);
         else accepted.push(concept);
       });
-      if (duplicateSlots.length) {
+      // The hook planner already sees recent hooks. A second generative novelty
+      // pass tended to replace emotionally sound ideas with forced absurdity.
+      if (duplicateSlots.length && !hookPortfolio.slots.length) {
         try {
           const replacement = await generateCreativeReplacementsWithOpenAI({
             project,
@@ -4488,7 +4629,9 @@ const routes = {
           // rather than failing the entire eight-creative batch.
         }
       }
-      const pinnedCoreHooks = coreStoryHookSeeds(project.brief?.creative_notes);
+      // Campaign notes are resolved by the hook planner before visuals exist, so
+      // late pinning cannot silently change a hook after its concept was written.
+      const pinnedCoreHooks = [];
       const pinnedCoreSlots = new Set();
       if (pinnedCoreHooks.length) {
         const eligibleSlots = creativeDeck.recipes
@@ -4547,6 +4690,8 @@ const routes = {
           novelty_mode: noveltyMode,
           memory_concepts: priorConcepts.length,
           core_story_pinned: pinnedCoreSlots.has(index),
+          hook_mode: hookPortfolio.slots[index].mode,
+          hook_emotional_job: String(hookPortfolio.slots[index].emotional_job || "").slice(0, 500),
           creative_deck: creativeDeck.recipes[index],
         },
         updated_at: now,
@@ -4568,6 +4713,7 @@ const routes = {
         tracks_total: Number(playlist.tracks_total || tracks.length),
         snapshot_track_count: tracks.length,
         generated_at: now,
+        hook_portfolio: hookPortfolio.slots,
         model: process.env.OPENAI_MODEL || "gpt-5.6",
       };
       const updatedResponse = await sb(`/rest/v1/meta_creative_projects?id=eq.${encodeURIComponent(project.id)}`, {
