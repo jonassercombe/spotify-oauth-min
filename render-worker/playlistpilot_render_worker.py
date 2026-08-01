@@ -173,7 +173,12 @@ def extract_qa_frames(video: Path, duration: float, workdir: Path) -> list[dict]
 def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     editor = job.get("editor") or {}
     width, height = dimensions(str(job.get("format") or editor.get("format") or "9:16"))
-    template_id = str(editor.get("template_id") or "bold_center")
+    requested_template_id = str(editor.get("template_id") or "bold_center")
+    # Keep the public Editorial Top preset, but render it through the proven
+    # bold text path with the editor's top/left positioning. The former
+    # editorial-only filter chain intermittently produced footage with no hook
+    # at all on the production FFmpeg build.
+    template_id = "bold_center" if requested_template_id == "editorial_top" else requested_template_id
     template = {
         "bold_center": {"font_ratio": 0.098, "safe_x": 0.13, "safe_top": 0.22, "safe_bottom": 0.54, "vertical": "center", "cover_ratio": 0.50},
         "editorial_top": {"font_ratio": 0.084, "safe_x": 0.13, "safe_top": 0.19, "safe_bottom": 0.46, "vertical": "top", "cover_ratio": 0.38},
@@ -189,7 +194,11 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     minimum_hook_end = min(duration, hook_start + min(4.8, max(3.8, duration * 0.44)))
     hook_end = min(duration, max(minimum_hook_end, float(editor.get("hook_end") or 4)))
     hook_position = str(editor.get("hook_position") or "center")
-    if template_id == "bold_center":
+    if requested_template_id == "editorial_top":
+        # Use the same vertically-centered expression as the reliable layouts,
+        # but constrain it to the upper safe band so it still reads editorial.
+        safe_top, safe_bottom, vertical = 0.18, 0.48, "center"
+    elif template_id == "bold_center":
         position_zones = {"top": (0.19, 0.45, "top"), "center": (0.22, 0.54, "center"), "bottom": (0.53, 0.72, "center")}
         safe_top, safe_bottom, vertical = position_zones.get(hook_position, position_zones["center"])
     else:
@@ -207,7 +216,10 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
     playlist_name = str(job.get("playlist_name") or "").strip()
     show_cta = bool(editor.get("show_cta", True)) and bool(cta)
     show_cover = bool(editor.get("show_cover", True)) and bool(job.get("playlist_cover_url"))
-    show_context_label = bool(editor.get("show_context_label", False))
+    # The small "CURATED PLAYLIST" eyebrow made the composition feel like a
+    # template and, on some FFmpeg builds, caused the editorial headline chain
+    # to render unreliably. The main hook is the ad; keep this layout focused.
+    show_context_label = False
     reveal_style = str(editor.get("reveal_style") or "side_lockup")
 
     source = workdir / "source.mp4"
@@ -307,8 +319,6 @@ def render(job: dict, workdir: Path) -> tuple[Path, float, int, int]:
                 f"x={safe_x}:y={label_y}:alpha='{hook_alpha}':fix_bounds=1:shadowcolor=black@0.5:shadowx=1:shadowy=2:"
                 f"enable='between(t,{hook_start:.3f},{hook_end:.3f})'"
             )
-        if template_id == "editorial_top":
-            hook_x = str(safe_x + max(22, int(width * 0.04)))
         text_filters.append(
             "drawtext="
             f"fontfile='{FONT_FILE}':textfile='{hook_file}':fontcolor={text_color}:fontsize={hook_font_size}:"
