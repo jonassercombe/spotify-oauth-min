@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Head from "next/head";
 import { useRouter } from "next/router";
-import { ArrowDown, ArrowUp, Check, GripVertical, ListEnd, Lock, Music2, Pause, Play, Settings, SlidersHorizontal, Shuffle, TimerReset, Trash2, Unlock, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Check, GripVertical, ListEnd, Lock, Music2, Pause, Play, Settings, SlidersHorizontal, Shuffle, TimerReset, Trash2, Unlock, UserPlus, Users, X } from "lucide-react";
 import { Turnstile } from "@marsidev/react-turnstile";
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { getSupabaseBrowserClient } from "../lib/supabaseBrowser";
@@ -11,6 +11,16 @@ const ENABLE_FAST_PLAYLIST_MOVES = true;
 const ENABLE_FAST_PLAYLIST_MUTATIONS = true;
 const USE_RECHARTS_GROWTH_CHART = true;
 const META_CAMPAIGN_RESUME_STORAGE_KEY = "playlistpilot_meta_campaign_resume_v1";
+const ACTIVE_WORKSPACE_STORAGE_KEY = "playlistpilot:active-workspace";
+let apiSessionRefreshPromise = null;
+
+async function refreshBrowserSessionOnce() {
+  if (!apiSessionRefreshPromise) {
+    apiSessionRefreshPromise = getSupabaseBrowserClient().auth.refreshSession()
+      .finally(() => { apiSessionRefreshPromise = null; });
+  }
+  return apiSessionRefreshPromise;
+}
 
 const CREATIVE_RENDER_TEMPLATES = [
   { id: "bold_center", name: "Bold Center", description: "Large centered hook with a strong cover reveal.", hook_position: "center", text_align: "center" },
@@ -19,16 +29,29 @@ const CREATIVE_RENDER_TEMPLATES = [
 ];
 
 async function api(path, { method = "GET", accessToken, body } = {}) {
-  const headers = { "Content-Type": "application/json" };
-  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+  const request = async (token) => {
+    const headers = { "Content-Type": "application/json" };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    if (typeof window !== "undefined") {
+      const workspaceId = window.localStorage.getItem(ACTIVE_WORKSPACE_STORAGE_KEY) || "";
+      if (workspaceId) headers["x-playlistpilot-workspace"] = workspaceId;
+    }
+    const res = await fetch(path, {
+      method,
+      headers,
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    const data = await res.json().catch(() => null);
+    return { res, data };
+  };
 
-  const res = await fetch(path, {
-    method,
-    headers,
-    ...(body ? { body: JSON.stringify(body) } : {}),
-  });
-
-  const data = await res.json().catch(() => null);
+  let { res, data } = await request(accessToken);
+  if (res.status === 401 && accessToken && typeof window !== "undefined") {
+    const { data: refreshed, error: refreshError } = await refreshBrowserSessionOnce();
+    if (!refreshError && refreshed?.session?.access_token) {
+      ({ res, data } = await request(refreshed.session.access_token));
+    }
+  }
   if (!res.ok) {
     const err = new Error(data?.error || `Request failed: ${res.status}`);
     err.status = res.status;
@@ -144,6 +167,17 @@ function spotifySetupErrorMessage(code = "") {
   if (code === "spotify_me_failed_403") return "Spotify rejected this account. Add the Spotify account name and email under Users and Access in your Spotify Developer app, then connect again.";
   if (code === "no_refresh_token_consent_required") return "Spotify did not return a refresh token. Retry Connect Spotify and approve access.";
   return `Spotify connection failed: ${code.replaceAll("_", " ")}`;
+}
+
+function spotifyCredentialsErrorMessage(errorLike) {
+  const code = String(errorLike?.message || errorLike || "");
+  if (code.includes("spotify_credentials_rejected")) return "Spotify rejected this Client ID and Client Secret. Copy both values again from the same Spotify Developer app.";
+  if (code.includes("spotify_credentials_validation_unavailable")) return "Spotify could not verify the credentials right now. Please wait a moment and try again.";
+  if (code.includes("invalid_client_id")) return "The Client ID format is invalid. Copy the complete Client ID from Spotify.";
+  if (code.includes("invalid_client_secret")) return "The Client Secret is incomplete. Copy the complete secret from Spotify.";
+  if (code.includes("invalid_redirect_uri")) return "Use the exact PlaylistPilot Redirect URI shown in this form.";
+  if (code.includes("subscription_required")) return "Your PlaylistPilot trial or subscription must be active before saving Spotify credentials.";
+  return code || "Spotify credentials could not be saved.";
 }
 
 function sortPlaylistsByFollowers(items = []) {
@@ -602,6 +636,10 @@ function reorderTracks(list, sourceTrack, targetPosition) {
   }));
 }
 
+function trackDragKey(track) {
+  return `${Number(track?.position)}:${track?.track_id || ""}`;
+}
+
 function dropTargetPosition(source, target, placement = "before") {
   const from = Number(source?.position);
   const targetPos = Number(target?.position);
@@ -886,6 +924,7 @@ export default function PlaylistManager() {
   const router = useRouter();
   const [supabase, setSupabase] = useState(null);
   const [session, setSession] = useState(null);
+  const [authInitialized, setAuthInitialized] = useState(false);
   const [authRefreshTick, setAuthRefreshTick] = useState(0);
   const [userContext, setUserContext] = useState(null);
   const [connections, setConnections] = useState([]);
@@ -940,7 +979,12 @@ export default function PlaylistManager() {
   const moveInFlightRef = useRef(false);
   const moveQueueRef = useRef(Promise.resolve());
   const moveReconcileTimerRef = useRef(null);
+  const tracksRef = useRef([]);
+  const dragAutoScrollFrameRef = useRef(null);
+  const dragAutoScrollStateRef = useRef({ target: null, velocity: 0 });
   const [pendingPlaylistEdits, setPendingPlaylistEdits] = useState(0);
+  const currentUserLoadSeqRef = useRef(0);
+  const authRecoveryInFlightRef = useRef(false);
   const connectionsLoadSeqRef = useRef(0);
   const lastAutoSetupStepRef = useRef(0);
   const spotifyAccountsSectionRef = useRef(null);
@@ -953,6 +997,8 @@ export default function PlaylistManager() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [spotifySetupAlert, setSpotifySetupAlert] = useState("");
+  const [spotifyReconnect, setSpotifyReconnect] = useState(null);
+  const [spotifyReconnectAccounts, setSpotifyReconnectAccounts] = useState([]);
   const [authMode, setAuthMode] = useState("login");
   const [authEmail, setAuthEmail] = useState("");
   const [authPassword, setAuthPassword] = useState("");
@@ -990,8 +1036,14 @@ export default function PlaylistManager() {
   const [dragTrackId, setDragTrackId] = useState("");
   const [dragTarget, setDragTarget] = useState(null);
   const [spotifyCredentials, setSpotifyCredentials] = useState(null);
+  const [spotifyCredentialsError, setSpotifyCredentialsError] = useState("");
   const [spotifyCredsOpen, setSpotifyCredsOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [teamData, setTeamData] = useState({ members: [], connections: [] });
+  const [teamLoading, setTeamLoading] = useState(false);
+  const [teamInviteEmail, setTeamInviteEmail] = useState("");
+  const [teamInviteConnections, setTeamInviteConnections] = useState([]);
+  const [teamAccessDrafts, setTeamAccessDrafts] = useState({});
   const [onboardingOpen, setOnboardingOpen] = useState(false);
   const [onboardingDismissed, setOnboardingDismissed] = useState(false);
   const [connectionsLoaded, setConnectionsLoaded] = useState(false);
@@ -1176,17 +1228,32 @@ export default function PlaylistManager() {
   }, [playlistId]);
 
   useEffect(() => {
+    tracksRef.current = tracks;
+  }, [tracks]);
+
+  useEffect(() => () => stopDragAutoScroll(), []);
+
+  useEffect(() => {
     const client = getSupabaseBrowserClient();
     setSupabase(client);
+    let active = true;
 
-    client.auth.getSession().then(({ data }) => {
-      setSession(data.session || null);
-    });
+    client.auth.getSession()
+      .then(({ data, error: sessionError }) => {
+        if (!active) return;
+        if (sessionError) console.warn("PlaylistPilot session restore failed", sessionError.message);
+        setSession(data?.session || null);
+      })
+      .finally(() => {
+        if (active) setAuthInitialized(true);
+      });
 
     const { data: listener } = client.auth.onAuthStateChange((event, nextSession) => {
-      setSession(nextSession || null);
+      setAuthInitialized(true);
+      if (nextSession) setSession(nextSession);
+      else if (event === "SIGNED_OUT" || event === "USER_DELETED" || event === "INITIAL_SESSION") setSession(null);
       if (event === "PASSWORD_RECOVERY") setPasswordRecoveryOpen(true);
-      if (!nextSession || event === "SIGNED_OUT" || event === "USER_DELETED") {
+      if (event === "SIGNED_OUT" || event === "USER_DELETED") {
         setUserContext(null);
         setConnections([]);
         setConnectionsLoaded(false);
@@ -1198,6 +1265,8 @@ export default function PlaylistManager() {
         setTracks([]);
         setFlexSettings(null);
         setFlexSlots([]);
+        setSpotifyReconnect(null);
+        setSpotifyReconnectAccounts([]);
         setFlexReferenceMeta(null);
         setFlexReferenceIssue(null);
         setFutureAdds([]);
@@ -1208,7 +1277,47 @@ export default function PlaylistManager() {
       }
     });
 
-    return () => listener.subscription.unsubscribe();
+    const recoverSession = async () => {
+      if (!active || authRecoveryInFlightRef.current || document.visibilityState === "hidden") return;
+      authRecoveryInFlightRef.current = true;
+      try {
+        const { data, error: sessionError } = await client.auth.getSession();
+        if (sessionError) {
+          console.warn("PlaylistPilot session check failed", sessionError.message);
+          return;
+        }
+        const current = data?.session || null;
+        if (!current) return;
+        const expiresAt = Number(current.expires_at || 0) * 1000;
+        if (expiresAt && expiresAt - Date.now() < 2 * 60 * 1000) {
+          const { data: refreshed, error: refreshError } = await refreshBrowserSessionOnce();
+          if (refreshError) {
+            console.warn("PlaylistPilot session refresh failed", refreshError.message);
+            return;
+          }
+          if (refreshed?.session) setSession(refreshed.session);
+        } else {
+          setSession(current);
+        }
+      } finally {
+        authRecoveryInFlightRef.current = false;
+        if (active) setAuthInitialized(true);
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") recoverSession();
+    };
+    window.addEventListener("focus", recoverSession);
+    window.addEventListener("online", recoverSession);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
+    return () => {
+      active = false;
+      listener.subscription.unsubscribe();
+      window.removeEventListener("focus", recoverSession);
+      window.removeEventListener("online", recoverSession);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
   }, []);
 
   useEffect(() => {
@@ -1226,6 +1335,24 @@ export default function PlaylistManager() {
   }, [session?.access_token, authRefreshTick]);
 
   useEffect(() => {
+    if (typeof window === "undefined" || !session?.access_token || !session?.refresh_token) return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("playlistpilot_extension") !== "connect") return;
+    const nonce = params.get("nonce") || "";
+    if (!/^[a-f0-9]{36}$/i.test(nonce)) return;
+    window.postMessage({
+      type: "PLAYLISTPILOT_EXTENSION_SESSION",
+      nonce,
+      session: {
+        access_token: session.access_token,
+        refresh_token: session.refresh_token,
+        expires_at: session.expires_at,
+        email: session.user?.email || "",
+      },
+    }, window.location.origin);
+  }, [session?.access_token, session?.refresh_token, session?.expires_at, session?.user?.email]);
+
+  useEffect(() => {
     if (!userContext?.linked) return;
     setConnectionsLoaded(false);
     setPlaylistsLoaded(false);
@@ -1235,26 +1362,35 @@ export default function PlaylistManager() {
     setPlaylist(null);
     setTracks([]);
     loadConnections();
-    loadDashboard();
-    loadSpotifyCredentials();
-    loadHealthStatus();
-  }, [userContext?.linked, userContext?.bubble_user_id]);
+    if (userContext.workspace_role === "owner") {
+      loadDashboard();
+      loadSpotifyCredentials();
+      loadHealthStatus();
+    } else {
+      setSpotifyCredentials({ configured: true, shared_workspace: true });
+      setDashboardSummary(null);
+      setDashboardSeries(null);
+      setHealthStatus(null);
+      setView("manager");
+    }
+  }, [userContext?.linked, userContext?.bubble_user_id, userContext?.workspace_role]);
+
+  useEffect(() => {
+    if (!settingsOpen || userContext?.workspace_role !== "owner") return;
+    loadTeamMembers();
+  }, [settingsOpen, userContext?.workspace_role, userContext?.bubble_user_id]);
 
   useEffect(() => {
     if (!workspaceBootstrapped) return;
     const key = `playlistpilot:onboarding-dismissed:${userContext.bubble_user_id || userContext.email}`;
     const dismissed = !onboardingMustConnect && typeof window !== "undefined" && window.localStorage.getItem(key) === "1";
     setOnboardingDismissed(dismissed);
-    if (onboardingStep < 5) {
-      setOnboardingOpen(false);
+    if (onboardingStep < 5 && !dismissed) {
+      setSettingsOpen(false);
+      setOnboardingOpen(true);
       if (lastAutoSetupStepRef.current !== onboardingStep) {
         lastAutoSetupStepRef.current = onboardingStep;
-        if (onboardingStep === 2) {
-          setSpotifyCredsOpen(true);
-          setSettingsOpen(true);
-        } else if (onboardingStep === 3) {
-          setSettingsOpen(true);
-        }
+        if (onboardingStep === 2) setSpotifyCredsOpen(true);
       }
     } else {
       lastAutoSetupStepRef.current = 5;
@@ -1483,11 +1619,29 @@ export default function PlaylistManager() {
     };
   }, [trackLink, connectionId, session?.access_token]);
 
-  const activeFlexTrackIds = useMemo(
-    () => new Set(flexSlots.map((slot) => slot.current_track_id).filter(Boolean)),
-    [flexSlots]
-  );
+  const flexSlotByPosition = useMemo(() => {
+    const slots = new Map();
+    flexSlots.forEach((slot) => {
+      const position = Number(slot?.position);
+      if (Number.isFinite(position) && position >= 0 && position < 1000000) slots.set(position, slot);
+    });
+    return slots;
+  }, [flexSlots]);
   const backupSlots = useMemo(() => buildBackupSlots(backups), [backups]);
+
+  function handleSpotifyReconnectError(errorLike) {
+    const raw = String(errorLike?.message || errorLike || "");
+    if (!raw.includes("spotify_reconnect_required")) return false;
+    const matchedConnectionId = raw.match(/spotify_reconnect_required:([a-f0-9-]{36})/i)?.[1] || connectionId || "";
+    const connection = connections.find((item) => item.id === matchedConnectionId);
+    setSpotifyReconnect({
+      connectionId: matchedConnectionId,
+      name: connection?.display_name || connection?.spotify_user_id || "this Spotify account",
+    });
+    setSpotifySetupAlert("Spotify revoked this account's access. Reconnect the same account to continue managing its playlists.");
+    setSettingsOpen(true);
+    return true;
+  }
 
   async function run(label, fn) {
     setBusy(true);
@@ -1499,7 +1653,11 @@ export default function PlaylistManager() {
       setMessage(label);
       return result;
     } catch (e) {
-      setError(e.message || String(e));
+      if (handleSpotifyReconnectError(e)) {
+        setError("Spotify access needs to be reconnected.");
+      } else {
+        setError(e.message || String(e));
+      }
       return null;
     } finally {
       setBusy(false);
@@ -1513,12 +1671,16 @@ export default function PlaylistManager() {
 
   async function signInWithGoogle() {
     setError("");
-    await supabase.auth.signInWithOAuth({
+    const { error: authError } = await supabase.auth.signInWithOAuth({
       provider: "google",
       options: {
         redirectTo: `${window.location.origin}/app`,
+        queryParams: {
+          prompt: "select_account",
+        },
       },
     });
+    if (authError) setError(authError.message || "Could not start Google login.");
   }
 
   function resetAuthCaptcha() {
@@ -1580,7 +1742,15 @@ export default function PlaylistManager() {
   }
 
   async function signOut() {
-    await supabase.auth.signOut();
+    if (!supabase) return;
+    setError("");
+    const { error: authError } = await supabase.auth.signOut({ scope: "local" });
+    if (authError) {
+      setError(authError.message || "Logout failed. Please try again.");
+      return;
+    }
+    setSession(null);
+    setUserContext(null);
   }
 
   async function saveRecoveryPassword(event) {
@@ -1691,7 +1861,83 @@ export default function PlaylistManager() {
     });
   }
 
+  async function switchWorkspace(workspaceId) {
+    if (!workspaceId || workspaceId === userContext?.bubble_user_id) return;
+    window.localStorage.setItem(ACTIVE_WORKSPACE_STORAGE_KEY, workspaceId);
+    setSettingsOpen(false);
+    setUserContext(null);
+    setConnections([]);
+    setPlaylists([]);
+    setPlaylistId("");
+    setPlaylist(null);
+    setTracks([]);
+    await loadCurrentUser();
+  }
+
+  async function loadTeamMembers() {
+    if (userContext?.workspace_role !== "owner") return null;
+    setTeamLoading(true);
+    try {
+      const data = await api("/api/team/members", { accessToken: accessToken() });
+      const next = { members: data?.members || [], connections: data?.connections || [] };
+      setTeamData(next);
+      setTeamAccessDrafts(Object.fromEntries(next.members.map((member) => [member.id, member.connection_ids || []])));
+      return next;
+    } catch (error) {
+      setError(error.message || "Team settings failed to load.");
+      return null;
+    } finally {
+      setTeamLoading(false);
+    }
+  }
+
+  function toggleTeamConnection(currentIds, connectionId) {
+    return currentIds.includes(connectionId)
+      ? currentIds.filter((id) => id !== connectionId)
+      : [...currentIds, connectionId];
+  }
+
+  async function inviteTeamMember() {
+    const email = teamInviteEmail.trim().toLowerCase();
+    if (!email) return;
+    await run("Team member invited", async () => {
+      await api("/api/team/members/invite", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { email, connection_ids: teamInviteConnections },
+      });
+      setTeamInviteEmail("");
+      setTeamInviteConnections([]);
+      return loadTeamMembers();
+    });
+  }
+
+  async function saveTeamMemberAccess(memberId) {
+    await run("Team access updated", async () => {
+      await api("/api/team/members/access", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { member_id: memberId, connection_ids: teamAccessDrafts[memberId] || [] },
+      });
+      return loadTeamMembers();
+    });
+  }
+
+  async function removeTeamMember(memberId) {
+    if (!window.confirm("Remove this team member and revoke access to every Spotify account?")) return;
+    await run("Team member removed", async () => {
+      await api("/api/team/members/remove", {
+        method: "POST",
+        accessToken: accessToken(),
+        body: { member_id: memberId },
+      });
+      return loadTeamMembers();
+    });
+  }
+
   async function loadCurrentUser() {
+    const requestSeq = currentUserLoadSeqRef.current + 1;
+    currentUserLoadSeqRef.current = requestSeq;
     return run("Signed in", async () => {
       let data;
       try {
@@ -1699,6 +1945,10 @@ export default function PlaylistManager() {
       } catch (e) {
         if (e.status === 403 && e.data) data = e.data;
         else throw e;
+      }
+      if (currentUserLoadSeqRef.current !== requestSeq) return data;
+      if (data?.bubble_user_id && typeof window !== "undefined") {
+        window.localStorage.setItem(ACTIVE_WORKSPACE_STORAGE_KEY, data.bubble_user_id);
       }
       setUserContext(data);
       return data;
@@ -1709,28 +1959,43 @@ export default function PlaylistManager() {
     const loadSeq = connectionsLoadSeqRef.current + 1;
     connectionsLoadSeqRef.current = loadSeq;
     return run("Connections loaded", async () => {
-      let data = await api("/api/connections/list", { accessToken: accessToken() });
-      if (retryPreferred && preferredSpotifyUserId && !data.some((c) => c.spotify_user_id === preferredSpotifyUserId)) {
+      let data = await api("/api/connections/list?include_inactive=1", { accessToken: accessToken() });
+      if (retryPreferred && preferredSpotifyUserId && !data.some((c) => c.spotify_user_id === preferredSpotifyUserId && c.is_active !== false && !c.disabled_at)) {
         await new Promise((resolve) => setTimeout(resolve, 650));
-        data = await api("/api/connections/list", { accessToken: accessToken() });
+        data = await api("/api/connections/list?include_inactive=1", { accessToken: accessToken() });
       }
       if (connectionsLoadSeqRef.current !== loadSeq) return data;
-      setConnections(data);
+      const activeConnections = data.filter((connection) => connection.is_active !== false && !connection.disabled_at);
+      const reconnectAccounts = data.filter((connection) => connection.is_active === false && !!connection.disabled_at && !connection.disconnected_at);
+      setConnections(activeConnections);
+      setSpotifyReconnectAccounts(reconnectAccounts);
+      if (reconnectAccounts.length) {
+        const reconnectAccount = reconnectAccounts[0];
+        if (userContext?.workspace_role === "owner") {
+          setSpotifyReconnect((current) => current || {
+            connectionId: reconnectAccount.id,
+            name: reconnectAccount.display_name || reconnectAccount.spotify_user_id || "this Spotify account",
+          });
+          setSpotifySetupAlert("Spotify access needs to be reconnected for one account before PlaylistPilot can resume its automations.");
+        } else {
+          setSpotifySetupAlert(`${reconnectAccount.display_name || "A shared Spotify account"} must be reconnected by the workspace owner.`);
+        }
+      }
       const stored = readStoredSelection(userContext);
       const preferredId = preferredSpotifyUserId || initialSpotifySyncUser;
       const connectedConnectionId = preferredId
-        ? data.find((c) => c.spotify_user_id === preferredId)?.id || ""
+        ? activeConnections.find((c) => c.spotify_user_id === preferredId)?.id || ""
         : "";
-      const storedConnectionId = stored.connectionId && data.some((c) => c.id === stored.connectionId)
+      const storedConnectionId = stored.connectionId && activeConnections.some((c) => c.id === stored.connectionId)
         ? stored.connectionId
         : "";
-      const nextConnectionId = connectedConnectionId || storedConnectionId || data[0]?.id || "";
+      const nextConnectionId = connectedConnectionId || storedConnectionId || activeConnections[0]?.id || "";
       if (connectionId !== nextConnectionId) setConnectionId(nextConnectionId);
       setConnectionsLoaded(true);
       if (retryPreferred && preferredSpotifyUserId && !connectedConnectionId) {
         throw new Error("Spotify authorization completed, but the account is not active in this workspace. Refresh accounts or reconnect Spotify.");
       }
-      return data;
+      return activeConnections;
     });
   }
 
@@ -1761,12 +2026,36 @@ export default function PlaylistManager() {
   async function refreshFromSpotify() {
     if (!connectionId) return;
     await run("Spotify playlists refreshed", async () => {
-      await api("/api/playlists/sync?with_followers=1&with_items=1&items_limit=12", {
+      // Refresh account metadata first, then synchronously replace the selected
+      // playlist's local track snapshot with Spotify's current order. The old
+      // flow only queued the 12 largest playlists and never reloaded the open
+      // track list, so the Refresh button could leave the visible playlist stale.
+      await api("/api/playlists/sync?with_followers=1", {
         method: "POST",
         accessToken: accessToken(),
         body: { connection_id: connectionId },
       });
+
+      if (playlistId) {
+        const syncResult = await api("/api/playlists/sync-items", {
+          method: "POST",
+          accessToken: accessToken(),
+          body: { playlist_row_id: playlistId, read_only: true },
+        });
+        if (syncResult?.already_in_progress || syncResult?.rescheduled || syncResult?.paused) {
+          throw new Error(
+            syncResult?.reason === "rate_limited"
+              ? "Spotify is rate limiting this refresh. Please retry in a moment."
+              : "This playlist is still syncing. Please retry in a moment."
+          );
+        }
+        if (syncResult?.ok !== true) {
+          throw new Error("Spotify returned an incomplete playlist refresh. Please retry.");
+        }
+      }
+
       await loadPlaylists();
+      if (playlistId) await loadSelectedPlaylist();
     });
   }
 
@@ -1784,7 +2073,7 @@ export default function PlaylistManager() {
       let itemMeta = Array.isArray(itemPayload) ? null : itemPayload?.meta;
       const expectedTracks = Number(detail?.tracks_total || 0);
       const loadedTracks = Array.isArray(items) ? items.length : 0;
-      const looksPartial = !!itemMeta?.partial || (expectedTracks > 0 && loadedTracks > 0 && loadedTracks < Math.max(1, Math.floor(expectedTracks * 0.8)));
+      const looksPartial = !!itemMeta?.partial || (expectedTracks > 0 && loadedTracks !== expectedTracks);
       if ((!loadedTracks || looksPartial) && expectedTracks > 0) {
         await api("/api/playlists/sync-items", {
           method: "POST",
@@ -1892,7 +2181,7 @@ export default function PlaylistManager() {
   function assertCompletePlaylistItems(items, meta, playlistLabel = "Playlist") {
     const expected = Number(meta?.expected_tracks || 0);
     const loaded = Array.isArray(items) ? items.length : 0;
-    const partial = !!meta?.partial || (expected > 0 && loaded > 0 && loaded < Math.max(1, Math.floor(expected * 0.8)));
+    const partial = !!meta?.partial || (expected > 0 && loaded !== expected);
     if (partial) {
       throw new Error(`${playlistLabel} sync incomplete: loaded ${formatNumber(loaded)} of ${formatNumber(expected)} tracks. Please try again in a moment.`);
     }
@@ -2002,8 +2291,93 @@ export default function PlaylistManager() {
       api(`/api/flex/slots/list?playlist_id=${encodeURIComponent(targetPlaylistId)}`, { accessToken: accessToken() }).catch(() => []),
     ]);
     if (selectedPlaylistIdRef.current !== targetPlaylistId) return;
+    tracksRef.current = items;
     setTracks(items);
     setFlexSlots(Array.isArray(slots) ? slots : []);
+  }
+
+  function applyQueuedTrackMove(sourceTrack, targetPosition) {
+    const current = tracksRef.current;
+    const sourcePosition = Number(sourceTrack?.position);
+    const source = current.find((item) => (
+      Number(item.position) === sourcePosition && item.track_id === sourceTrack?.track_id
+    )) || current.find((item) => item.track_id === sourceTrack?.track_id);
+    if (!source) return null;
+
+    const from = Number(source.position);
+    const to = Math.max(0, Math.min(current.length - 1, Number(targetPosition)));
+    if (!Number.isFinite(from) || !Number.isFinite(to) || from === to) return null;
+
+    const next = reorderTracks(current, source, to);
+    tracksRef.current = next;
+    setTracks(next);
+    return { source, from, to };
+  }
+
+  function stopDragAutoScroll() {
+    dragAutoScrollStateRef.current = { target: null, velocity: 0 };
+    if (dragAutoScrollFrameRef.current !== null && typeof window !== "undefined") {
+      window.cancelAnimationFrame(dragAutoScrollFrameRef.current);
+      dragAutoScrollFrameRef.current = null;
+    }
+  }
+
+  function updateDragAutoScroll(clientY, origin) {
+    if (typeof window === "undefined" || !origin) return;
+    let target = origin.parentElement;
+    while (target && target !== document.body) {
+      const style = window.getComputedStyle(target);
+      const canScroll = /(auto|scroll)/.test(style.overflowY) && target.scrollHeight > target.clientHeight;
+      if (canScroll) break;
+      target = target.parentElement;
+    }
+    if (!target || target === document.body) target = document.scrollingElement || document.documentElement;
+
+    const isPage = target === document.scrollingElement || target === document.documentElement;
+    const originRect = origin.getBoundingClientRect();
+    const rect = isPage
+      ? {
+          top: Math.max(0, originRect.top),
+          bottom: Math.min(window.innerHeight, originRect.bottom),
+        }
+      : {
+          top: Math.max(target.getBoundingClientRect().top, originRect.top),
+          bottom: Math.min(target.getBoundingClientRect().bottom, originRect.bottom),
+        };
+    if (rect.bottom <= rect.top) {
+      stopDragAutoScroll();
+      return;
+    }
+    const edgeSize = Math.min(130, Math.max(72, (rect.bottom - rect.top) * 0.18));
+    const topStrength = Math.max(0, Math.min(1, (rect.top + edgeSize - clientY) / edgeSize));
+    const bottomStrength = Math.max(0, Math.min(1, (clientY - (rect.bottom - edgeSize)) / edgeSize));
+    const strength = bottomStrength - topStrength;
+    const velocity = Math.sign(strength) * Math.pow(Math.abs(strength), 1.6) * 20;
+    dragAutoScrollStateRef.current = { target, velocity };
+
+    if (Math.abs(velocity) < 0.25) {
+      if (dragAutoScrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(dragAutoScrollFrameRef.current);
+        dragAutoScrollFrameRef.current = null;
+      }
+      return;
+    }
+    if (dragAutoScrollFrameRef.current !== null) return;
+
+    const tick = () => {
+      const state = dragAutoScrollStateRef.current;
+      if (!state.target || Math.abs(state.velocity) < 0.25) {
+        dragAutoScrollFrameRef.current = null;
+        return;
+      }
+      if (state.target === document.scrollingElement || state.target === document.documentElement) {
+        window.scrollBy(0, state.velocity);
+      } else {
+        state.target.scrollTop += state.velocity;
+      }
+      dragAutoScrollFrameRef.current = window.requestAnimationFrame(tick);
+    };
+    dragAutoScrollFrameRef.current = window.requestAnimationFrame(tick);
   }
 
   function scheduleMoveReconcile(targetPlaylistId, delay = 1200) {
@@ -2086,11 +2460,12 @@ export default function PlaylistManager() {
   async function moveTrack(track, dir) {
     const targetPosition = Number(track.position) + (dir === "up" ? -1 : 1);
     if (ENABLE_FAST_PLAYLIST_MOVES) {
-      setTracks((current) => reorderTracks(current, track, targetPosition));
+      const move = applyQueuedTrackMove(track, targetPosition);
+      if (!move) return;
       enqueuePlaylistMove({
         playlist_id: playlistId,
-        track_id: track.track_id,
-        from_position: track.position,
+        track_id: move.source.track_id,
+        from_position: move.from,
         dir,
         steps: 1,
       });
@@ -2125,13 +2500,14 @@ export default function PlaylistManager() {
     const to = Math.max(0, Math.min(tracks.length - 1, Number(targetPosition)));
     if (!Number.isFinite(from) || !Number.isFinite(to) || from === to) return;
     if (ENABLE_FAST_PLAYLIST_MOVES) {
-      setTracks((current) => reorderTracks(current, track, to));
+      const move = applyQueuedTrackMove(track, to);
+      if (!move) return;
       enqueuePlaylistMove({
         playlist_id: playlistId,
-        track_id: track.track_id,
-        from_position: track.position,
-        dir: to < from ? "up" : "down",
-        steps: Math.abs(to - from),
+        track_id: move.source.track_id,
+        from_position: move.from,
+        dir: move.to < move.from ? "up" : "down",
+        steps: Math.abs(move.to - move.from),
       });
       return;
     }
@@ -2160,24 +2536,50 @@ export default function PlaylistManager() {
   }
 
   async function removeTrack(track) {
-    const previousTracks = tracks;
+    const targetPlaylistId = playlistId;
+    const previousTracks = tracksRef.current;
     if (ENABLE_OPTIMISTIC_PLAYLIST_UI) {
-      setTracks(tracks.filter((item) => item.track_id !== track.track_id).map((item, index) => ({ ...item, position: index })));
+      const removedPosition = Number(track.position);
+      const nextTracks = previousTracks
+        .filter((item) => !(item.track_id === track.track_id && Number(item.position) === removedPosition))
+        .map((item, index) => ({
+          ...item,
+          position: index,
+          locked_position: item.is_locked ? index : item.locked_position,
+        }));
+      tracksRef.current = nextTracks;
+      setTracks(nextTracks);
     }
-    await run("Track removed; sync dispatched", async () => {
-      await api("/api/playlist-items/remove", {
+    setPendingPlaylistEdits((count) => count + 1);
+    setError("");
+    setMessage("Removing track");
+    const task = moveQueueRef.current
+      .catch(() => null)
+      .then(() => api("/api/playlist-items/remove", {
         method: "POST",
         accessToken: accessToken(),
         body: {
-          playlist_id: playlistId,
+          playlist_id: targetPlaylistId,
           track_id: track.track_id,
           position0: track.position,
         },
-      });
-      await (ENABLE_OPTIMISTIC_PLAYLIST_UI ? reconcileTracksAndFlex() : loadSelectedPlaylist());
-    }).then((result) => {
-      if (result === null && ENABLE_OPTIMISTIC_PLAYLIST_UI) setTracks(previousTracks);
-    });
+      }));
+    moveQueueRef.current = task;
+    task
+      .then(() => scheduleMoveReconcile(targetPlaylistId, 500))
+      .catch(async (error) => {
+        const rawMessage = error.message || String(error);
+        setError(rawMessage.includes("duplicate_track_remove_requires_spotify")
+          ? "This track appears more than once in Spotify. Remove the intended copy in Spotify, then refresh PlaylistPilot."
+          : rawMessage);
+        if (selectedPlaylistIdRef.current === targetPlaylistId) {
+          tracksRef.current = previousTracks;
+          setTracks(previousTracks);
+          await reconcileTracksAndFlex({ repair: false }).catch(() => null);
+        }
+      })
+      .finally(() => setPendingPlaylistEdits((count) => Math.max(0, count - 1)));
+    return task;
   }
 
   async function toggleLock(track) {
@@ -2437,7 +2839,9 @@ export default function PlaylistManager() {
   async function loadAdminStatus() {
     if (!session?.access_token || !isAdmin) return null;
     const data = await api("/api/admin/status", { accessToken: accessToken() }).catch((e) => {
-      setError(e.message || "Admin status failed.");
+      setAdminStatus(null);
+      const sources = Array.isArray(e.data?.sources) ? e.data.sources.join(", ") : "";
+      setError(sources ? `Admin status could not read: ${sources}. Please retry.` : e.message || "Admin status failed.");
       return null;
     });
     setAdminStatus(data);
@@ -3446,20 +3850,26 @@ export default function PlaylistManager() {
   }
 
   async function saveSpotifyCredentials() {
+    setSpotifyCredentialsError("");
     await run("Spotify app settings saved", async () => {
-      const data = await api("/api/spotify/credentials/save", {
-        method: "POST",
-        accessToken: accessToken(),
-        body: {
-          client_id: spotifyClientId,
-          client_secret: spotifyClientSecret,
-          redirect_uri: spotifyRedirectUri,
-          app_name: spotifyAppName,
-        },
-      });
-      setSpotifyClientSecret("");
-      await loadSpotifyCredentials();
-      return data;
+      try {
+        const data = await api("/api/spotify/credentials/save", {
+          method: "POST",
+          accessToken: accessToken(),
+          body: {
+            client_id: spotifyClientId,
+            client_secret: spotifyClientSecret,
+            redirect_uri: spotifyRedirectUri,
+            app_name: spotifyAppName,
+          },
+        });
+        setSpotifyClientSecret("");
+        await loadSpotifyCredentials();
+        return data;
+      } catch (saveError) {
+        setSpotifyCredentialsError(spotifyCredentialsErrorMessage(saveError));
+        throw saveError;
+      }
     });
   }
 
@@ -3479,8 +3889,6 @@ export default function PlaylistManager() {
             enabled: flexEnabled,
             repeat_cooldown_weeks: flexRepeatWeeks,
             avoid_target_duplicates: flexAvoidDuplicates,
-            min_popularity: flexMinPopularity || null,
-            max_popularity: flexMaxPopularity || null,
             max_release_age_weeks: flexMaxReleaseAgeWeeks || null,
           },
         });
@@ -3600,10 +4008,10 @@ export default function PlaylistManager() {
         <nav className="mainNav" aria-label="Main navigation">
           {session && userContext?.linked && billingActive && onboardingConnectionsReady ? (
             <div className="navTabs">
-              <button className={view === "dashboard" ? "navButton active" : "navButton"} onClick={() => setView("dashboard")}>Dashboard</button>
+              {userContext.workspace_role === "owner" ? <button className={view === "dashboard" ? "navButton active" : "navButton"} onClick={() => setView("dashboard")}>Dashboard</button> : null}
               <button className={view === "manager" ? "navButton active" : "navButton"} onClick={() => setView("manager")}>Playlist Manager</button>
-              {isAdmin ? <button className={view === "ads" ? "navButton active" : "navButton"} onClick={() => openAdsSection("overview")}>Ads Manager</button> : null}
-              {isAdmin ? <button className={view === "admin" ? "navButton active" : "navButton"} onClick={() => setView("admin")}>Admin</button> : null}
+              {isAdmin && userContext.workspace_role === "owner" ? <button className={view === "ads" ? "navButton active" : "navButton"} onClick={() => openAdsSection("overview")}>Ads Manager</button> : null}
+              {isAdmin && userContext.workspace_role === "owner" ? <button className={view === "admin" ? "navButton active" : "navButton"} onClick={() => setView("admin")}>Admin</button> : null}
             </div>
           ) : null}
           {session && userContext?.linked && billingActive ? (
@@ -3645,7 +4053,7 @@ export default function PlaylistManager() {
           <div>
             <strong>Spotify account needs one more setup step</strong>
             <p>{spotifySetupAlert}</p>
-            <small>After adding the account under Users and Access, save the Spotify app and try Connect Spotify again.</small>
+            <small>{userContext?.workspace_role === "member" ? "Your access remains saved while the owner reconnects the account." : "After adding the account under Users and Access, save the Spotify app and try Connect Spotify again."}</small>
           </div>
           <button className="iconOnlyButton" onClick={() => setSpotifySetupAlert("")} aria-label="Dismiss Spotify setup message">
             <X aria-hidden="true" />
@@ -3671,7 +4079,16 @@ export default function PlaylistManager() {
         </div>
       ) : null}
 
-      {!session ? (
+      {!authInitialized ? (
+        <section className="loadingScreen" aria-live="polite">
+          <div className="loaderMark">
+            <img src="/playlistpilot-logo-v1.jpg" alt="" />
+            <span />
+          </div>
+          <h2>Restoring your session</h2>
+          <p>Securely reconnecting your PlaylistPilot workspace.</p>
+        </section>
+      ) : !session ? (
         <section className="loginScreen">
           <div className="loginCard">
             <div className="loginBrand">
@@ -3867,6 +4284,7 @@ export default function PlaylistManager() {
                   <input value={spotifyAppName} onChange={(e) => setSpotifyAppName(e.target.value)} placeholder="App name" />
                   <input value={spotifyClientId} onChange={(e) => setSpotifyClientId(e.target.value)} placeholder="Client ID" />
                   <input type="password" value={spotifyClientSecret} onChange={(e) => setSpotifyClientSecret(e.target.value)} placeholder="Client Secret" />
+                  {spotifyCredentialsError ? <div className="authError" role="alert">{spotifyCredentialsError}</div> : null}
                   <button disabled={busy || !spotifyClientId.trim() || !spotifyClientSecret.trim()} onClick={saveSpotifyCredentials}>Save Spotify App</button>
                 </div>
               </div>
@@ -3915,6 +4333,30 @@ export default function PlaylistManager() {
           </section>
         </div>
       ) : null}
+      {spotifyReconnect ? (
+        <div className="onboardingOverlay" role="dialog" aria-modal="true" aria-label="Reconnect Spotify account">
+          <section className="onboardingPanel spotifyReconnectPanel">
+            <div className="onboardingHeader">
+              <div>
+                <span>Spotify reconnect required</span>
+                <h2>Reconnect {spotifyReconnect.name}</h2>
+                <p>Spotify revoked the saved access token. PlaylistPilot has paused automation for this account until you authorize it again.</p>
+              </div>
+              <button className="iconOnlyButton" onClick={() => setSpotifyReconnect(null)} aria-label="Close reconnect dialog">
+                <X aria-hidden="true" />
+              </button>
+            </div>
+            <div className="setupNotice spotifyReconnectNotice">
+              <strong>Use the same Spotify account</strong>
+              <p>Continue with Spotify, sign in to {spotifyReconnect.name}, and approve access. Your playlists, locks, expiry settings, rotator slots, and growth history stay attached to the existing connection.</p>
+            </div>
+            <div className="onboardingActions">
+              <button disabled={busy} onClick={startSpotifyConnect}>Reconnect Spotify</button>
+              <button className="secondaryOutline" disabled={busy} onClick={() => { setSpotifyReconnect(null); setSpotifyCredsOpen(true); setSettingsOpen(true); }}>Check API settings</button>
+            </div>
+          </section>
+        </div>
+      ) : null}
       {settingsOpen ? (
         <div className="settingsOverlay" role="dialog" aria-modal="true" aria-label="Settings">
           <div className="settingsPanel">
@@ -3931,8 +4373,21 @@ export default function PlaylistManager() {
             <section className="settingsSection">
               <span>Signed in</span>
               <strong>{userContext.email}</strong>
+              {(userContext.workspaces || []).length > 1 ? (
+                <label className="workspaceSwitcher">
+                  <span>Active workspace</span>
+                  <select value={userContext.bubble_user_id} onChange={(event) => switchWorkspace(event.target.value)}>
+                    {(userContext.workspaces || []).map((workspace) => (
+                      <option key={workspace.id} value={workspace.id}>{workspace.label}</option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+              {userContext.workspace_role === "member" ? (
+                <div className="sharedWorkspaceBadge"><Users aria-hidden="true" /><span>Team member · Account access is controlled by the workspace owner.</span></div>
+              ) : null}
               <div className="accountActions">
-                <button disabled={busy} onClick={reopenOnboarding}>Open onboarding</button>
+                {userContext.workspace_role === "owner" ? <button disabled={busy} onClick={reopenOnboarding}>Open onboarding</button> : <span />}
                 <button className="dangerOutline settingsLogout" onClick={signOut}>Log out</button>
               </div>
             </section>
@@ -3945,18 +4400,18 @@ export default function PlaylistManager() {
                 </div>
                 <div className="settingsHeaderActions">
                   <button className="secondaryOutline" disabled={busy} onClick={() => loadConnections()}>Refresh accounts</button>
-                  <button
+                  {userContext.workspace_role === "owner" ? <button
                     disabled={busy || (!spotifyCredentials?.configured && !spotifyCredentials?.fallback_available)}
                     onClick={startSpotifyConnect}
                   >
                     Connect Spotify
-                  </button>
+                  </button> : null}
                 </div>
               </div>
-              <div className="setupNotice settingsSpotifyNotice">
+              {userContext.workspace_role === "owner" ? <div className="setupNotice settingsSpotifyNotice">
                 <strong>Before you connect</strong>
                 <p>Add the Spotify account's name and email under <b>Users and Access</b> in your Spotify Developer app, then press Save. Spotify returns a 403 if this step is missing.</p>
-              </div>
+              </div> : null}
               <div className="connectionList">
                 {connections.map((c) => (
                   <div key={c.id} className="connectionItem">
@@ -3965,19 +4420,117 @@ export default function PlaylistManager() {
                       <strong>{c.display_name || c.spotify_user_id || "Spotify Account"}</strong>
                       <span>{c.spotify_user_id || "Connected account"}</span>
                     </div>
-                    <button
+                    {userContext.workspace_role === "owner" ? <button
                       className="dangerOutline"
                       disabled={busy}
                       onClick={() => disconnectSpotifyConnection(c.id)}
                     >
                       Remove
-                    </button>
+                    </button> : <span className="sharedAccountLabel">Shared</span>}
                   </div>
                 ))}
                 {!connections.length ? <p>No Spotify account connected yet.</p> : null}
               </div>
+              {userContext.workspace_role === "owner" && spotifyReconnectAccounts.length ? (
+                <div className="reconnectAccountList">
+                  <strong>Reconnect required</strong>
+                  {spotifyReconnectAccounts.map((connection) => (
+                    <div key={connection.id} className="connectionItem connectionItem--reconnect">
+                      <Artwork src={connection.avatar_url} alt="" size="sm" />
+                      <div>
+                        <strong>{connection.display_name || connection.spotify_user_id || "Spotify Account"}</strong>
+                        <span>Spotify revoked access. Automations are paused.</span>
+                      </div>
+                      <button disabled={busy} onClick={() => setSpotifyReconnect({
+                        connectionId: connection.id,
+                        name: connection.display_name || connection.spotify_user_id || "this Spotify account",
+                      })}>Reconnect</button>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
             </section>
 
+            {userContext.workspace_role === "owner" ? (
+              <section className="settingsSection teamSettingsSection">
+                <div className="settingsSectionHeader">
+                  <div>
+                    <h3>Team access</h3>
+                    <p>Invite collaborators and choose exactly which Spotify accounts they can manage.</p>
+                  </div>
+                  <button className="secondaryOutline" disabled={teamLoading || busy} onClick={loadTeamMembers}>Refresh</button>
+                </div>
+
+                <div className="teamInviteCard">
+                  <div className="teamInviteHeading">
+                    <span className="teamIcon"><UserPlus aria-hidden="true" /></span>
+                    <div><strong>Invite a team member</strong><small>Access activates immediately for existing users, or when this email first signs in.</small></div>
+                  </div>
+                  <input
+                    type="email"
+                    value={teamInviteEmail}
+                    onChange={(event) => setTeamInviteEmail(event.target.value)}
+                    placeholder="team@example.com"
+                    aria-label="Team member email"
+                  />
+                  <div className="teamConnectionPicker">
+                    {(teamData.connections || []).filter((connection) => connection.is_active !== false && !connection.disabled_at).map((connection) => (
+                      <label key={connection.id}>
+                        <input
+                          type="checkbox"
+                          checked={teamInviteConnections.includes(connection.id)}
+                          onChange={() => setTeamInviteConnections((current) => toggleTeamConnection(current, connection.id))}
+                        />
+                        <Artwork src={connection.avatar_url} alt="" size="sm" />
+                        <span>{connection.display_name || connection.spotify_user_id || "Spotify account"}</span>
+                      </label>
+                    ))}
+                    {!teamData.connections?.length ? <small>Connect a Spotify account before assigning team access.</small> : null}
+                  </div>
+                  <button disabled={busy || teamLoading || !teamInviteEmail.trim()} onClick={inviteTeamMember}>Invite member</button>
+                </div>
+
+                <div className="teamMemberList">
+                  {(teamData.members || []).map((member) => {
+                    const selectedIds = teamAccessDrafts[member.id] || [];
+                    const originalIds = member.connection_ids || [];
+                    const changed = [...selectedIds].sort().join(",") !== [...originalIds].sort().join(",");
+                    return (
+                      <article key={member.id} className="teamMemberCard">
+                        <div className="teamMemberHeader">
+                          <div><strong>{member.member_email}</strong><span className={`teamStatus teamStatus--${member.status}`}>{member.status === "active" ? "Active" : "Invite pending"}</span></div>
+                          <button className="dangerOutline" disabled={busy} onClick={() => removeTeamMember(member.id)}>Remove</button>
+                        </div>
+                        <div className="teamConnectionPicker teamConnectionPicker--member">
+                          {(teamData.connections || []).filter((connection) => connection.is_active !== false && !connection.disabled_at).map((connection) => (
+                            <label key={connection.id}>
+                              <input
+                                type="checkbox"
+                                checked={selectedIds.includes(connection.id)}
+                                onChange={() => setTeamAccessDrafts((current) => ({
+                                  ...current,
+                                  [member.id]: toggleTeamConnection(current[member.id] || [], connection.id),
+                                }))}
+                              />
+                              <Artwork src={connection.avatar_url} alt="" size="sm" />
+                              <span>{connection.display_name || connection.spotify_user_id || "Spotify account"}</span>
+                            </label>
+                          ))}
+                        </div>
+                        <div className="teamMemberFooter">
+                          <small>{selectedIds.length} account{selectedIds.length === 1 ? "" : "s"} shared</small>
+                          <button className="secondaryOutline" disabled={busy || !changed} onClick={() => saveTeamMemberAccess(member.id)}>Save access</button>
+                        </div>
+                      </article>
+                    );
+                  })}
+                  {!teamLoading && !teamData.members?.length ? <div className="teamEmptyState"><Users aria-hidden="true" /><span>No team members yet.</span></div> : null}
+                  {teamLoading ? <div className="teamEmptyState"><span>Loading team access...</span></div> : null}
+                </div>
+              </section>
+            ) : null}
+
+            {userContext.workspace_role === "owner" ? <>
             <section className={billingActive ? "billingBox billingBox--active" : "billingBox"}>
               <div className="settingsSectionHeader">
                 <div>
@@ -4046,6 +4599,7 @@ export default function PlaylistManager() {
                     onChange={(e) => setSpotifyClientSecret(e.target.value)}
                     placeholder={spotifyCredentials?.configured ? "New Client Secret to replace" : "Client Secret"}
                   />
+                  {spotifyCredentialsError ? <div className="authError" role="alert">{spotifyCredentialsError}</div> : null}
                   <button disabled={busy || !spotifyClientId.trim() || !spotifyClientSecret.trim()} onClick={saveSpotifyCredentials}>
                     Save Spotify App
                   </button>
@@ -4068,6 +4622,7 @@ export default function PlaylistManager() {
                 <article><span>Rotator</span><strong>{formatNumber(healthStatus?.rotator?.enabled)}</strong><small>{formatNumber(healthStatus?.rotator?.due)} due</small></article>
               </div>
             </section>
+            </> : null}
           </div>
         </div>
       ) : null}
@@ -5141,7 +5696,7 @@ export default function PlaylistManager() {
                   <span className="jobStatus jobStatus--failed">failed</span>
                   <strong>{job.job_type}</strong>
                   <span>{formatNumber(job.attempts)} attempts</span>
-                  <small>{job.last_error || "No error message"}</small>
+                  <small>{job.last_error || "No error message"}{job.playlist_id || (job.scope_type === "playlist" && job.scope_id) ? ` · playlist ${String(job.playlist_id || job.scope_id).slice(0, 8)}` : " · no playlist ID stored"} · {job.updated_at ? new Date(job.updated_at).toLocaleString() : "unknown time"}</small>
                 </div>
               ))}
               {!adminStatus?.failed_jobs?.length ? <p>No failed jobs.</p> : null}
@@ -5566,8 +6121,6 @@ export default function PlaylistManager() {
                           <div className="rotatorRules">
                             <input value={flexRepeatWeeks} onChange={(e) => setFlexRepeatWeeks(e.target.value)} placeholder="No repeat weeks" inputMode="numeric" />
                             <input value={flexMaxReleaseAgeWeeks} onChange={(e) => setFlexMaxReleaseAgeWeeks(e.target.value)} placeholder="Max release age weeks" inputMode="numeric" />
-                            <input value={flexMinPopularity} onChange={(e) => setFlexMinPopularity(e.target.value)} placeholder="Min popularity" inputMode="numeric" />
-                            <input value={flexMaxPopularity} onChange={(e) => setFlexMaxPopularity(e.target.value)} placeholder="Max popularity" inputMode="numeric" />
                           </div>
                         </div>
                       </section>
@@ -5599,6 +6152,13 @@ export default function PlaylistManager() {
                           <li>Choose “Add to other playlist” and create a new playlist.</li>
                           <li>Open your new playlist, copy its link, and paste it above.</li>
                         </ol>
+                      </div>
+                    ) : null}
+                    {error.includes("reference_playlist_has_no_usable_tracks") ? (
+                      <div className="referenceIssue">
+                        <strong>No eligible rotation track is available.</strong>
+                        <p>This source currently has no song left after your selection rules were applied. For this playlist, every available source song is already in the target playlist.</p>
+                        <p>Choose a broader source playlist, or turn off “Skip songs already in target playlist” if duplicates are acceptable.</p>
                       </div>
                     ) : null}
                     <div className="toolActions">
@@ -5739,7 +6299,15 @@ export default function PlaylistManager() {
                 placeholder="Search tracks"
               />
             </div>
-            <div className="trackList">
+            <div
+              className="trackList"
+              onDragOver={(e) => {
+                if (!dragTrackId) return;
+                e.preventDefault();
+                updateDragAutoScroll(e.clientY, e.currentTarget);
+              }}
+              onDrop={stopDragAutoScroll}
+            >
               {playlistLoading ? (
                 <div className="trackLoadingState" role="status" aria-live="polite">
                   <span><i className="miniSpinner" aria-hidden="true" />Loading tracks</span>
@@ -5754,38 +6322,44 @@ export default function PlaylistManager() {
                 </div>
               ) : null}
               {!playlistLoading && filteredTracks.map((track) => {
-                const isFlexTrack = activeFlexTrackIds.has(track.track_id);
+                const flexSlot = flexSlotByPosition.get(Number(track.position));
+                const isFlexTrack = flexSlot?.current_track_id === track.track_id;
                 return (
 	                  <article
 	                    key={`${track.position}-${track.track_id}`}
-	                    className={`trackRow ${isFlexTrack ? "trackRow--flex" : ""} ${dragTrackId === track.track_id ? "trackRow--dragging" : ""} ${dragTarget?.trackId === track.track_id ? `trackRow--drop-${dragTarget.placement}` : ""}`}
+	                    className={`trackRow ${isFlexTrack ? "trackRow--flex" : ""} ${dragTrackId === trackDragKey(track) ? "trackRow--dragging" : ""} ${dragTarget?.trackKey === trackDragKey(track) ? `trackRow--drop-${dragTarget.placement}` : ""}`}
 	                    draggable={!busy && !isMobileViewport}
 	                    onDragStart={(e) => {
-	                      setDragTrackId(track.track_id);
+	                      const dragKey = trackDragKey(track);
+	                      setDragTrackId(dragKey);
 	                      setDragTarget(null);
 	                      e.dataTransfer.effectAllowed = "move";
-	                      e.dataTransfer.setData("text/plain", track.track_id);
+	                      e.dataTransfer.setData("text/plain", JSON.stringify({ trackId: track.track_id, position: track.position }));
 	                    }}
 	                    onDragOver={(e) => {
-	                      if (busy || dragTrackId === track.track_id) return;
+	                      if (busy || dragTrackId === trackDragKey(track)) return;
 	                      e.preventDefault();
 	                      const rect = e.currentTarget.getBoundingClientRect();
 	                      const placement = e.clientY > rect.top + rect.height / 2 ? "after" : "before";
-	                      setDragTarget({ trackId: track.track_id, placement });
+	                      setDragTarget({ trackKey: trackDragKey(track), placement });
 	                    }}
 	                    onDragLeave={() => {
-	                      setDragTarget((current) => current?.trackId === track.track_id ? null : current);
+	                      setDragTarget((current) => current?.trackKey === trackDragKey(track) ? null : current);
 	                    }}
 	                    onDrop={(e) => {
 	                      e.preventDefault();
-	                      const sourceId = e.dataTransfer.getData("text/plain");
-	                      const source = tracks.find((item) => item.track_id === sourceId);
-	                      const placement = dragTarget?.trackId === track.track_id ? dragTarget.placement : "before";
+	                      stopDragAutoScroll();
+	                      let payload = null;
+	                      try { payload = JSON.parse(e.dataTransfer.getData("text/plain")); } catch {}
+	                      const source = tracksRef.current.find((item) => Number(item.position) === Number(payload?.position) && item.track_id === payload?.trackId)
+	                        || tracksRef.current.find((item) => item.track_id === payload?.trackId);
+	                      const placement = dragTarget?.trackKey === trackDragKey(track) ? dragTarget.placement : "before";
 	                      setDragTrackId("");
 	                      setDragTarget(null);
 	                      if (source) moveTrackTo(source, dropTargetPosition(source, track, placement));
 	                    }}
 	                    onDragEnd={() => {
+	                      stopDragAutoScroll();
 	                      setDragTrackId("");
 	                      setDragTarget(null);
 	                    }}
@@ -5829,7 +6403,7 @@ export default function PlaylistManager() {
                           tooltip={isFlexTrack ? "Convert this rotation slot back into a normal song." : "Turn this song into a locked rotation slot."}
                           disabled={busy}
                           onClick={() => isFlexTrack
-                            ? removeFlexSlot(flexSlots.find((slot) => slot.current_track_id === track.track_id))
+                            ? removeFlexSlot(flexSlot)
                             : addFlexSlot(track)
                           }
                         >
@@ -6550,6 +7124,12 @@ export default function PlaylistManager() {
           background: #181c23;
           box-shadow: 0 28px 100px rgba(0, 0, 0, 0.58);
         }
+        .spotifyReconnectPanel {
+          width: min(620px, 100%);
+        }
+        .spotifyReconnectNotice {
+          margin: 0;
+        }
         .onboardingHeader {
           display: flex;
           justify-content: space-between;
@@ -6811,6 +7391,141 @@ export default function PlaylistManager() {
           justify-content: space-between;
           gap: 10px;
         }
+        .workspaceSwitcher {
+          display: grid;
+          grid-template-columns: auto minmax(0, 1fr);
+          align-items: center;
+          gap: 12px;
+          padding: 10px 12px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #181c23;
+        }
+        .workspaceSwitcher select {
+          width: 100%;
+          min-width: 0;
+        }
+        .sharedWorkspaceBadge,
+        .sharedAccountLabel {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          color: #18e06f;
+          font-size: 12px;
+          font-weight: 800;
+        }
+        .sharedWorkspaceBadge svg {
+          width: 16px;
+          height: 16px;
+        }
+        .teamSettingsSection {
+          gap: 14px;
+        }
+        .teamInviteCard,
+        .teamMemberCard {
+          display: grid;
+          gap: 12px;
+          padding: 12px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #181c23;
+        }
+        .teamInviteHeading,
+        .teamMemberHeader,
+        .teamMemberFooter {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+        }
+        .teamInviteHeading {
+          justify-content: flex-start;
+        }
+        .teamInviteHeading > div,
+        .teamMemberHeader > div {
+          display: grid;
+          gap: 4px;
+          min-width: 0;
+        }
+        .teamInviteHeading small,
+        .teamMemberFooter small,
+        .teamEmptyState {
+          color: #a6adba;
+        }
+        .teamIcon {
+          display: grid;
+          place-items: center;
+          width: 34px;
+          height: 34px;
+          flex: 0 0 34px;
+          border: 1px solid rgba(24, 224, 111, 0.45);
+          border-radius: 8px;
+          color: #18e06f;
+          background: rgba(24, 224, 111, 0.07);
+        }
+        .teamIcon svg {
+          width: 17px;
+          height: 17px;
+        }
+        .teamMemberList,
+        .teamConnectionPicker {
+          display: grid;
+          gap: 8px;
+        }
+        .teamConnectionPicker {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .teamConnectionPicker label {
+          grid-template-columns: auto 30px minmax(0, 1fr);
+          align-items: center;
+          gap: 8px;
+          min-width: 0;
+          padding: 8px;
+          border: 1px solid #2a303b;
+          border-radius: 8px;
+          background: #12161d;
+          cursor: pointer;
+        }
+        .teamConnectionPicker input {
+          width: 16px;
+          height: 16px;
+          accent-color: #18e06f;
+        }
+        .teamConnectionPicker label span {
+          overflow: hidden;
+          color: #f4f6fb;
+          font-size: 12px;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .teamStatus {
+          width: fit-content;
+          padding: 3px 7px;
+          border: 1px solid #39414f;
+          border-radius: 999px;
+          color: #a6adba;
+          font-size: 10px;
+          font-weight: 900;
+          text-transform: uppercase;
+        }
+        .teamStatus--active {
+          border-color: rgba(24, 224, 111, 0.38);
+          color: #18e06f;
+        }
+        .teamEmptyState {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 8px;
+          min-height: 72px;
+          border: 1px dashed #303743;
+          border-radius: 8px;
+          font-size: 13px;
+        }
+        .teamEmptyState svg {
+          width: 17px;
+          height: 17px;
+        }
         .settingsSection ol {
           padding-left: 18px;
         }
@@ -6837,6 +7552,19 @@ export default function PlaylistManager() {
           display: grid;
           gap: 8px;
         }
+        .reconnectAccountList {
+          display: grid;
+          gap: 8px;
+          margin-top: 14px;
+          padding-top: 14px;
+          border-top: 1px solid #303743;
+        }
+        .reconnectAccountList > strong {
+          color: #ffd066;
+          font-size: 12px;
+          font-weight: 900;
+          text-transform: uppercase;
+        }
         .connectionItem {
           display: grid;
           grid-template-columns: 42px minmax(0, 1fr) auto;
@@ -6861,6 +7589,10 @@ export default function PlaylistManager() {
         .connectionItem span {
           color: #a6adba;
           font-size: 13px;
+        }
+        .connectionItem--reconnect {
+          border-color: rgba(255, 208, 102, 0.38);
+          background: rgba(255, 208, 102, 0.05);
         }
         .dangerOutline {
           border-color: #ff4d4d;
@@ -10952,6 +11684,22 @@ export default function PlaylistManager() {
           }
           .accountActions {
             flex-wrap: wrap;
+          }
+          .workspaceSwitcher,
+          .teamConnectionPicker {
+            grid-template-columns: 1fr;
+          }
+          .workspaceSwitcher {
+            align-items: stretch;
+          }
+          .teamConnectionPicker label {
+            grid-template-columns: auto 30px minmax(0, 1fr);
+          }
+          .teamInviteHeading,
+          .teamMemberHeader,
+          .teamMemberFooter {
+            align-items: stretch;
+            flex-direction: column;
           }
           .sectionTitle {
             display: grid;

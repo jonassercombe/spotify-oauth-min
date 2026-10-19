@@ -1,0 +1,20 @@
+{
+  "summary": {
+    "en-US": "A focused multi-account workspace for Spotify playlist curators."
+  },
+  "categories": {
+    "firefox": ["photos-music-videos"]
+  },
+  "homepage": {
+    "en-US": "https://playlist-pilot.com"
+  },
+  "support_email": {
+    "en-US": "jonassercombe@googlemail.com"
+  },
+  "version": {
+    "license": "MPL-2.0",
+    "release_notes": {
+      "en-US": "Initial PlaylistPilot Curator release candidate."
+    }
+  }
+}

@@ -4,16 +4,35 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "extension:validate": "node extension/scripts/validate.mjs",
+    "extension:test": "node extension/tests/adapter-contract.test.mjs",
+    "extension:lint": "npx --yes web-ext@latest lint --source-dir extension --ignore-files dist/** .package/**",
+    "extension:package": "npm run extension:validate && node extension/scripts/package.mjs",
+    "extension:release-check": "npm run extension:validate && npm run extension:test && npm run extension:lint && npm run extension:package",
+    "extension:sign:listed": "node --env-file=.env.amo.local extension/scripts/sign.mjs listed",
+    "extension:sign:unlisted": "node --env-file=.env.amo.local extension/scripts/sign.mjs unlisted"
+  },
+  "engines": {
+    "node": "24.x"
+  },
+  "overrides": {
+    "nanoid": "3.3.18",
+    "postcss": "8.5.23",
+    "sharp": "0.35.5",
+    "source-map-js": "1.2.2"
   },
   "dependencies": {
     "@marsidev/react-turnstile": "^1.4.1",
     "@supabase/supabase-js": "^2.105.4",
     "lucide-react": "^1.16.0",
-    "next": "^15.0.0",
+    "next": "15.5.28",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "recharts": "^3.8.1",
     "stripe": "^22.1.1"
+  },
+  "devDependencies": {
+    "web-ext": "10.8.0"
   }
 }

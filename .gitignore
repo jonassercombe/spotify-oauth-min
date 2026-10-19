@@ -140,3 +140,5 @@ vite.config.ts.timestamp-*
 .vercel
 .env*.local
 render-worker/__pycache__/
+.DS_Store
+output/

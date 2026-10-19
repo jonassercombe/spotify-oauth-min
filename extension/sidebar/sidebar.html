@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>PlaylistPilot</title>
+    <link rel="stylesheet" href="sidebar.css" />
+  </head>
+  <body data-view="queue">
+    <header class="topbar">
+      <img src="../icons/playlistpilot.svg" alt="" />
+      <div class="brand"><strong>PlaylistPilot</strong><span>Curator copilot</span></div>
+      <div class="topbarMenuWrap">
+        <button id="moreButton" class="iconButton" type="button" title="Account and extension menu" aria-expanded="false">•••</button>
+        <div id="accountMenu" class="accountMenu hidden">
+          <span class="eyebrow">PlaylistPilot account</span>
+          <strong id="authLabel">Not connected</strong>
+          <div class="accountMenuActions">
+            <button id="connectButton" type="button">Connect</button>
+            <button id="signOutButton" class="secondary hidden" type="button">Sign out</button>
+            <button id="refreshButton" class="secondary" type="button">Refresh data</button>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section id="sessionDockCard" class="card sessionDockCard hidden">
+        <div class="dockHeader">
+          <div><span class="eyebrow">Quick switch</span><strong>Accounts</strong></div>
+          <button id="ensureSessionsButton" class="textButton" type="button">Load all</button>
+        </div>
+        <div id="sessionDock" class="sessionDock"></div>
+      </section>
+
+      <section id="sessionCard" class="card viewQueue hidden">
+        <div class="sectionTitle">
+          <div><span class="eyebrow">Overview</span><strong>Accounts & activity</strong></div>
+          <button id="scanSessionsButton" class="textButton" type="button">Scan all</button>
+        </div>
+        <div id="cockpitStats" class="cockpitStats"></div>
+        <section id="overviewPlayer" class="overviewPlayer" aria-label="Focused Spotify track">
+          <div class="overviewPlayerTopline">
+            <div class="overviewPlayerMeta">
+            <strong id="overviewPlayerTitle">Choose a submission on the page</strong>
+              <span id="overviewPlayerArtist">No track selected</span>
+            </div>
+            <button id="openSpotifyButton" class="compactIconButton" type="button" title="Open full track in Spotify" aria-label="Open full track in Spotify" disabled>↗</button>
+            <button id="spotifyActivateButton" class="compactIconButton" type="button" title="Use track from current page" aria-label="Use track from current page">◎</button>
+          </div>
+          <div class="overviewPlayerControls">
+            <button id="previousSubmissionButton" class="secondary" type="button" title="Previous detected track">←</button>
+            <button id="playPauseButton" class="primary" type="button">▶ Play</button>
+            <button id="nextSubmissionButton" class="secondary" type="button" title="Next detected track">→</button>
+          </div>
+          <span id="spotifyPlayerStatus" class="overviewPlayerStatus hidden"></span>
+          <iframe id="spotifyEmbed" class="hidden" title="PlaylistPilot Spotify player" src="https://playlist-pilot.com/extension-player" allow="autoplay; encrypted-media; fullscreen; picture-in-picture" loading="eager"></iframe>
+        </section>
+        <div id="platformCoverage" class="platformCoverage legacyFeature"></div>
+        <div id="scanMeta" class="scanMeta"></div>
+        <div id="earningsSummary" class="earningsSummary hidden"></div>
+        <div id="submitHubAds" class="submitHubAds hidden"></div>
+        <div id="accountList" class="accountList"></div>
+        <div id="unassignedSessions" class="unassignedSessions"></div>
+        <button id="addAccountButton" class="secondary fullButton" type="button">Add platform account</button>
+        <form id="accountForm" class="accountForm hidden">
+          <input id="accountIdInput" type="hidden" />
+          <label>
+            Account name
+            <input id="accountNameInput" maxlength="80" placeholder="Groover · Main" required />
+          </label>
+          <label>
+            Platform
+            <select id="accountPlatformSelect">
+              <option value="groover">Groover</option>
+              <option value="submithub">SubmitHub</option>
+              <option value="playlistpush">PlaylistPush</option>
+              <option value="unhurd">Unhurd</option>
+            </select>
+          </label>
+          <label>
+            Firefox session
+            <select id="accountContainerSelect">
+              <option value="__new__">Create a new Firefox Container</option>
+              <option value="firefox-default">Default Firefox session</option>
+            </select>
+          </label>
+          <label>
+            Tracking playlist mapping
+            <select id="accountPlaylistSelect">
+              <option value="">Choose when placing</option>
+            </select>
+          </label>
+          <div>
+            <label>Accepted-song expiry<input id="accountExpiryInput" type="number" min="1" max="104" value="4" /></label>
+            <label class="legacyFeature">Default slot<input id="accountPositionInput" type="number" min="1" placeholder="Append" /></label>
+          </div>
+          <div>
+            <label>Income per reviewed song<input id="accountEarningAmountInput" type="number" min="0" max="10000" step="0.0001" value="0" /></label>
+            <label>Currency<select id="accountEarningCurrencySelect"><option>EUR</option><option>USD</option><option>GBP</option></select></label>
+          </div>
+          <label class="checkRow"><input id="accountEarningTrackingInput" type="checkbox" checked /><span>Track completed reviews as estimated income</span></label>
+          <label class="checkRow"><input id="accountTrackingInput" type="checkbox" checked /><span>Track accepted submissions for this account</span></label>
+          <label class="checkRow compactCheck legacyFeature"><input id="accountLockInput" type="checkbox" /><span>Lock the prepared slot</span></label>
+          <label class="checkRow legacyFeature"><input id="accountAutoPrepareInput" type="checkbox" checked /><span>Automatically prepare these rules for each detected submission</span></label>
+          <label class="checkRow"><input id="accountKeepReadyInput" type="checkbox" checked /><span>Keep this platform session ready when Firefox starts</span></label>
+          <div class="managerActions">
+            <button id="saveAccountButton" type="submit">Save account</button>
+            <button id="cancelAccountButton" class="secondary" type="button">Cancel</button>
+          </div>
+        </form>
+        <p id="cockpitStatus" class="status"></p>
+      </section>
+
+      <section id="emptyCard" class="card emptyCard viewFocus legacyFeature">
+        <span class="pulse"></span>
+        <strong>Open a curator submission</strong>
+        <p>Groover, SubmitHub and PlaylistPush are supported.</p>
+      </section>
+
+      <section id="contextCard" class="card viewFocus hidden legacyFeature">
+        <div class="platformRow">
+          <span id="platformBadge" class="platformBadge">Platform</span>
+          <span id="profileLabel" class="muted"></span>
+          <button id="adapterQuickStatus" class="adapterQuickStatus" type="button" title="Open adapter details"><span></span></button>
+        </div>
+        <div id="queueStats" class="queueStats"></div>
+        <div class="track">
+          <strong id="trackTitle">No track selected</strong>
+          <span id="artistNames"></span>
+          <small id="deadlineLabel"></small>
+        </div>
+        <a id="spotifyLink" class="spotifyLink hidden" target="_blank" rel="noreferrer">Open on Spotify ↗</a>
+      </section>
+
+      <section id="reviewCard" class="card reviewCard viewFocus hidden legacyFeature">
+        <div class="sectionTitle">
+          <div><span class="eyebrow">Universal review</span><strong>One workflow, every platform</strong></div>
+          <span id="reviewBridgeBadge" class="adapterStatusBadge">Checking</span>
+        </div>
+        <div class="reviewQueueLine"><span>Cross-platform queue</span><strong id="reviewQueuePosition">Scanning…</strong></div>
+        <label class="checkRow compactReviewCheck"><input id="autoPlayInput" type="checkbox" checked /><span>Auto-play after Previous / Next</span></label>
+        <label class="checkRow compactReviewCheck"><input id="defaultDeclineInput" type="checkbox" checked /><span>Prepare decline and connect feedback automatically</span></label>
+        <div class="modeSwitch reviewDecisionSwitch" role="group" aria-label="Prepare platform decision">
+          <button id="prepareAcceptButton" class="modeButton" type="button">Prepare accept</button>
+          <button id="prepareDeclineButton" class="modeButton" type="button">Prepare decline</button>
+        </div>
+        <label>
+          Direct typing portal
+          <textarea id="liveFeedbackInput" rows="6" readonly aria-readonly="true" placeholder="Click here, then type — your keyboard is focused directly into the real platform field."></textarea>
+        </label>
+        <p class="safetyNote">This is a passive mirror. Physical typing goes into the real website field; generated drafts transfer only after your explicit click. Nothing is submitted.</p>
+        <section id="spotifyFallback" class="spotifyFallback hidden" aria-hidden="true"></section>
+        <p id="reviewStatus" class="status"></p>
+      </section>
+
+      <section id="adapterCard" class="card adapterCard viewTools hidden legacyFeature">
+        <div class="sectionTitle">
+          <div><span class="eyebrow">Adapter check</span><strong>Page recognition</strong></div>
+          <span id="adapterStatusBadge" class="adapterStatusBadge">Checking</span>
+        </div>
+        <div id="adapterFields" class="adapterFields"></div>
+        <div id="adapterWarnings" class="adapterWarnings"></div>
+        <div class="adapterActions">
+          <span id="adapterMeta" class="muted"></span>
+          <button id="copyAdapterReportButton" class="textButton" type="button">Copy diagnostic</button>
+        </div>
+        <p id="adapterStatus" class="status"></p>
+      </section>
+
+      <section id="placementCard" class="card viewFocus hidden legacyFeature">
+        <div class="sectionTitle">
+          <div><span class="eyebrow">Playlist placement</span><strong>Manage with PlaylistPilot</strong></div>
+          <span id="decisionBadge" class="decisionBadge">Manual</span>
+        </div>
+        <label>
+          Playlist
+          <select id="playlistSelect"><option value="">Choose a playlist</option></select>
+        </label>
+        <div class="fieldGrid">
+          <label>Position<input id="positionInput" type="number" min="1" placeholder="Append" /></label>
+          <label>Expiry weeks<input id="expiryInput" type="number" min="1" step="1" /></label>
+        </div>
+        <label class="checkRow"><input id="lockInput" type="checkbox" /><span>Lock this position</span></label>
+        <div id="workflowHint" class="workflowHint hidden">
+          <span id="workflowHintText"></span>
+          <button id="workflowApplyButton" class="textButton" type="button">Apply rules</button>
+        </div>
+        <button id="placementButton" class="primary" disabled>Review placement</button>
+        <p id="placementStatus" class="status"></p>
+      </section>
+
+      <section id="managerCard" class="card viewTools hidden legacyFeature">
+        <div class="sectionTitle">
+          <div><span class="eyebrow">Playlist manager</span><strong>Quick controls</strong></div>
+          <button id="openManagerButton" class="textButton" type="button">Full app ↗</button>
+        </div>
+        <label>
+          Playlist
+          <select id="managerPlaylistSelect"><option value="">Choose a playlist</option></select>
+        </label>
+        <div id="managerStats" class="managerStats"></div>
+        <div id="playlistSettings" class="managerSettings hidden">
+          <label class="checkRow"><input id="autoExpiryInput" type="checkbox" /><span>Automatic playlist expiry</span></label>
+          <div class="inlineField">
+            <label>Default weeks<input id="autoExpiryWeeksInput" type="number" min="1" max="104" /></label>
+            <button id="saveSettingsButton" class="secondary" type="button">Save rules</button>
+          </div>
+        </div>
+        <div class="managerActions">
+          <button id="backupButton" class="secondary" type="button">Create backup</button>
+          <button id="reloadPlaylistButton" class="secondary" type="button">Reload</button>
+        </div>
+        <label class="trackFilterLabel">
+          Filter tracks
+          <input id="trackFilterInput" type="search" placeholder="Title or artist" />
+        </label>
+        <div id="managerTrackList" class="managerTrackList">
+          <p class="muted">Choose a playlist to manage its tracks.</p>
+        </div>
+        <p id="managerStatus" class="status"></p>
+      </section>
+
+      <section id="acceptedTracksCard" class="card viewTools hidden">
+        <div class="sectionTitle">
+          <div><span class="eyebrow">Submission tracking</span><strong>Accepted placements</strong></div>
+          <button id="reloadAcceptedTracksButton" class="textButton" type="button">Reload</button>
+        </div>
+        <label class="trackingFilterLabel">Show
+          <select id="acceptedTracksFilter">
+            <option value="all">All placements</option>
+            <option value="waiting">Waiting for Spotify</option>
+            <option value="active">Active</option>
+            <option value="needs_mapping">Needs mapping</option>
+          </select>
+        </label>
+        <div id="acceptedTracksList" class="acceptedTracksList"><p class="muted">Tracked platform acceptances will appear here.</p></div>
+        <p id="acceptedTracksStatus" class="status"></p>
+      </section>
+
+      <section id="adsCard" class="card viewAds hidden">
+        <div class="sectionTitle">
+          <div><span class="eyebrow">SubmitHub ads</span><strong>Spend & performance</strong></div>
+          <button id="scanAdsButton" class="textButton" type="button">Scan now</button>
+        </div>
+        <div id="adsSummary" class="cockpitStats"></div>
+        <p id="adsMeta" class="scanMeta">No ad scan yet.</p>
+        <label class="checkRow"><input id="adsAutoSyncInput" type="checkbox" /><span>After a manual scan, update PlaylistPilot ad performance</span></label>
+        <p class="safetyNote">Map each campaign to one PlaylistPilot playlist. Daily credits are converted from USD to EUR using the server's ECB reference rate.</p>
+        <div id="adsCampaignList" class="adsCampaignList"><p class="muted">Run a manual scan to load active campaigns.</p></div>
+        <button id="syncAdsButton" class="primary fullButton" type="button">Sync mapped campaigns</button>
+        <p id="adsStatus" class="status"></p>
+      </section>
+
+      <section id="feedbackCard" class="card viewFocus hidden">
+        <div class="sectionTitle">
+          <div><span class="eyebrow">Feedback studio</span><strong>Write in your voice</strong></div>
+          <span id="styleCountBadge" class="decisionBadge">0 samples</span>
+        </div>
+        <div class="modeSwitch" role="group" aria-label="Feedback decision">
+          <button id="acceptModeButton" class="modeButton active" type="button">Accept</button>
+          <button id="declineModeButton" class="modeButton" type="button">Decline</button>
+        </div>
+        <label>
+          What do you like?
+          <textarea id="feedbackLikesInput" rows="3" placeholder="Vocals, production, hook, energy…"></textarea>
+        </label>
+        <label>
+          Why does it not fit?
+          <textarea id="feedbackMismatchInput" rows="3" placeholder="Playlist fit, genre, pacing, mix, personal taste…"></textarea>
+        </label>
+        <button id="generateFeedbackButton" class="primary" type="button">Generate personal feedback</button>
+        <label id="feedbackOutputLabel" class="hidden">
+          Draft
+          <textarea id="feedbackOutput" rows="6"></textarea>
+        </label>
+        <div id="feedbackOutputActions" class="managerActions hidden">
+          <button id="copyFeedbackButton" class="secondary" type="button">Copy</button>
+          <button id="insertFeedbackButton" class="secondary" type="button">Transfer to platform</button>
+          <button id="clearFeedbackButton" class="secondary" type="button">Clear</button>
+        </div>
+        <p class="safetyNote">Insertion only fills the visible platform form. PlaylistPilot never clicks accept, decline or submit.</p>
+        <p id="feedbackStatus" class="status"></p>
+        <details class="styleLibrary">
+          <summary>Voice templates & humanization</summary>
+          <div class="templateToolbar">
+            <select id="feedbackTemplateSelect" aria-label="Feedback template"></select>
+            <button id="newFeedbackTemplateButton" class="secondary" type="button">New</button>
+            <button id="deleteFeedbackTemplateButton" class="secondary dangerText" type="button">Delete</button>
+          </div>
+          <label>Template name<input id="feedbackTemplateNameInput" maxlength="60" /></label>
+          <label>Use automatically for<select id="feedbackTemplateScopeSelect"></select></label>
+          <div class="fieldGrid">
+            <label>Language<select id="feedbackLanguageSelect"><option value="auto">Match examples</option><option value="en">English</option><option value="de">German</option></select></label>
+            <label>Tone<select id="feedbackToneSelect"><option value="matched">Match examples</option><option value="warm">Warm</option><option value="direct">Direct</option><option value="casual">Casual</option></select></label>
+            <label>Length<select id="feedbackLengthSelect"><option value="matched">Match examples</option><option value="short">Short</option><option value="medium">Medium</option><option value="long">Long</option></select></label>
+            <label>Imperfections<select id="feedbackImperfectionsSelect"><option value="matched">Match examples</option><option value="none">None</option><option value="subtle">Subtle</option><option value="natural">Natural</option></select></label>
+          </div>
+          <label>Grammar<select id="feedbackGrammarSelect"><option value="matched">Match examples</option><option value="clean">Clean</option><option value="casual">Casual</option><option value="rough">Loose / rough</option></select></label>
+          <label>Special rules<textarea id="feedbackRulesInput" rows="3" placeholder="e.g. never use em dashes; short greeting; mention playlist fit only once"></textarea></label>
+          <p class="muted">Paste handwritten feedbacks separated by a blank line. Examples stay in Firefox; selected samples are sent only when generating.</p>
+          <textarea id="styleLibraryInput" rows="8" placeholder="Hey, thanks for sending this over…&#10;&#10;Really enjoyed the vocal tone here…"></textarea>
+          <button id="saveStyleLibraryButton" class="secondary" type="button">Save template</button>
+        </details>
+      </section>
+
+    </main>
+
+    <nav class="bottomNav" aria-label="PlaylistPilot sections">
+      <button id="queueNavButton" class="active" type="button"><span>≡</span>Overview</button>
+      <button id="focusNavButton" type="button"><span>✎</span>Feedback</button>
+      <button id="toolsNavButton" type="button"><span>✓</span>Tracking</button>
+      <button id="adsNavButton" type="button"><span>↗</span>Ads</button>
+    </nav>
+
+    <dialog id="placementReviewDialog" class="reviewDialog">
+      <form method="dialog">
+        <div class="reviewHeader">
+          <div><span class="eyebrow">Review & apply</span><strong>Confirm playlist change</strong></div>
+          <button id="closePlacementReviewButton" class="iconButton" type="button" aria-label="Close review">×</button>
+        </div>
+        <div id="placementReviewRows" class="reviewRows"></div>
+        <div id="trackedPlacementFields" class="trackedPlacementFields hidden">
+          <label>Playlist<select id="trackedPlaylistSelect"></select></label>
+          <label>Expiry<input id="trackedExpiryInput" type="number" min="1" max="104" value="8" /> weeks</label>
+          <label>Playlist slot<input id="trackedPositionInput" type="number" min="1" max="10000" value="10" /></label>
+        </div>
+        <div id="placementReviewWarning" class="reviewWarning hidden"></div>
+        <label id="placementReviewAcknowledgeRow" class="checkRow hidden"><input id="placementReviewAcknowledgeInput" type="checkbox" /><span>I verified the track and playlist despite the adapter warning</span></label>
+        <p class="safetyNote">This changes the Spotify playlist through PlaylistPilot. It does not accept or decline anything on the curator platform.</p>
+        <div class="reviewActions">
+          <button id="cancelPlacementReviewButton" class="secondary" type="button">Cancel</button>
+          <button id="confirmPlacementButton" class="primary" type="button">Apply playlist change</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="sidebar.js"></script>
+  </body>
+</html>

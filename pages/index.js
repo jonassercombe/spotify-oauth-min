@@ -178,6 +178,7 @@ export default function LandingPage() {
       </section>
 
       <footer>
+        <a href="/privacy">Privacy</a>
         <strong>PlaylistPilot</strong>
         <nav aria-label="Legal links">
           <a href="/legal/imprint">Imprint</a>

@@ -1,0 +1,71 @@
+{
+  "manifest_version": 3,
+  "name": "PlaylistPilot Curator",
+  "version": "0.35.1",
+  "description": "A focused multi-account curator sidebar for Groover, SubmitHub, PlaylistPush and Unhurd.",
+  "icons": {
+    "48": "icons/playlistpilot.svg",
+    "96": "icons/playlistpilot.svg"
+  },
+  "permissions": [
+    "alarms",
+    "contextualIdentities",
+    "cookies",
+    "menus",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://playlist-pilot.com/*",
+    "https://*.submithub.com/*",
+    "https://groover.co/*",
+    "https://app.playlistpush.com/*",
+    "https://curator.unhurdmusic.com/*"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "sidebar_action": {
+    "default_icon": "icons/playlistpilot.svg",
+    "default_title": "PlaylistPilot",
+    "default_panel": "sidebar/sidebar.html",
+    "open_at_install": false
+  },
+  "action": {
+    "default_icon": "icons/playlistpilot.svg",
+    "default_title": "Open PlaylistPilot"
+  },
+  "commands": {
+    "generate-feedback-profile-1": { "description": "Generate feedback with profile 1" },
+    "generate-feedback-profile-2": { "description": "Generate feedback with profile 2" },
+    "generate-feedback-profile-3": { "description": "Generate feedback with profile 3" },
+    "generate-feedback-profile-4": { "description": "Generate feedback with profile 4" }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://playlist-pilot.com/*",
+        "https://*.submithub.com/*",
+        "https://groover.co/*",
+        "https://app.playlistpush.com/*",
+        "https://curator.unhurdmusic.com/*"
+      ],
+      "js": ["content/adapter-contract.js", "content/content-script.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "curator@playlist-pilot.com",
+      "strict_min_version": "142.0",
+      "data_collection_permissions": {
+        "required": [
+          "authenticationInfo",
+          "personalCommunications",
+          "websiteContent"
+        ]
+      }
+    }
+  }
+}
