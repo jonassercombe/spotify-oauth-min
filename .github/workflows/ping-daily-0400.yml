@@ -1,8 +1,6 @@
-name: Ping Vercel maintenance (daily 04:00 UTC)
+name: Run PlaylistPilot maintenance manually
 
 on:
-  schedule:
-    - cron: "0 4 * * *"     # täglich 04:00 UTC
   workflow_dispatch:
 
 jobs:

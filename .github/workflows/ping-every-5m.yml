@@ -1,62 +1,35 @@
-# .github/workflows/ping-every-5m.yml
-name: Ping Vercel endpoints (every 5m, all 60 buckets)
+name: Check PlaylistPilot follower sync manually
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      bucket:
+        description: "Spotify account bucket to check (0–59)"
+        required: true
+        default: "0"
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: playlistpilot-manual-sync-check
+  cancel-in-progress: false
 
 jobs:
-  ping:
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    concurrency:
-      group: ext-crons-5m
-      cancel-in-progress: false
+    timeout-minutes: 3
     env:
       BASE_URL: "https://playlist-pilot.com"
       CRON_SECRET: ${{ secrets.CRON_SECRET }}
-
+      CHECK_BUCKET: ${{ inputs.bucket }}
     steps:
-      - name: Check secret
-        run: |
-          test -n "$CRON_SECRET" || (echo "CRON_SECRET missing" && exit 1)
-          echo "OK $(date -u +'%Y-%m-%d %H:%M:%S')"
-
-      - name: Ping all 60 buckets (followers + watch)
+      - name: Refresh one playlist in the selected account bucket
         shell: bash
         run: |
           set -euo pipefail
-          hit () {
-            local url="$1" tries=0 max=3 code body
-            while (( tries < max )); do
-              tries=$((tries+1))
-              resp="$(curl -sSL -m 25 -H "Authorization: Bearer ${CRON_SECRET}" -w '\n%{http_code}' "${url}")" || true
-              code="${resp##*$'\n'}"; body="${resp%$'\n'*}"
-              echo "HTTP ${code} ${url}"
-              [[ "${code}" =~ ^(200|201|202|204)$ ]] && { echo "${body}" | tr -d '\n' | cut -c1-300; echo; return 0; }
-              sleep 2
-            done
-            echo "FAILED → ${url}"; echo "${body}" | tr -d '\n' | cut -c1-500; echo; return 1
-          }
-
-          failures=0
-
-          # followers
-          for b in $(seq 0 59); do
-            url="${BASE_URL}/api/followers/cron-refresh-all?bucket=${b}"
-            hit "${url}" || failures=$((failures+1))
-            sleep 0.2
-          done
-
-          # watch
-          for b in $(seq 0 59); do
-            url="${BASE_URL}/api/watch/cron-all?bucket=${b}"
-            hit "${url}" || failures=$((failures+1))
-            sleep 0.2
-          done
-
-          [[ "${failures}" -eq 0 ]] || { echo "Completed with ${failures} failed calls."; exit 1; }
-          echo "All calls succeeded."
-
-          
+          test -n "$CRON_SECRET"
+          [[ "$CHECK_BUCKET" =~ ^([0-9]|[1-5][0-9])$ ]] || exit 1
+          curl --fail-with-body --silent --show-error --max-time 120 \
+            --header "Authorization: Bearer ${CRON_SECRET}" \
+            "${BASE_URL}/api/followers/cron-refresh-all?bucket=${CHECK_BUCKET}&discover=0&max=1&concurrency=1"
