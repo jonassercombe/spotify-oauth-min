@@ -8,6 +8,11 @@ on:
         required: true
         default: "0"
         type: string
+      playlist_row_id:
+        description: "Optional playlist row UUID for a read-only track sync check"
+        required: false
+        default: ""
+        type: string
 
 permissions: {}
 
@@ -23,6 +28,7 @@ jobs:
       BASE_URL: "https://playlist-pilot.com"
       CRON_SECRET: ${{ secrets.CRON_SECRET }}
       CHECK_BUCKET: ${{ inputs.bucket }}
+      CHECK_PLAYLIST_ID: ${{ inputs.playlist_row_id }}
     steps:
       - name: Refresh one playlist in the selected account bucket
         shell: bash
@@ -33,3 +39,18 @@ jobs:
           curl --fail-with-body --silent --show-error --max-time 120 \
             --header "Authorization: Bearer ${CRON_SECRET}" \
             "${BASE_URL}/api/followers/cron-refresh-all?bucket=${CHECK_BUCKET}&discover=0&max=1&concurrency=1"
+      - name: Check queued track synchronization without Spotify writes
+        if: inputs.playlist_row_id != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CHECK_PLAYLIST_ID" =~ ^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$ ]] || exit 1
+          body=$(jq -n --arg id "$CHECK_PLAYLIST_ID" '{job_type:"playlist_sync_items",playlist_id:$id,scope_type:"playlist",scope_id:$id,payload:{read_only:true}}')
+          curl --fail-with-body --silent --show-error --max-time 30 \
+            --header "Authorization: Bearer ${CRON_SECRET}" \
+            --header "Content-Type: application/json" \
+            --data "$body" "${BASE_URL}/api/sync/jobs/enqueue" > /dev/null
+          curl --fail-with-body --silent --show-error --max-time 120 \
+            --header "Authorization: Bearer ${CRON_SECRET}" \
+            "${BASE_URL}/api/sync/jobs/run?limit=1&max_ms=45000" | \
+            jq -e '.ok == true and .processed == 1 and all(.results[]; .ok == true)'
