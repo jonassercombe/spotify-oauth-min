@@ -6,11 +6,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
 import socket
 import subprocess
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import base64
 from pathlib import Path
@@ -20,13 +22,32 @@ API_BASE = os.environ.get("PLAYLISTPILOT_API_BASE", "https://playlist-pilot.com/
 WORKER_SECRET = os.environ.get("RENDER_WORKER_SECRET", "")
 WORKER_ID = os.environ.get("RENDER_WORKER_ID", f"ffmpeg:{socket.gethostname()}")
 POLL_SECONDS = max(2, int(os.environ.get("RENDER_POLL_SECONDS", "5")))
+MAX_BACKOFF_SECONDS = max(POLL_SECONDS, int(os.environ.get("RENDER_MAX_BACKOFF_SECONDS", "60")))
 MAX_LOAD = max(0.5, float(os.environ.get("RENDER_MAX_LOAD", "3.6")))
 HTTP_TIMEOUT = max(30, int(os.environ.get("RENDER_HTTP_TIMEOUT", "180")))
+MAX_DOWNLOAD_BYTES = max(10 * 1024 * 1024, int(os.environ.get("RENDER_MAX_DOWNLOAD_BYTES", str(250 * 1024 * 1024))))
+ALLOW_HTTP = os.environ.get("RENDER_ALLOW_HTTP", "0") == "1"
 FONT_FILE = os.environ.get("RENDER_FONT_FILE", "/usr/share/fonts/truetype/lato/Lato-Black.ttf")
 FONT_REGULAR_FILE = os.environ.get("RENDER_FONT_REGULAR_FILE", "/usr/share/fonts/truetype/lato/Lato-Regular.ttf")
 
+_STOP_REQUESTED = False
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOG = logging.getLogger("playlistpilot-render-worker")
+
+
+def _handle_shutdown(signum: int, _frame: object) -> None:
+    global _STOP_REQUESTED
+    _STOP_REQUESTED = True
+    LOG.info("received signal %s; finishing current job before exit", signum)
+
+
+def _validate_remote_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(str(url or "").strip())
+    allowed_schemes = ("https", "http") if ALLOW_HTTP else ("https",)
+    if parsed.scheme.lower() not in allowed_schemes or not parsed.netloc:
+        raise ValueError(f"disallowed_url_scheme:{parsed.scheme or 'missing'}")
+    return parsed.geturl()
 
 
 def api(endpoint: str, payload: dict) -> dict:
@@ -40,16 +61,22 @@ def api(endpoint: str, payload: dict) -> dict:
         return json.loads(response.read().decode("utf-8") or "{}")
 
 
-def download(url: str, target: Path) -> None:
-    request = urllib.request.Request(url, headers={"User-Agent": "PlaylistPilotRenderWorker/1.0"})
+def download(url: str, target: Path, max_bytes: int = MAX_DOWNLOAD_BYTES) -> None:
+    safe_url = _validate_remote_url(url)
+    request = urllib.request.Request(safe_url, headers={"User-Agent": "PlaylistPilotRenderWorker/1.0"})
+    written = 0
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response, target.open("wb") as output:
         while chunk := response.read(1024 * 256):
+            written += len(chunk)
+            if written > max_bytes:
+                raise RuntimeError(f"download_exceeded_limit:{max_bytes}")
             output.write(chunk)
 
 
 def upload(url: str, source: Path) -> None:
+    safe_url = _validate_remote_url(url)
     request = urllib.request.Request(
-        url,
+        safe_url,
         data=source.read_bytes(),
         headers={"Content-Type": "video/mp4", "cache-control": "max-age=3600", "x-upsert": "true"},
         method="PUT",
@@ -392,22 +419,40 @@ def process_one() -> bool:
     return True
 
 
+def _sleep_interruptible(seconds: float) -> None:
+    deadline = time.monotonic() + max(0.0, seconds)
+    while not _STOP_REQUESTED and time.monotonic() < deadline:
+        time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+
+
 def main() -> None:
     if not WORKER_SECRET:
         raise SystemExit("RENDER_WORKER_SECRET is required")
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT, _handle_shutdown)
     LOG.info("worker %s started", WORKER_ID)
-    while True:
+    consecutive_errors = 0
+    while not _STOP_REQUESTED:
         try:
             if os.getloadavg()[0] <= MAX_LOAD:
                 if process_one():
+                    consecutive_errors = 0
                     continue
+                consecutive_errors = 0
             else:
                 LOG.info("host load %.2f above %.2f; waiting", os.getloadavg()[0], MAX_LOAD)
+            _sleep_interruptible(POLL_SECONDS)
         except urllib.error.HTTPError as error:
-            LOG.error("worker API returned %s: %s", error.code, error.read().decode("utf-8", "replace")[:500])
+            consecutive_errors += 1
+            wait = min(MAX_BACKOFF_SECONDS, POLL_SECONDS * (2 ** min(consecutive_errors - 1, 5)))
+            LOG.error("worker API returned %s (retry in %ss): %s", error.code, wait, error.read().decode("utf-8", "replace")[:500])
+            _sleep_interruptible(wait)
         except Exception:
-            LOG.exception("worker loop error")
-        time.sleep(POLL_SECONDS)
+            consecutive_errors += 1
+            wait = min(MAX_BACKOFF_SECONDS, POLL_SECONDS * (2 ** min(consecutive_errors - 1, 5)))
+            LOG.exception("worker loop error (retry in %ss)", wait)
+            _sleep_interruptible(wait)
+    LOG.info("worker %s stopped cleanly", WORKER_ID)
 
 
 if __name__ == "__main__":
