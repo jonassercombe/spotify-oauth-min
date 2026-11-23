@@ -2,21 +2,25 @@
 export const config = { api: { bodyParser: false } };
 
 import Stripe from "stripe";
-import { createHash, randomUUID } from "crypto";
+import { createHash, randomUUID, timingSafeEqual } from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { buildCreativeDeck, serendipityPexelsQuery } from "../../lib/creativeDeck";
 
 /* ==============================
    Shared Utils (Server-only)
 ============================== */
-// hi!
-
 const json = (res, code, payload) => res.status(code).json(payload);
 const bad  = (res, code, msg) => json(res, code, { error: msg });
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const ADMIN_EMAILS = new Set(["jonassercombe@googlemail.com"]);
 const EU_DSA_COUNTRIES = new Set(["AT", "BE", "BG", "HR", "CY", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GR", "HU", "IE", "IT", "LT", "LU", "LV", "MT", "NL", "PL", "PT", "RO", "SE", "SI", "SK"]);
 let euroFxCache = null;
+
+function safeEqual(a, b) {
+  const ha = createHash("sha256").update(String(a)).digest();
+  const hb = createHash("sha256").update(String(b)).digest();
+  return timingSafeEqual(ha, hb);
+}
 
 async function getEcbEuroRates() {
   const maxAgeMs = 6 * 60 * 60 * 1000;
@@ -61,7 +65,15 @@ function isSpotifyQuotaExceeded(payload) {
 function withCORS(handler) {
   return async (req, res) => {
     const origin = req.headers?.origin || "";
-    const isPlaylistPilotExtension = /^(moz|chrome)-extension:\/\/[a-z0-9-]+$/i.test(origin);
+    const configuredExtOrigins = new Set(
+      String(process.env.ALLOWED_EXTENSION_ORIGINS || "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    );
+    const isPlaylistPilotExtension = configuredExtOrigins.size > 0
+      ? configuredExtOrigins.has(origin)
+      : /^(moz|chrome)-extension:\/\/[a-z0-9-]+$/i.test(origin);
     const allowedOrigins = new Set([
       "https://playlist-pilot.com",
       process.env.PUBLIC_BASE_URL || "",
@@ -69,6 +81,8 @@ function withCORS(handler) {
       process.env.NODE_ENV !== "production" ? "http://localhost:3000" : "",
       process.env.NODE_ENV !== "production" ? "http://127.0.0.1:3000" : "",
     ].filter(Boolean));
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Cache-Control", "no-store");
     if (origin && !allowedOrigins.has(origin) && !isPlaylistPilotExtension) {
       return res.status(403).json({ error: "origin_not_allowed" });
     }
@@ -139,13 +153,7 @@ async function recordOpenAIUsage({ bubbleUserId, projectId = null, conceptId = n
 function requireRenderWorker(req, res) {
   const expected = process.env.RENDER_WORKER_SECRET || "";
   const supplied = String(req.headers?.["x-render-worker-secret"] || "");
-  if (!expected || !supplied || supplied.length !== expected.length) {
-    bad(res, 401, "render_worker_unauthorized");
-    return false;
-  }
-  let mismatch = 0;
-  for (let i = 0; i < expected.length; i += 1) mismatch |= expected.charCodeAt(i) ^ supplied.charCodeAt(i);
-  if (mismatch !== 0) {
+  if (!expected || !supplied || !safeEqual(supplied, expected)) {
     bad(res, 401, "render_worker_unauthorized");
     return false;
   }
@@ -387,8 +395,9 @@ async function executeSyncJob(job, req) {
 
 function checkCronAuth(req) {
   const want = process.env.CRON_SECRET || "";
-  const gotAuth = req.headers?.authorization || "";
-  return !!want && gotAuth === `Bearer ${want}`;
+  const gotAuth = String(req.headers?.authorization || "");
+  const bearer = gotAuth.startsWith("Bearer ") ? gotAuth.slice(7) : "";
+  return !!want && !!bearer && safeEqual(bearer, want);
 }
 
 function checkAppSecret(req) {
@@ -397,8 +406,8 @@ function checkAppSecret(req) {
 
 function hasValidAppSecret(req) {
   const want = process.env.APP_WEBHOOK_SECRET || "";
-  const got = req.headers["x-app-secret"] || "";
-  return !!want && got === want;
+  const got = String(req.headers?.["x-app-secret"] || "");
+  return !!want && !!got && safeEqual(got, want);
 }
 
 // Separate from the app webhook secret: this can authorize only the two
@@ -406,10 +415,7 @@ function hasValidAppSecret(req) {
 function hasMetaAnalysisDebugToken(req) {
   const expected = process.env.META_ANALYSIS_DEBUG_TOKEN || "";
   const supplied = String(req.headers?.["x-meta-analysis-debug-token"] || "");
-  if (!expected || expected.length !== supplied.length) return false;
-  let mismatch = 0;
-  for (let i = 0; i < expected.length; i += 1) mismatch |= expected.charCodeAt(i) ^ supplied.charCodeAt(i);
-  return mismatch === 0;
+  return !!expected && !!supplied && safeEqual(supplied, expected);
 }
 
 async function loadSingleReadyMetaConnectionForDebug() {
@@ -7868,41 +7874,47 @@ Content rules:
    "users/settings/save": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
      const bubbleUserId = await bubbleUserIdFromRequest(req);
-     if (!bubbleUserId) return bad(res, 401, "missing_x_bubble_user_id");
+     if (!bubbleUserId) return bad(res, 401, "not_authenticated");
    
      const b = await readBody(req);
-     // Nur whitelisten, was wir erlauben:
+     // Nur echte User-Preferences whitelisten (niemals Subscription-Felder):
      const payload = {
        bubble_user_id: bubbleUserId,
        ...(typeof b.sync_paused === "boolean" ? { sync_paused: b.sync_paused } : {}),
        ...(typeof b.auto_remove_enabled === "boolean" ? { auto_remove_enabled: b.auto_remove_enabled } : {}),
        ...(typeof b.position_lock_enabled === "boolean" ? { position_lock_enabled: b.position_lock_enabled } : {}),
-   
-       // optional adminish: nur setzen, wenn übergeben (z. B. Stripe-Webhook):
-       ...(typeof b.subscription_status === "string" ? { subscription_status: b.subscription_status } : {}),
-       ...(b.subscription_expires_at ? { subscription_expires_at: b.subscription_expires_at } : {})
      };
    
      // ensure app_user exists
-     await sb(`/rest/v1/app_users?on_conflict=bubble_user_id`, {
+     const up = await sb(`/rest/v1/app_users?on_conflict=bubble_user_id`, {
        method: "POST",
        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
        body: JSON.stringify([payload])
      });
+     if (!up.ok) {
+       console.error("users/settings/save failed", { status: up.status, body: await up.text().catch(() => "") });
+       return bad(res, 500, "settings_save_failed");
+     }
    
      return json(res, 200, { ok:true });
    },
 
          /* ---------- paypal/subscriptions/link (POST) ----------
-   Body: { subscriptionId: "I-...", bubble_user_id: "<id>", environment: "live"|"sandbox" }
-   Header (optional Admin-Override): x-app-secret: <APP_WEBHOOK_SECRET>
+   Body: { subscriptionId: "I-...", bubble_user_id?: "<id>", environment: "live"|"sandbox" }
+   Auth: Supabase Bearer token OR x-app-secret
    */
    "paypal/subscriptions/link": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+     const hasSecret = checkAppSecret(req);
+     const ctx = hasSecret ? null : await getUserContext(req);
+     if (!hasSecret && !ctx?.linked) return bad(res, 401, "not_authenticated");
      try {
        const body = await readBody(req);
        const subscriptionId = String(body.subscriptionId || body.subscription_id || "").trim();
-       const bubble_user_id = String(body.bubble_user_id || "").trim();
+       const requestedUid = String(body.bubble_user_id || "").trim();
+       const bubble_user_id = (hasSecret || ctx?.is_admin)
+         ? (requestedUid || ctx?.bubble_user_id || "")
+         : ctx.bubble_user_id;
        const environment = (String(body.environment || "").toLowerCase() === "live") ? "live" : "sandbox";
        if (!subscriptionId || !bubble_user_id) return bad(res, 400, "missing_subscription_id_or_user");
    
@@ -7962,12 +7974,9 @@ Content rules:
        }
    
        // --- CUSTOM_ID MISMATCH HANDLING (tolerant für Alt-Abos):
-       const hasSecret = checkAppSecret(req);
        if (norm.custom_id && norm.custom_id !== bubble_user_id) {
          const sameUserAlready = !!existing && existing.bubble_user_id === bubble_user_id;
-         if (!sameUserAlready && !hasSecret) {
-           // Wer mag, kann zum Debuggen folgende Zeile temporär aktivieren:
-           // return bad(res, 409, `custom_id_mismatch (pp=${norm.custom_id}, ui=${bubble_user_id})`);
+         if (!sameUserAlready && !hasSecret && !ctx?.is_admin) {
            return bad(res, 409, "custom_id_mismatch");
          }
        }
@@ -8067,11 +8076,16 @@ Content rules:
        return { ok: v?.verification_status === "SUCCESS", env, token: tok.access_token, base, webhook_id };
      };
    
-     let ver = await tryVerify("live");
-     if (!ver.ok) ver = await tryVerify("sandbox");
+     const targetEnv = /sandbox/i.test(String(cert_url || "")) ? "sandbox" : "live";
+     if (targetEnv === "sandbox" && process.env.PAYPAL_ALLOW_SANDBOX_WEBHOOKS !== "1") {
+       console.warn("PP webhook sandbox rejected in non-sandbox mode");
+       return bad(res, 400, "sandbox_webhooks_disabled");
+     }
+
+     const ver = await tryVerify(targetEnv);
      if (!ver.ok) {
        console.error("PP webhook verify FAILED", {
-         event_type: event?.event_type, sub: event?.resource?.id
+         env: targetEnv, event_type: event?.event_type, sub: event?.resource?.id
        });
        return bad(res, 400, "webhook_verify_failed");
      }
@@ -8141,9 +8155,31 @@ Content rules:
    // POST /api/paypal/subscriptions/cancel
    "paypal/subscriptions/cancel": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+     const hasSecret = checkAppSecret(req);
+     const ctx = hasSecret ? null : await getUserContext(req);
+     if (!hasSecret && !ctx?.linked) return bad(res, 401, "not_authenticated");
+
      const { subscriptionId, environment = "live", reason = "user_cancelled" } = await readBody(req);
      if (!subscriptionId) return bad(res, 400, "missing_subscription_id");
      const isLive = String(environment).toLowerCase() === "live";
+     const envStr = isLive ? "live" : "sandbox";
+
+     // Ownership prüfen (außer bei internem App-Secret oder Admin)
+     if (!hasSecret && !ctx?.is_admin) {
+       const ownR = await sb(
+         `/rest/v1/subscriptions?select=id,bubble_user_id&limit=1` +
+         `&provider=eq.paypal&environment=eq.${encodeURIComponent(envStr)}` +
+         `&provider_subscription_id=eq.${encodeURIComponent(subscriptionId)}`
+       );
+       if (!ownR.ok) {
+         console.error("paypal/subscriptions/cancel ownership select failed", { status: ownR.status });
+         return bad(res, 500, "subscription_lookup_failed");
+       }
+       const subRow = (await ownR.json().catch(() => []))?.[0];
+       if (!subRow) return bad(res, 404, "subscription_not_found");
+       if (subRow.bubble_user_id !== ctx.bubble_user_id) return bad(res, 403, "forbidden");
+     }
+
      const base = isLive ? "https://api.paypal.com" : "https://api.sandbox.paypal.com";
      const cid    = need(isLive ? "PAYPAL_CLIENT_ID_LIVE"     : "PAYPAL_CLIENT_ID_SANDBOX");
      const secret = need(isLive ? "PAYPAL_CLIENT_SECRET_LIVE" : "PAYPAL_CLIENT_SECRET_SANDBOX");
@@ -8165,11 +8201,12 @@ Content rules:
      });
      if (cancelRes.status !== 204) {
        const t = await cancelRes.text();
-       return bad(res, cancelRes.status, `paypal_cancel_failed: ${t}`);
+       console.error("paypal/subscriptions/cancel failed", { status: cancelRes.status, body: t.slice(0, 500) });
+       return bad(res, cancelRes.status, "paypal_cancel_failed");
      }
    
      // status nachziehen (optional: Detail-GET)
-     await sb(`/rest/v1/subscriptions?provider=eq.paypal&provider_subscription_id=eq.${encodeURIComponent(subscriptionId)}&environment=eq.${encodeURIComponent(isLive ? "live":"sandbox")}`, {
+     await sb(`/rest/v1/subscriptions?provider=eq.paypal&provider_subscription_id=eq.${encodeURIComponent(subscriptionId)}&environment=eq.${encodeURIComponent(envStr)}`, {
        method: "PATCH",
        headers: { Prefer: "return=minimal" },
        body: JSON.stringify({ status: "CANCELLED", updated_at: new Date().toISOString() })
@@ -8230,10 +8267,16 @@ Content rules:
    */
    "subscriptions/refresh": async (req, res) => {
      if (req.method !== "POST") return bad(res, 405, "method_not_allowed");
+     const hasSecret = checkAppSecret(req);
+     const ctx = hasSecret ? null : await getUserContext(req);
+     if (!hasSecret && !ctx?.linked) return bad(res, 401, "not_authenticated");
      try {
        const body = await readBody(req);
        const subscriptionId = String(body.subscription_id || body.subscriptionId || "").trim();
-       const bubble_user_id = String(body.bubble_user_id || "").trim();
+       const requestedUid = String(body.bubble_user_id || "").trim();
+       const bubble_user_id = (hasSecret || ctx?.is_admin)
+         ? (requestedUid || ctx?.bubble_user_id || "")
+         : ctx.bubble_user_id;
        const environment = (String(body.environment || "live").toLowerCase() === "sandbox") ? "sandbox" : "live";
        if (!subscriptionId) return bad(res, 400, "missing_subscription_id");
    
@@ -10368,7 +10411,8 @@ Content rules:
          sync: syncResult
        });
      } catch (e) {
-       return bad(res, 500, `add_track_exception: ${e && e.stack ? e.stack : String(e)}`);
+       console.error("playlist-items/add exception", e?.stack || String(e));
+       return bad(res, 500, "add_track_exception");
      }
    },
 
@@ -10887,6 +10931,7 @@ Content rules:
       Abhängigkeiten: need(), sb(), encToken(), decToken(), fetch, process.env.*
    -------------------------------------------------------- */
    "cron/spotify/snapshot-daily": async (req, res) => {
+     if (!checkCronAuth(req) && !checkAppSecret(req)) return bad(res, 401, "unauthorized_cron");
      try {
        // --- Env-Guards
        const assertEnv = (n) => need(n);
@@ -12275,7 +12320,7 @@ Content rules:
        const msg = e && e.stack ? e.stack : String(e);
        console.error("sync-items:error", msg);
        console.timeEnd(timeLabel);
-       return bad(res, 500, "sync_items_exception: " + msg);
+       return bad(res, 500, "sync_items_exception");
      } finally {
        // Guard sicher abbauen
        try {
@@ -13933,7 +13978,7 @@ export default withCORS(async function handler(req, res) {
     }
     return await handler(req, res);
   } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: String(e?.message || e) });
+    console.error("[api:unhandled]", e);
+    return bad(res, 500, "internal_server_error");
   }
 });
